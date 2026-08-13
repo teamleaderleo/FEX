@@ -2,6 +2,10 @@
 #include <stdint.h>
 #include <type_traits>
 
+#if defined(FEX_GUEST_THUNK_SELF_PIN)
+#include <dlfcn.h>
+#endif
+
 #include "PackedArguments.h"
 
 #if __SIZEOF_POINTER__ == 8
@@ -73,10 +77,22 @@ MAKE_THUNK(fex, allocate_host_trampoline_for_guest_function,
            "0x9b, 0xb2, 0xf4, 0xb4, 0x83, 0x7d, 0x28, 0x93, 0x40, 0xcb, 0xf4, 0x7a, 0x0b, 0x47, 0x85, 0x87, 0xf9, 0xbc, 0xb5, 0x27, 0xca, "
            "0xa6, 0x93, 0xa5, 0xc0, 0x73, 0x27, 0x24, 0xae, 0xc8, 0xb8, 0x5a")
 
+#if defined(FEX_GUEST_THUNK_SELF_PIN)
+static void PinGuestThunkForProcessLifetime() {
+  static void* const PinHandle = dlopen(FEX_GUEST_THUNK_SONAME, RTLD_LAZY | RTLD_LOCAL);
+  if (!PinHandle) {
+    __builtin_trap();
+  }
+}
+#else
+static void PinGuestThunkForProcessLifetime() {}
+#endif
+
 #define LOAD_LIB_BASE(name, init_fn)                   \
   __attribute__((constructor)) static void loadlib() { \
     LoadlibArgs args = {#name};                        \
     fexthunks_fex_loadlib(&args);                      \
+    PinGuestThunkForProcessLifetime();                 \
     if ((init_fn)) ((void (*)())init_fn)();            \
   }
 
