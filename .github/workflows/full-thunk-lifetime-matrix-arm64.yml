@@ -1,22 +1,22 @@
-name: Full thunk lifetime matrix ARM64
+name: Thunk retire-rebind diagnostic ARM64
 
 on:
   push:
-    branches: [ci/full-thunk-lifetime-matrix-20260814]
+    branches: [ci/thunk-rebind-diagnostic-20260814]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  lifetime-matrix:
+  retire-rebind:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     env:
       FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
       FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
       ROOTFS: ${{ github.workspace }}/rootfs-amd64
-      R: ${{ github.workspace }}/receipts-full
+      R: ${{ github.workspace }}/receipts-rebind
       FEX_PORTABLE: 1
       DEBIAN_FRONTEND: noninteractive
 
@@ -51,9 +51,42 @@ jobs:
           echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
           mkdir /tmp/repro
           tar xf /tmp/repro.tar.gz -C /tmp/repro
-          find /tmp/repro -maxdepth 3 -type f -printf '%P\n' | sort > "$R/fixture-files.txt"
 
-      - name: Build exact FEX
+      - name: Apply narrow retire-rebind diagnostic
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/FEXCore/Source/Interface/Core/Core.cpp')
+          s = p.read_text()
+          old = '''    if (Result->Data != (void*)GuestThunkEntrypoint) {
+                // NOTE: This may happen in Vulkan thunks if the Vulkan driver resolves two different symbols
+                //       to the same function (e.g. vkGetPhysicalDeviceFeatures2/vkGetPhysicalDeviceFeatures2KHR)
+                LogMan::Msg::EFmt("Input address for AddThunkTrampoline is already linked elsewhere");
+              }
+          '''
+          if old not in s:
+              old = '''    if (Result->Data != (void*)GuestThunkEntrypoint) {
+                // NOTE: This may happen in Vulkan thunks if the Vulkan driver resolves two different symbols
+                //       to the same function (e.g. vkGetPhysicalDeviceFeatures2/vkGetPhysicalDeviceFeatures2KHR)
+                LogMan::Msg::EFmt("Input address for AddThunkTrampoline is already linked elsewhere");
+              }'''
+          if old not in s:
+              raise SystemExit('target block missing')
+          new = '''    if (Result->Data != (void*)GuestThunkEntrypoint) {
+                LogMan::Msg::EFmt("DIAGNOSTIC: retiring old thunk link before rebinding");
+                RemoveCustomIREntrypoint(nullptr, Entrypoint);
+                AddThunkTrampolineIRHandler(Entrypoint, GuestThunkEntrypoint);
+                return;
+              }'''
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git -C src diff --check
+          git -C src diff -- FEXCore/Source/Interface/Core/Core.cpp > "$R/rebind.diff"
+          grep -n -A12 -B4 'DIAGNOSTIC: retiring' src/FEXCore/Source/Interface/Core/Core.cpp > "$R/rebind-snippet.txt"
+
+      - name: Build diagnostic FEX and full thunk pair
         shell: bash
         run: |
           set -euxo pipefail
@@ -65,21 +98,11 @@ jobs:
             -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
             -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
           cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
-          test -x src/build/Bin/FEX
-          test -x src/build/Bin/FEXServer
-
-      - name: Build full real-FEX thunk pair
-        shell: bash
-        run: |
-          set -euxo pipefail
           cd /tmp/repro/fex-full-thunk-pair
           make clean
           make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/build-full-pair.log" 2>&1
-          find . -maxdepth 3 -type f -printf '%P\n' | sort > "$R/full-pair-files.txt"
-          test -x guest/fex_full_lifetime
-          test -d host
 
-      - name: Prepare amd64 rootfs
+      - name: Prepare rootfs
         shell: bash
         run: |
           set -euxo pipefail
@@ -95,38 +118,28 @@ jobs:
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
 
-      - name: Execute lifetime matrix
+      - name: Execute forced-different reload
         shell: bash
         run: |
           set -uxo pipefail
           FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
           HOST="/tmp/repro/fex-full-thunk-pair/host"
-          run_case() {
-            local name="$1"; shift
-            set +e
-            (cd "$ROOTFS/opt/fex-ci/full" && \
-              FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 45s \
-              "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime "$@") \
-              > "$R/$name.stdout" 2> "$R/$name.stderr"
-            local rc=$?
-            set -e
-            echo "$rc" > "$R/$name.exit"
-          }
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/full" && \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime --force-different) \
+            > "$R/rebind.stdout" 2> "$R/rebind.stderr"
+          rc=$?
           set -e
-          run_case stale-alias --call-stale --alias
-          run_case stale-different --call-stale --force-different
-          run_case cycles-different --force-different --cycles 5
-          run_case pin --pin
-          for name in stale-alias stale-different cycles-different pin; do
-            printf '%s=' "$name"; cat "$R/$name.exit"
-            grep -E 'generation|callback|invoker|unmap|mapping|alias|linked|stale|fresh|cycle|pin|SIG|fault|reserved' "$R/$name.stdout" "$R/$name.stderr" || true
-          done > "$R/key-lines.txt"
-          cat "$R/key-lines.txt"
+          echo "$rc" > "$R/rebind.exit"
+          cat "$R/rebind.stdout"
+          cat "$R/rebind.stderr"
+          exit 0
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: full-thunk-lifetime-matrix-${{ github.run_id }}
-          path: receipts-full
+          name: thunk-retire-rebind-${{ github.run_id }}
+          path: receipts-rebind
           retention-days: 30
