@@ -208,6 +208,9 @@ if (BITNESS EQUAL 64)
   target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
   target_include_directories_from_pkgconfig(libvulkan-guest-deps "xcb;x11;xrandr;xrender")
   add_guest_lib(vulkan "libvulkan.so.1")
+  # Diagnostic lifetime policy: the Vulkan guest thunk publishes executable
+  # guest addresses into process-owned bridge state.
+  target_link_options(vulkan-guest PRIVATE "LINKER:-z,nodelete")
 
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories_from_pkgconfig(libdrm-guest-deps libdrm /usr/include/drm /usr/include/libdrm)
