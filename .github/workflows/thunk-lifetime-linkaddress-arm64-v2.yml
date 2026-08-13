@@ -1,0 +1,97 @@
+name: Hosted ARM64 LinkAddress reload probe v2
+
+on:
+  push:
+    branches: [ci/thunk-lifetime-repro-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reload-probe-v2:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-v2
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and identity
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang lld libclang-dev llvm-dev pkg-config libcap-dev gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'fex=%s\nfieldwork=%s\ncarrier=%s\n' "$(git -C src rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" "$GITHUB_SHA" > "$R/identity.txt"
+
+      - name: Reassemble retained fixture
+        run: |
+          set -euxo pipefail
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+
+      - name: Build FEX and server
+        run: |
+          set -euxo pipefail
+          CC=clang CXX=clang++ cmake -S src -B src/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build.log" 2>&1
+          test -x src/build/Bin/FEX
+          test -x src/build/Bin/FEXServer
+
+      - name: Prepare amd64 guest
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci/link"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cd /tmp/repro/fex-linkaddress-guest
+          make clean all CXX=x86_64-linux-gnu-g++
+          cp fex_link_lifetime libguest_link_lifetime.so "$ROOTFS/opt/fex-ci/link/"
+
+      - name: Changed-base reload discriminator
+        run: |
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/link" && FEX_ROOTFS="$ROOTFS" timeout 45s "$GITHUB_WORKSPACE/src/build/Bin/FEX" /opt/fex-ci/link/fex_link_lifetime --force-different) > "$R/reload.stdout" 2> "$R/reload.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/reload.exit"
+          grep -E 'stable native|proof:|reload invoker|reserved old|linked entry|fresh direct' "$R/reload.stdout" > "$R/key-lines.txt" || true
+          grep -E 'already linked elsewhere' "$R/reload.stderr" >> "$R/key-lines.txt" || true
+          cat "$R/key-lines.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linkaddress-reload-v2-${{ github.run_id }}
+          path: receipts-v2
+          if-no-files-found: warn
