@@ -1,0 +1,39 @@
+name: Research apply Vulkan debug-report routing
+
+on:
+  push:
+    branches: [linux-fieldwork/fex-guest-thunk-selfpin]
+    paths:
+      - .github/workflows/research-apply-vulkan-debug-report-routing.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: linux-fieldwork/fex-guest-thunk-selfpin
+      - name: Apply exact routing edit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/libvulkan/Host.cpp')
+          s = p.read_text()
+          old = '''  } else if (a_1 == "vkFreeMemory"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkFreeMemory;\n  } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {\n'''
+          new = '''  } else if (a_1 == "vkFreeMemory"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkFreeMemory;\n  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;\n  } else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;\n  } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {\n'''
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one Vulkan lookup anchor, found {s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git diff --check
+          git diff -- ThunkLibs/libvulkan/Host.cpp
+      - name: Commit routing repair
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add ThunkLibs/libvulkan/Host.cpp
+          git commit -m 'vulkan: route debug report callbacks through custom wrappers'
+          git push origin HEAD:linux-fieldwork/fex-guest-thunk-selfpin
