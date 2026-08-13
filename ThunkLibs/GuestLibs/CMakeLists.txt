@@ -49,11 +49,7 @@ if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
   # uninstall target
   if(NOT TARGET uninstall)
     configure_file("${FEX_PROJECT_SOURCE_DIR}/Data/CMake/cmake_uninstall.cmake.in"
-      "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/cmake_uninstall.cmake"
-      IMMEDIATE @ONLY)
-
-    add_custom_target(uninstall
-      COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/cmake_uninstall.cmake)
+      "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/cmake_uninstall.cmake" @ONLY)
   endif()
 else()
   # We've been included using add_subdirectory, so set up targets for IDE integration using the host toolchain
@@ -208,6 +204,9 @@ if (BITNESS EQUAL 64)
   target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
   target_include_directories_from_pkgconfig(libvulkan-guest-deps "xcb;x11;xrandr;xrender")
   add_guest_lib(vulkan "libvulkan.so.1")
+  # Diagnostic lifetime policy: this thunk publishes guest code addresses into
+  # process-owned FEX bridge state, so keep its image resident for the process.
+  target_link_options(vulkan-guest PRIVATE "LINKER:-z,nodelete")
 
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories_from_pkgconfig(libdrm-guest-deps libdrm /usr/include/drm /usr/include/libdrm)
@@ -224,27 +223,6 @@ add_guest_lib(VDSO "linux-vdso.so.1")
 # Not necessary anyway because it only trampolines
 target_compile_options(VDSO-guest PRIVATE "-fno-stack-protector")
 target_link_options(VDSO-guest PRIVATE "-nostdlib" "LINKER:--no-undefined" "LINKER:-z,max-page-size=4096" "LINKER:--hash-style=both")
-
-if (BITNESS EQUAL 32)
-  # 32-bit entrypoint points to __kernel_vsyscall and needs to exist
-  target_link_options(VDSO-guest PRIVATE "LINKER:-e,__kernel_vsyscall")
-  # 32-bit VDSO needs to have PIC disabled.
-  # Otherwise GCC/Clang generates GOT prologues on the functions that corrupt vsyscall.
-  # Correct:
-  # 00000350 <__kernel_vsyscall>:
-  #  350:   cd 80                   int    0x80
-  #  352:   c3                      ret
-  #  353:   0f 0b                   ud2
-  # Incorrect:
-  # 0000032a <__kernel_vsyscall>:
-  #  32a:   e8 0b 00 00 00          call   33a <__x86.get_pc_thunk.ax>
-  #  32f:   05 79 03 00 00          add    eax,0x379
-  #  334:   cd 80                   int    0x80
-  #  336:   c3                      ret
-  #  337:   90                      nop
-  #  338:   0f 0b                   ud2
-  target_compile_options(VDSO-guest PRIVATE "-fno-pic")
-endif()
 
 if (BUILD_FEX_LINUX_TESTS)
   generate(libfex_thunk_test ${CMAKE_CURRENT_SOURCE_DIR}/../libfex_thunk_test/libfex_thunk_test_interface.cpp)
