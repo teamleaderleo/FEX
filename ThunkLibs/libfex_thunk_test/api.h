@@ -7,9 +7,15 @@
 #include <cstdint>
 #include <limits>
 
+using IndirectFn = uint32_t (*)(uint32_t);
+
 extern "C" {
 
 uint32_t GetDoubledValue(uint32_t);
+
+// FIELDWORK: Return a native function pointer so the guest thunk can exercise
+// the same H -> CallHostFunction<T> indirect-call bridge used by Vulkan.
+IndirectFn GetIndirectFn();
 
 
 /// Interfaces used to test opaque_type and assume_compatible_data_layout annotations
