@@ -1,0 +1,182 @@
+name: Agent F ARM64 Vulkan allocator suppression
+
+on:
+  push:
+    branches: [ci/agent-f-arm64-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  allocator-candidate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      HOST: ${{ github.workspace }}/host-thunks
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan1 mesa-vulkan-drivers
+          git rev-parse HEAD > "$R/identity.txt"
+
+      - name: Apply buffer-only allocator suppression candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('ThunkLibs/libvulkan/libvulkan_interface.cpp')
+          s = p.read_text()
+          old = '''template<>
+          struct fex_gen_config<vkCreateBuffer> {};
+          template<>
+          struct fex_gen_config<vkDestroyBuffer> {};'''
+          new = '''template<>
+          struct fex_gen_config<vkCreateBuffer> : fexgen::custom_host_impl {};
+          template<>
+          struct fex_gen_config<vkDestroyBuffer> : fexgen::custom_host_impl {};'''
+          if old not in s:
+              raise SystemExit('buffer config block missing')
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('ThunkLibs/libvulkan/Host.cpp')
+          s = p.read_text()
+          marker = '''// Functions with callbacks are overridden to ignore the guest-side callbacks
+
+          static VkResult
+          FEXFN_IMPL(vkCreateShaderModule)'''
+          insert = '''// Functions with callbacks are overridden to ignore the guest-side callbacks
+
+          static VkResult FEXFN_IMPL(vkCreateBuffer)(VkDevice a_0, const VkBufferCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkBuffer* a_3) {
+            (void)a_2;
+            (void*&)LDR_PTR(vkCreateBuffer) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateBuffer");
+            return LDR_PTR(vkCreateBuffer)(a_0, a_1, nullptr, a_3);
+          }
+
+          static void FEXFN_IMPL(vkDestroyBuffer)(VkDevice a_0, VkBuffer a_1, const VkAllocationCallbacks* a_2) {
+            (void)a_2;
+            (void*&)LDR_PTR(vkDestroyBuffer) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkDestroyBuffer");
+            LDR_PTR(vkDestroyBuffer)(a_0, a_1, nullptr);
+          }
+
+          static VkResult
+          FEXFN_IMPL(vkCreateShaderModule)'''
+          if marker not in s:
+              raise SystemExit('Host.cpp insertion marker missing')
+          p.write_text(s.replace(marker, insert, 1))
+          PY
+          git diff --check
+          git diff -- ThunkLibs/libvulkan/libvulkan_interface.cpp ThunkLibs/libvulkan/Host.cpp > "$R/candidate.diff"
+
+      - name: Build candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1
+
+      - name: Prepare probe rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat >/tmp/probe.c <<'EOF'
+          #include <vulkan/vulkan.h>
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          static volatile unsigned calls;
+          static void* VKAPI_PTR a(void* u,size_t n,size_t al,VkSystemAllocationScope s){(void)u;(void)s;++calls;if(al<sizeof(void*))al=sizeof(void*);void*p=0;if(posix_memalign(&p,al,n?n:1))return 0;return p;}
+          static void* VKAPI_PTR r(void* u,void* p,size_t n,size_t al,VkSystemAllocationScope s){(void)u;(void)al;(void)s;++calls;return realloc(p,n?n:1);}
+          static void VKAPI_PTR f(void* u,void* p){(void)u;++calls;free(p);}
+          static void VKAPI_PTR ia(void* u,size_t n,VkInternalAllocationType t,VkSystemAllocationScope s){(void)u;(void)n;(void)t;(void)s;++calls;}
+          static void VKAPI_PTR ifr(void* u,size_t n,VkInternalAllocationType t,VkSystemAllocationScope s){(void)u;(void)n;(void)t;(void)s;++calls;}
+          #define R(T,N) T N=(T)dlsym(vk,#N); if(!N)return 3
+          int main(void){
+            void*vk=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);if(!vk)return 2;
+            R(PFN_vkCreateInstance,vkCreateInstance);R(PFN_vkDestroyInstance,vkDestroyInstance);R(PFN_vkEnumeratePhysicalDevices,vkEnumeratePhysicalDevices);
+            R(PFN_vkGetPhysicalDeviceQueueFamilyProperties,vkGetPhysicalDeviceQueueFamilyProperties);R(PFN_vkCreateDevice,vkCreateDevice);R(PFN_vkDestroyDevice,vkDestroyDevice);
+            R(PFN_vkCreateBuffer,vkCreateBuffer);R(PFN_vkDestroyBuffer,vkDestroyBuffer);
+            VkApplicationInfo ai={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName="alloc",.apiVersion=VK_API_VERSION_1_0};
+            VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&ai};VkInstance inst=0;VkResult vr=vkCreateInstance(&ici,0,&inst);if(vr)return 10;
+            uint32_t pc=0;vr=vkEnumeratePhysicalDevices(inst,&pc,0);if(vr||!pc)return 11;VkPhysicalDevice*ps=calloc(pc,sizeof(*ps));vr=vkEnumeratePhysicalDevices(inst,&pc,ps);if(vr)return 12;VkPhysicalDevice pd=ps[0];free(ps);
+            uint32_t qc=0;vkGetPhysicalDeviceQueueFamilyProperties(pd,&qc,0);VkQueueFamilyProperties*qs=calloc(qc,sizeof(*qs));vkGetPhysicalDeviceQueueFamilyProperties(pd,&qc,qs);uint32_t qi=0;while(qi<qc&&!(qs[qi].queueFlags&VK_QUEUE_GRAPHICS_BIT))++qi;free(qs);if(qi==qc)return 13;
+            float pr=1;VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=qi,.queueCount=1,.pQueuePriorities=&pr};VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};VkDevice dev=0;vr=vkCreateDevice(pd,&dci,0,&dev);if(vr)return 14;
+            VkAllocationCallbacks ac={.pfnAllocation=a,.pfnReallocation=r,.pfnFree=f,.pfnInternalAllocation=ia,.pfnInternalFree=ifr};VkBufferCreateInfo bci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=4096,.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT,.sharingMode=VK_SHARING_MODE_EXCLUSIVE};VkBuffer b=0;
+            calls=0;fprintf(stderr,"BEFORE calls=%u\n",calls);vr=vkCreateBuffer(dev,&bci,&ac,&b);fprintf(stderr,"AFTER_CREATE result=%d calls=%u\n",vr,calls);if(vr==VK_SUCCESS){vkDestroyBuffer(dev,b,&ac);fprintf(stderr,"AFTER_DESTROY calls=%u\n",calls);}vkDestroyDevice(dev,0);vkDestroyInstance(inst,0);return vr==VK_SUCCESS&&calls==0?30:20;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -I"$GITHUB_WORKSPACE/External/Vulkan-Headers/include" /tmp/probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/probe"
+
+      - name: Execute candidate
+        shell: bash
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/probe > "$R/run.stdout" 2> "$R/run.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/run.exit"
+          cat "$R/run.stderr"
+          echo "exit=$rc"
+          exit 0
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-f-buffer-allocator-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
