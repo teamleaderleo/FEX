@@ -59,3 +59,11 @@ jobs:
       - name: Build Vulkan thunks
         run: |
           cmake --build build --target vulkan-host-64 guest-libs -j"$(nproc)"
+
+      - name: Inspect generated debug utils layout
+        run: |
+          set -euxo pipefail
+          generated=build/gen_64/thunkgen_host_libvulkan.inl
+          test -f "$generated"
+          grep -n -A24 -B6 'guest_layout<VkDebugUtilsMessengerCreateInfoEXT>' "$generated"
+          grep -n -A24 -B6 'host_layout<VkDebugUtilsMessengerCreateInfoEXT>' "$generated"
