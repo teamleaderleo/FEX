@@ -1,0 +1,261 @@
+name: Agent C hosted ARM64 Finding A probe v2
+
+on:
+  push:
+    branches:
+      - ci/agent-c-finding-a-arm64-20260814
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  finding-a-v2:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_PROBE_SHA: 1b268a6742768086aa8355e997c10b4423319ba6
+      DEBIAN_FRONTEND: noninteractive
+      ROOTFS_DIR: ${{ github.workspace }}/rootfs-amd64
+      RECEIPT_DIR: ${{ github.workspace }}/receipts-v2
+      HOST_BASE: ${{ github.workspace }}/host-baseline-v2
+      HOST_CANDIDATE: ${{ github.workspace }}/host-candidate-v2
+      FEX_PORTABLE: 1
+
+    steps:
+      - name: Checkout disposable CI branch
+        uses: actions/checkout@v4
+
+      - name: Checkout exact FEX source under test
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: fex-src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout pinned internal probe
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_PROBE_SHA }}
+          path: fieldwork-probes
+          fetch-depth: 1
+
+      - name: Prepare receipts and dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RECEIPT_DIR" "$HOST_BASE" "$HOST_CANDIDATE"
+          test "$(git -C fex-src rev-parse HEAD)" = "$FEX_SHA"
+          {
+            echo "requested_fex_sha=$FEX_SHA"
+            echo "actual_fex_sha=$(git -C fex-src rev-parse HEAD)"
+            echo "fieldwork_probe_sha=$(git -C fieldwork-probes rev-parse HEAD)"
+            echo "ci_branch_sha=$GITHUB_SHA"
+            date -u +%FT%TZ
+            uname -a
+            uname -m
+          } | tee "$RECEIPT_DIR/identity.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang lld libclang-dev llvm-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools
+
+      - name: Native ARM64 Lavapipe control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" > "$RECEIPT_DIR/lvp-icd-path.txt"
+          VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary \
+            >"$RECEIPT_DIR/native-vulkaninfo.stdout" \
+            2>"$RECEIPT_DIR/native-vulkaninfo.stderr"
+          cc -O2 -Wall -Wextra \
+            fieldwork-probes/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c \
+            -ldl -o /tmp/callback-probe-arm64
+          VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-probe-arm64 report gipa positive \
+            >"$RECEIPT_DIR/native-callback.stdout" \
+            2>"$RECEIPT_DIR/native-callback.stderr"
+
+      - name: Configure exact FEX source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang CXX=clang++ cmake -S fex-src -B fex-src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DUSE_LINKER=lld \
+            -DENABLE_LTO=OFF \
+            -DENABLE_ASSERTIONS=ON \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF \
+            -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none \
+            -DX86_DEV_ROOTFS=/ \
+            >"$RECEIPT_DIR/cmake-host.log" 2>&1
+
+      - name: Build runtime, server, thunkgen, and 64-bit Vulkan host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake --build fex-src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v \
+            >"$RECEIPT_DIR/build-host.log" 2>&1
+          test -x fex-src/build/Bin/FEX
+          test -x fex-src/build/Bin/FEXServer
+          test -x fex-src/build/Bin/thunkgen
+          test -f fex-src/build/HostLibs_64/libvulkan-host.so
+          cp fex-src/build/HostLibs_64/libvulkan-host.so "$HOST_BASE/libvulkan-host.so"
+          file fex-src/build/Bin/FEX fex-src/build/Bin/FEXServer fex-src/build/Bin/thunkgen "$HOST_BASE/libvulkan-host.so" \
+            > "$RECEIPT_DIR/host-files.txt"
+
+      - name: Build 64-bit Vulkan guest thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S fex-src/ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/fex-src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/fex-src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/fex-src/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ \
+            >"$RECEIPT_DIR/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" -v \
+            >"$RECEIPT_DIR/build-guest.log" 2>&1
+          test -f guest-build/libvulkan-guest.so
+
+      - name: Create amd64 runtime rootfs and probes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 >"$RECEIPT_DIR/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS_DIR"
+          docker export "$cid" | tar -C "$ROOTFS_DIR" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          test -x "$ROOTFS_DIR/lib64/ld-linux-x86-64.so.2"
+          mkdir -p "$ROOTFS_DIR/usr/lib/x86_64-linux-gnu" "$ROOTFS_DIR/opt/fex-ci"
+          cp guest-build/libvulkan-guest.so "$ROOTFS_DIR/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS_DIR/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS_DIR/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/static-smoke.c <<'EOF'
+          #include <unistd.h>
+          int main(void) {
+            static const char text[] = "STATIC_SMOKE_MAIN\n";
+            return write(2, text, sizeof(text) - 1) == (ssize_t)(sizeof(text) - 1) ? 0 : 1;
+          }
+          EOF
+          cat >/tmp/phase-probe.c <<'EOF'
+          #include <dlfcn.h>
+          #include <string.h>
+          #include <unistd.h>
+          static void marker(const char *s) { (void)write(2, s, strlen(s)); }
+          int main(int argc, char **argv) {
+            marker("PHASE_MAIN\n");
+            if (argc == 1 || strcmp(argv[1], "plain") == 0) { marker("PHASE_PLAIN_EXIT\n"); return 0; }
+            marker("PHASE_BEFORE_DLOPEN\n");
+            void *h = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!h) { marker("PHASE_DLOPEN_ERROR\n"); return 2; }
+            marker("PHASE_AFTER_DLOPEN\n");
+            _exit(0);
+          }
+          EOF
+          x86_64-linux-gnu-gcc -static -O2 -Wall -Wextra -Werror /tmp/static-smoke.c -o "$ROOTFS_DIR/opt/fex-ci/static-smoke"
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/phase-probe.c -ldl -o "$ROOTFS_DIR/opt/fex-ci/phase-probe"
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror \
+            fieldwork-probes/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c \
+            -ldl -o "$ROOTFS_DIR/opt/fex-ci/callback-probe"
+
+      - name: Run baseline discriminators
+        shell: bash
+        run: |
+          set -uxo pipefail
+          LVP_ICD="$(cat "$RECEIPT_DIR/lvp-icd-path.txt")"
+          FEX_BIN="$GITHUB_WORKSPACE/fex-src/build/Bin/FEX"
+          run_case() {
+            local name="$1"; shift
+            set +e
+            VK_DRIVER_FILES="$LVP_ICD" FEX_ROOTFS="$ROOTFS_DIR" FEX_THUNKHOSTLIBS="$HOST_BASE" \
+              "$FEX_BIN" "$@" >"$RECEIPT_DIR/$name.stdout" 2>"$RECEIPT_DIR/$name.stderr"
+            local rc=$?
+            set -e
+            echo "$rc" >"$RECEIPT_DIR/$name.exit"
+          }
+          set -e
+          run_case static-smoke /opt/fex-ci/static-smoke
+          run_case dynamic-plain /opt/fex-ci/phase-probe plain
+          run_case dynamic-vulkan /opt/fex-ci/phase-probe vulkan
+          run_case report-direct /opt/fex-ci/callback-probe report direct positive
+          run_case report-gipa-baseline /opt/fex-ci/callback-probe report gipa positive
+          for f in static-smoke dynamic-plain dynamic-vulkan report-direct report-gipa-baseline; do
+            printf '%s=' "$f"; cat "$RECEIPT_DIR/$f.exit"
+          done | tee "$RECEIPT_DIR/baseline-matrix.txt"
+
+      - name: Apply diagnostic route and run candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('fex-src/ThunkLibs/libvulkan/Host.cpp')
+          s = p.read_text()
+          old = '  } else if (a_1 == "vkFreeMemory"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkFreeMemory;\n'
+          new = old + '  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'anchor count {s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          test "$(git -C fex-src rev-parse HEAD)" = "$FEX_SHA"
+          git -C fex-src diff -- ThunkLibs/libvulkan/Host.cpp > "$RECEIPT_DIR/diagnostic.diff"
+          cmake --build fex-src/build --target vulkan-host-64 -- -j"$(nproc)" -v \
+            >"$RECEIPT_DIR/rebuild-candidate.log" 2>&1
+          cp fex-src/build/HostLibs_64/libvulkan-host.so "$HOST_CANDIDATE/libvulkan-host.so"
+
+          LVP_ICD="$(cat "$RECEIPT_DIR/lvp-icd-path.txt")"
+          FEX_BIN="$GITHUB_WORKSPACE/fex-src/build/Bin/FEX"
+          set +e
+          VK_DRIVER_FILES="$LVP_ICD" FEX_ROOTFS="$ROOTFS_DIR" FEX_THUNKHOSTLIBS="$HOST_CANDIDATE" \
+            "$FEX_BIN" /opt/fex-ci/callback-probe report gipa positive \
+            >"$RECEIPT_DIR/report-gipa-candidate.stdout" \
+            2>"$RECEIPT_DIR/report-gipa-candidate.stderr"
+          candidate=$?
+          set -e
+          echo "$candidate" > "$RECEIPT_DIR/report-gipa-candidate.exit"
+
+          static="$(cat "$RECEIPT_DIR/static-smoke.exit")"
+          plain="$(cat "$RECEIPT_DIR/dynamic-plain.exit")"
+          vulkan="$(cat "$RECEIPT_DIR/dynamic-vulkan.exit")"
+          direct="$(cat "$RECEIPT_DIR/report-direct.exit")"
+          baseline="$(cat "$RECEIPT_DIR/report-gipa-baseline.exit")"
+          {
+            echo "static_smoke=$static"
+            echo "dynamic_plain=$plain"
+            echo "dynamic_vulkan=$vulkan"
+            echo "report_direct=$direct"
+            echo "report_gipa_baseline=$baseline"
+            echo "report_gipa_candidate=$candidate"
+            if [[ "$static" != 0 ]]; then echo "first_owner=fex-runtime";
+            elif [[ "$plain" != 0 ]]; then echo "first_owner=x86-dynamic-rootfs";
+            elif [[ "$vulkan" != 0 ]]; then echo "first_owner=guest-vulkan-load";
+            elif [[ "$direct" != 0 ]]; then echo "first_owner=direct-vulkan-thunk";
+            elif [[ "$baseline" == 0 ]]; then echo "first_owner=finding-a-baseline-unexpectedly-clean";
+            elif [[ "$candidate" == 0 ]]; then echo "first_owner=finding-a-dynamic-routing";
+            else echo "first_owner=finding-a-runtime-or-candidate"; fi
+          } | tee "$RECEIPT_DIR/classification.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-finding-a-arm64-v2-${{ github.run_id }}
+          path: receipts-v2
+          if-no-files-found: warn
