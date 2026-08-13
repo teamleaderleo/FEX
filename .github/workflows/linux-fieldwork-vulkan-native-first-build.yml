@@ -5,7 +5,7 @@ on:
   push:
     branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
     paths:
-      - LINUX_FIELDWORK_NATIVE_FIRST_V2.patch
+      - LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
       - .github/workflows/linux-fieldwork-vulkan-native-first-build.yml
 
 permissions:
@@ -29,8 +29,8 @@ jobs:
       - name: Apply experiment
         run: |
           set -euxo pipefail
-          git apply --check LINUX_FIELDWORK_NATIVE_FIRST_V2.patch
-          git apply LINUX_FIELDWORK_NATIVE_FIRST_V2.patch
+          git apply --check LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
+          git apply LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
           git diff --check
           grep -q 'vkCreateDebugReportCallbackEXT' ThunkLibs/libvulkan/Host.cpp
           grep -q 'vkDestroyDebugReportCallbackEXT' ThunkLibs/libvulkan/Host.cpp
