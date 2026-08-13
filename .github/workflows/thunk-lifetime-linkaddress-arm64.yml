@@ -1,0 +1,121 @@
+name: Hosted ARM64 LinkAddress reload probe
+
+on:
+  push:
+    branches: [ci/thunk-lifetime-repro-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reload-probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
+      ROOTFS_DIR: ${{ github.workspace }}/rootfs-amd64
+      RECEIPT_DIR: ${{ github.workspace }}/receipts
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: fex-src
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RECEIPT_DIR"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang lld libclang-dev llvm-dev pkg-config libcap-dev \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          {
+            echo "fex_sha=$(git -C fex-src rev-parse HEAD)"
+            echo "fieldwork_sha=$(git -C fieldwork rev-parse HEAD)"
+            echo "carrier_sha=$GITHUB_SHA"
+            uname -a
+          } > "$RECEIPT_DIR/identity.txt"
+
+      - name: Reassemble retained fixture
+        run: |
+          set -euxo pipefail
+          src="fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64"
+          base64 -d "$src" > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+
+      - name: Build FEX runtime
+        run: |
+          set -euxo pipefail
+          CC=clang CXX=clang++ cmake -S fex-src -B fex-src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DUSE_LINKER=lld \
+            -DENABLE_LTO=OFF \
+            -DENABLE_ASSERTIONS=ON \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF \
+            -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none \
+            -DX86_DEV_ROOTFS=/ > "$RECEIPT_DIR/cmake.log" 2>&1
+          cmake --build fex-src/build --target FEXServer -- -j"$(nproc)" -v > "$RECEIPT_DIR/build.log" 2>&1
+          test -x fex-src/build/Bin/FEX
+          test -x fex-src/build/Bin/FEXServer
+
+      - name: Prepare amd64 rootfs and guest fixture
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$RECEIPT_DIR/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS_DIR"
+          docker export "$cid" | tar -C "$ROOTFS_DIR" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS_DIR/usr/lib/x86_64-linux-gnu" "$ROOTFS_DIR/opt/fex-ci/link"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS_DIR/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS_DIR/usr/lib/x86_64-linux-gnu/"
+          cd /tmp/repro/fex-linkaddress-guest
+          make clean all CXX=x86_64-linux-gnu-g++
+          cp fex_link_lifetime libguest_link_lifetime.so "$ROOTFS_DIR/opt/fex-ci/link/"
+
+      - name: Run changed-base reload case
+        run: |
+          set +e
+          FEX_BIN="$GITHUB_WORKSPACE/fex-src/build/Bin/FEX"
+          (
+            cd "$ROOTFS_DIR/opt/fex-ci/link"
+            FEX_ROOTFS="$ROOTFS_DIR" timeout 45s "$FEX_BIN" /opt/fex-ci/link/fex_link_lifetime --force-different
+          ) > "$RECEIPT_DIR/reload.stdout" 2> "$RECEIPT_DIR/reload.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$RECEIPT_DIR/reload.exit"
+          grep -E 'stable native|proof:|reload invoker|reserved old|linked entry|fresh direct' "$RECEIPT_DIR/reload.stdout" > "$RECEIPT_DIR/key-lines.txt" || true
+          grep -E 'already linked elsewhere' "$RECEIPT_DIR/reload.stderr" >> "$RECEIPT_DIR/key-lines.txt" || true
+          cat "$RECEIPT_DIR/key-lines.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linkaddress-reload-${{ github.run_id }}
+          path: receipts
+          if-no-files-found: warn
