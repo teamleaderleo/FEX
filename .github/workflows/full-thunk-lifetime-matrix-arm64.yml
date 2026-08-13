@@ -1,4 +1,4 @@
-name: Thunk exact-evict rebind diagnostic ARM64
+name: Thunk shared-evict rebind diagnostic ARM64
 
 on:
   push:
@@ -52,35 +52,32 @@ jobs:
           mkdir /tmp/repro
           tar xf /tmp/repro.tar.gz -C /tmp/repro
           sed -n '315,345p' /tmp/repro/fex-full-thunk-pair/guest/main.cpp > "$R/fixture-rebind-site.txt"
-          cat "$R/fixture-rebind-site.txt"
 
-      - name: Apply exact-entry eviction diagnostic
+      - name: Apply shared exact-entry eviction diagnostic
         shell: bash
         run: |
           set -euxo pipefail
           python3 - <<'PY'
           from pathlib import Path
 
-          # Add an exact-entry cache eviction helper. Unlike InvalidateCacheRange,
-          # this does not depend on CodePages/CachedCodePages reverse indexes.
           p = Path('src/FEXCore/Source/Interface/Core/LookupCache.h')
           s = p.read_text()
-          marker = '  bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {'
-          insert = '''  // Diagnostic: invalidate one exact entry even when it has no guest code-page registration.
-          bool InvalidateExactEntry(uint64_t Address) {
-            auto lk = Shared->AcquireWriteLock();
-            InvalidateCache(Address, lk);
-            return Shared->Erase(Address, lk);
-          }
+          marker = '''  void InvalidateRange(uint64_t Start, uint64_t Length) {
+              auto lk = AcquireWriteLock();'''
+          insert = '''  // Diagnostic: erase one exact compiled entry without relying on CodePages.
+            bool InvalidateExactEntry(uint64_t Address) {
+              auto lk = AcquireWriteLock();
+              return Erase(Address, lk);
+            }
 
-          bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {'''
+            void InvalidateRange(uint64_t Start, uint64_t Length) {
+              auto lk = AcquireWriteLock();'''
           if marker not in s:
-              raise SystemExit('LookupCache insertion marker missing')
+              raise SystemExit('GuestToHostMap insertion marker missing')
           p.write_text(s.replace(marker, insert, 1))
 
           p = Path('src/FEXCore/Source/Interface/Core/Core.cpp')
           s = p.read_text()
-
           old = '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  HasCustomIRHandlers = true;\n'
           new = '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  fprintf(stderr, "DIAG_CUSTOM_ADD H=%#lx inserted=%d data=%p\\n", Entrypoint, InsertedIterator.second ? 1 : 0, Data);\n  HasCustomIRHandlers = true;\n'
           if old not in s:
@@ -106,7 +103,7 @@ jobs:
                 }
               }
             }
-            fprintf(stderr, "DIAG_CUSTOM_REMOVE H=%#lx handler=%zu exact=%zu\\n", Entrypoint, Erased, ExactEvictions);
+            fprintf(stderr, "DIAG_CUSTOM_REMOVE H=%#lx handler=%zu shared_exact=%zu\\n", Entrypoint, Erased, ExactEvictions);
           }'''
           s = s.replace(old, new, 1)
 
@@ -133,7 +130,7 @@ jobs:
           p.write_text(s.replace(old, new, 1))
           PY
           git -C src diff --check
-          git -C src diff -- FEXCore/Source/Interface/Core/LookupCache.h FEXCore/Source/Interface/Core/Core.cpp > "$R/exact-evict.diff"
+          git -C src diff -- FEXCore/Source/Interface/Core/LookupCache.h FEXCore/Source/Interface/Core/Core.cpp > "$R/shared-evict.diff"
 
       - name: Build diagnostic FEX and full thunk pair
         shell: bash
@@ -189,6 +186,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: thunk-exact-evict-rebind-${{ github.run_id }}
+          name: thunk-shared-evict-rebind-${{ github.run_id }}
           path: receipts-rebind
           retention-days: 30
