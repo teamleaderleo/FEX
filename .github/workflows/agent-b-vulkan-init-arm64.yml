@@ -1,0 +1,277 @@
+name: Agent B hosted ARM64 Vulkan init ladder
+
+on:
+  push:
+    branches: [ci/agent-b-vulkan-init-arm64-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  init-ladder:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      PROBE_SHA: 1b268a6742768086aa8355e997c10b4423319ba6
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts-agent-b
+      H0: ${{ github.workspace }}/host0
+      H1: ${{ github.workspace }}/host1
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.PROBE_SHA }}
+          path: probes
+          fetch-depth: 1
+
+      - name: Identity and dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H0" "$H1"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          {
+            echo "fex_sha=$(git -C src rev-parse HEAD)"
+            echo "probe_sha=$(git -C probes rev-parse HEAD)"
+            echo "ci_sha=$GITHUB_SHA"
+            uname -a
+            uname -m
+          } | tee "$R/identity.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools
+
+      - name: Native ARM64 Lavapipe control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP"
+          echo "$LVP" > "$R/lvp.txt"
+          VK_DRIVER_FILES="$LVP" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
+
+      - name: Build exact FEX runtime and 64-bit Vulkan host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ >"$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v >"$R/build-host.log" 2>&1
+          test -x src/build/Bin/FEX
+          test -x src/build/Bin/FEXServer
+          test -f src/build/HostLibs_64/libvulkan-host.so
+          cp src/build/HostLibs_64/libvulkan-host.so "$H0/libvulkan-host.so"
+
+      - name: Build exact 64-bit Vulkan guest thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
+          test -f guest/libvulkan-guest.so
+          file guest/libvulkan-guest.so > "$R/guest-file.txt"
+
+      - name: Create amd64 rootfs and phase probes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 >"$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          test -x "$ROOTFS/lib64/ld-linux-x86-64.so.2"
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/static.c <<'EOF'
+          #include <unistd.h>
+          int main(void) {
+            static const char s[] = "STATIC_OK\n";
+            return write(2, s, sizeof(s)-1) == (ssize_t)(sizeof(s)-1) ? 0 : 1;
+          }
+          EOF
+
+          cat >/tmp/phase.c <<'EOF'
+          #include <dlfcn.h>
+          #include <string.h>
+          #include <unistd.h>
+          static void marker(const char *s) {
+            size_t left = strlen(s);
+            while (left) {
+              ssize_t n = write(2, s, left);
+              if (n <= 0) _exit(99);
+              s += n;
+              left -= (size_t)n;
+            }
+          }
+          int main(int argc, char **argv) {
+            marker("PHASE_MAIN\n");
+            if (argc < 2 || strcmp(argv[1], "plain") == 0) { marker("PHASE_PLAIN_EXIT\n"); return 0; }
+            const char *name = strcmp(argv[1], "x11") == 0 ? "libX11.so.6" : "libvulkan.so.1";
+            marker("PHASE_BEFORE_DLOPEN\n");
+            void *h = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+            if (!h) { marker("PHASE_DLOPEN_ERROR\n"); return 2; }
+            marker("PHASE_AFTER_DLOPEN\n");
+            _exit(0);
+          }
+          EOF
+
+          cat >/tmp/internal.cpp <<'EOF'
+          #include "common/Guest.h"
+          #include <cstring>
+          #include <unistd.h>
+          static void marker(const char *s) {
+            size_t left = std::strlen(s);
+            while (left) {
+              ssize_t n = write(2, s, left);
+              if (n <= 0) _exit(99);
+              s += n;
+              left -= (size_t)n;
+            }
+          }
+          int main(int argc, char **argv) {
+            if (argc != 2) return 64;
+            marker("INTERNAL_MAIN\n");
+            if (std::strcmp(argv[1], "builtin") == 0) {
+              marker("INTERNAL_BEFORE_IS_LOADED\n");
+              bool loaded = IsLibLoaded("libvulkan");
+              marker(loaded ? "INTERNAL_LOADED=1\n" : "INTERNAL_LOADED=0\n");
+              marker("INTERNAL_AFTER_IS_LOADED\n");
+              return 0;
+            }
+            if (std::strcmp(argv[1], "loadlib") == 0) {
+              LoadlibArgs args = {"libvulkan", 0};
+              marker("INTERNAL_BEFORE_LOADLIB\n");
+              fexthunks_fex_loadlib(&args);
+              marker("INTERNAL_AFTER_LOADLIB\n");
+              return 0;
+            }
+            return 64;
+          }
+          EOF
+
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *display, int discard) { (void)display; (void)discard; return 0; }
+          void *XGetVisualInfo(void *display, long mask, void *templ, int *count) {
+            (void)display; (void)mask; (void)templ; if (count) *count = 0; return 0;
+          }
+          const char *XDisplayString(void *display) { (void)display; return ":0"; }
+          EOF
+
+          x86_64-linux-gnu-gcc -static -O2 -Wall -Wextra -Werror /tmp/static.c -o "$ROOTFS/opt/fex-ci/static"
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/phase.c -ldl -o "$ROOTFS/opt/fex-ci/phase"
+          x86_64-linux-gnu-g++ -std=c++20 -O2 -Wall -Wextra -Werror \
+            -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" /tmp/internal.cpp -o "$ROOTFS/opt/fex-ci/internal"
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o /tmp/libX11.so.6
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror \
+            probes/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c \
+            -ldl -o "$ROOTFS/opt/fex-ci/callback"
+          file "$ROOTFS/opt/fex-ci/"* /tmp/libX11.so.6 > "$R/x86-files.txt"
+
+      - name: Run initialization ladder
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP="$(cat "$R/lvp.txt")"
+          run_case() {
+            local name="$1"; shift
+            set +e
+            VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H0" \
+              "$FEX" "$@" >"$R/$name.out" 2>"$R/$name.err"
+            local rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+          }
+          set -e
+          run_case static /opt/fex-ci/static
+          run_case plain /opt/fex-ci/phase plain
+          run_case builtin /opt/fex-ci/internal builtin
+          run_case loadlib /opt/fex-ci/internal loadlib
+          run_case x11_missing /opt/fex-ci/phase x11
+          run_case vulkan_no_x11 /opt/fex-ci/phase vulkan
+
+          cp /tmp/libX11.so.6 "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          run_case x11_stub /opt/fex-ci/phase x11
+          run_case vulkan_with_x11 /opt/fex-ci/phase vulkan
+          run_case report_direct0 /opt/fex-ci/callback report direct 0
+          run_case report_gipa0 /opt/fex-ci/callback report gipa 0
+
+          for x in static plain builtin loadlib x11_missing vulkan_no_x11 x11_stub vulkan_with_x11 report_direct0 report_gipa0; do
+            printf '%s=' "$x"; cat "$R/$x.exit"
+          done | tee "$R/init-matrix.txt"
+
+      - name: Apply Finding A diagnostic route and rerun dynamic probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/ThunkLibs/libvulkan/Host.cpp')
+          s=p.read_text()
+          old='  } else if (a_1 == "vkFreeMemory"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkFreeMemory;\n'
+          new=old+'  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;\n'
+          if s.count(old) != 1: raise SystemExit(f'anchor count={s.count(old)}')
+          p.write_text(s.replace(old,new,1))
+          PY
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          git -C src diff -- ThunkLibs/libvulkan/Host.cpp > "$R/diagnostic.diff"
+          cmake --build src/build --target vulkan-host-64 -- -j"$(nproc)" -v >"$R/rebuild-candidate.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$H1/libvulkan-host.so"
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP="$(cat "$R/lvp.txt")"
+          set +e
+          VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H1" \
+            "$FEX" /opt/fex-ci/callback report gipa 0 >"$R/report_candidate0.out" 2>"$R/report_candidate0.err"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/report_candidate0.exit"
+          {
+            echo "fex_sha=$FEX_SHA"
+            for x in static plain builtin loadlib x11_missing vulkan_no_x11 x11_stub vulkan_with_x11 report_direct0 report_gipa0; do
+              printf '%s=' "$x"; cat "$R/$x.exit"
+            done
+            echo "report_candidate0=$rc"
+          } | tee "$R/final-matrix.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-b-vulkan-init-arm64-${{ github.run_id }}
+          path: receipts-agent-b
+          if-no-files-found: warn
+          retention-days: 14
