@@ -1,4 +1,4 @@
-name: Agent C callback routing candidate
+name: Agent C callback family confirmation
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  callback-candidate:
+  callback-family:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
@@ -58,7 +58,7 @@ jobs:
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools
 
-      - name: Native ARM64 callback control
+      - name: Native ARM64 callback controls
         shell: bash
         run: |
           set -euxo pipefail
@@ -70,7 +70,9 @@ jobs:
             fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c \
             -ldl -o /tmp/callback-arm64
           VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 report gipa positive \
-            >"$R/native-callback.out" 2>"$R/native-callback.err"
+            >"$R/native-report.out" 2>"$R/native-report.err"
+          VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 utils gipa positive \
+            >"$R/native-utils.out" 2>"$R/native-utils.err"
 
       - name: Apply candidate and build FEX Vulkan thunk pair
         shell: bash
@@ -129,7 +131,7 @@ jobs:
             -ldl -o "$ROOTFS/opt/fex-ci/callback-probe"
           file "$ROOTFS/opt/fex-ci/callback-probe" "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6" > "$R/guest-files.txt"
 
-      - name: Run direct and GIPA candidate
+      - name: Run callback family candidate matrix
         shell: bash
         run: |
           set -uxo pipefail
@@ -146,20 +148,24 @@ jobs:
             cat "$R/$name.err"
           }
           set -e
-          run_case direct /opt/fex-ci/callback-probe report direct 0
-          run_case gipa /opt/fex-ci/callback-probe report gipa 0
+          run_case report-direct /opt/fex-ci/callback-probe report direct 0
+          run_case report-gipa /opt/fex-ci/callback-probe report gipa 0
+          run_case utils-direct /opt/fex-ci/callback-probe utils direct 0
+          run_case utils-gipa /opt/fex-ci/callback-probe utils gipa 0
           {
-            printf 'direct='; cat "$R/direct.exit"
-            printf 'gipa='; cat "$R/gipa.exit"
-          } | tee "$R/callback-matrix.txt"
-          test "$(cat "$R/direct.exit")" = 0
-          test "$(cat "$R/gipa.exit")" = 0
+            for name in report-direct report-gipa utils-direct utils-gipa; do
+              printf '%s=' "$name"; cat "$R/$name.exit"
+            done
+          } | tee "$R/callback-family-matrix.txt"
+          for name in report-direct report-gipa utils-direct utils-gipa; do
+            test "$(cat "$R/$name.exit")" = 0
+          done
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-c-callback-candidate-${{ github.run_id }}
+          name: agent-c-callback-family-${{ github.run_id }}
           path: receipts
           if-no-files-found: warn
           retention-days: 14
