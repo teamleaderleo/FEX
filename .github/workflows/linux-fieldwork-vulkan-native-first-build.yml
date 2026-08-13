@@ -38,7 +38,23 @@ jobs:
 
       - name: Configure
         run: |
-          CC=clang CXX=clang++ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=False -DENABLE_ASSERTIONS=True -DBUILD_TESTING=False -DBUILD_THUNKS=True -DBUILD_FEXCONFIG=False -DENABLE_CLANG_THUNKS=True -DRANGES_NATIVE=OFF
+          set -euxo pipefail
+          CLANG_DIR=$(dirname "$(find /usr/lib/llvm-18 -type f -name ClangConfig.cmake -print -quit)")
+          LLVM_DIR=$(dirname "$(find /usr/lib/llvm-18 -type f -name LLVMConfig.cmake -print -quit)")
+          test -f "$CLANG_DIR/ClangConfig.cmake"
+          test -f "$LLVM_DIR/LLVMConfig.cmake"
+          CC=clang CXX=clang++ cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DUSE_LINKER=lld \
+            -DENABLE_LTO=False \
+            -DENABLE_ASSERTIONS=True \
+            -DBUILD_TESTING=False \
+            -DBUILD_THUNKS=True \
+            -DBUILD_FEXCONFIG=False \
+            -DENABLE_CLANG_THUNKS=True \
+            -DRANGES_NATIVE=OFF \
+            -DClang_DIR="$CLANG_DIR" \
+            -DLLVM_DIR="$LLVM_DIR"
 
       - name: Build Vulkan thunks
         run: |
