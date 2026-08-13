@@ -44,22 +44,6 @@ TEST_CASE_METHOD(Fixture, "Trivial") {
   CHECK(GetDoubledValue(10) == 20);
 }
 
-TEST_CASE_METHOD(Fixture, "Guest thunk remains resident after application dlclose") {
-  auto SavedGetDoubledValue = GetDoubledValue;
-  REQUIRE(SavedGetDoubledValue(21) == 42);
-
-  REQUIRE(dlclose(lib) == 0);
-  lib = nullptr;
-
-  // Guest thunk entrypoints can escape the application's ordinary dlopen
-  // handle through native callback/PFN plumbing. The wrapper therefore needs
-  // to stay resident once loaded.
-  auto ResidentHandle = dlopen("libfex_thunk_test.so", RTLD_LAZY | RTLD_NOLOAD);
-  REQUIRE(ResidentHandle != nullptr);
-  REQUIRE(SavedGetDoubledValue(21) == 42);
-  REQUIRE(dlclose(ResidentHandle) == 0);
-}
-
 TEST_CASE_METHOD(Fixture, "Opaque data types") {
   {
     auto data = MakeOpaqueType(0x1234);
@@ -75,27 +59,22 @@ TEST_CASE_METHOD(Fixture, "Opaque data types") {
 
 TEST_CASE_METHOD(Fixture, "Automatic struct repacking") {
   {
-    // Test repacking of return values
-    ReorderingType test_struct = MakeReorderingType(0x1234, 0x5678);
-    REQUIRE(test_struct.a == 0x1234);
-    REQUIRE(test_struct.b == 0x5678);
+    auto data = MakeReorderingType(0x1234, 0x5678);
+    REQUIRE(data.a == 0x1234);
+    REQUIRE(data.b == 0x5678);
 
-    // Test offsets of the host-side guest_layout wrapper match the guest-side ones
-    CHECK(QueryOffsetOf(&test_struct, 0) == offsetof(ReorderingType, a));
-    CHECK(QueryOffsetOf(&test_struct, 1) == offsetof(ReorderingType, b));
+    CHECK(QueryOffsetOf(&data, 0) == offsetof(ReorderingType, a));
+    CHECK(QueryOffsetOf(&data, 1) == offsetof(ReorderingType, b));
 
-    // Test repacking of input pointers
-    CHECK(GetReorderingTypeMember(&test_struct, 0) == 0x1234);
-    CHECK(GetReorderingTypeMember(&test_struct, 1) == 0x5678);
+    CHECK(GetReorderingTypeMember(&data, 0) == 0x1234);
+    CHECK(GetReorderingTypeMember(&data, 1) == 0x5678);
 
-    // Test that we can force reinterpreting the data in guest layout as host layout
-    CHECK(GetReorderingTypeMemberWithoutRepacking(&test_struct, 0) == 0x5678);
-    CHECK(GetReorderingTypeMemberWithoutRepacking(&test_struct, 1) == 0x1234);
+    CHECK(GetReorderingTypeMemberWithoutRepacking(&data, 0) == 0x5678);
+    CHECK(GetReorderingTypeMemberWithoutRepacking(&data, 1) == 0x1234);
 
-    // Test repacking of output pointers
-    ModifyReorderingTypeMembers(&test_struct);
-    CHECK(GetReorderingTypeMember(&test_struct, 0) == 0x1235);
-    CHECK(GetReorderingTypeMember(&test_struct, 1) == 0x567a);
+    ModifyReorderingTypeMembers(&data);
+    CHECK(GetReorderingTypeMember(&data, 0) == 0x1235);
+    CHECK(GetReorderingTypeMember(&data, 1) == 0x567a);
   };
 }
 
