@@ -1,0 +1,159 @@
+name: Agent D ARM64 Vulkan allocator semantics
+
+on:
+  push:
+    branches: [ci/agent-d-arm64-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      HOST: ${{ github.workspace }}/host-thunks
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan1 mesa-vulkan-drivers
+          git rev-parse HEAD > "$R/product-sha.txt"
+
+      - name: Build current FEX Vulkan thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1
+
+      - name: Prepare amd64 rootfs and probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 \
+            /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat >/tmp/allocator_probe.c <<'EOF'
+          #include <vulkan/vulkan.h>
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+
+          static volatile unsigned calls;
+          static void* VKAPI_PTR a(void* u,size_t n,size_t align,VkSystemAllocationScope s){
+            (void)u;(void)s; ++calls; if (align < sizeof(void*)) align=sizeof(void*);
+            void *p=0; if(posix_memalign(&p,align,n?n:1)) return 0; return p;
+          }
+          static void* VKAPI_PTR r(void* u,void* old,size_t n,size_t align,VkSystemAllocationScope s){
+            (void)u;(void)align;(void)s; ++calls; return realloc(old,n?n:1);
+          }
+          static void VKAPI_PTR f(void* u,void* p){(void)u; ++calls; free(p);}
+          static void VKAPI_PTR ia(void* u,size_t n,VkInternalAllocationType t,VkSystemAllocationScope s){(void)u;(void)n;(void)t;(void)s;++calls;}
+          static void VKAPI_PTR ifr(void* u,size_t n,VkInternalAllocationType t,VkSystemAllocationScope s){(void)u;(void)n;(void)t;(void)s;++calls;}
+          #define RESOLVE(type,name) type name=(type)dlsym(vk,#name); if(!name){fprintf(stderr,"missing %s\n",#name);return 3;}
+          int main(int argc,char**argv){
+            if(argc!=2) return 64; int custom=!strcmp(argv[1],"custom");
+            void *vk=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL); if(!vk){fprintf(stderr,"dlopen %s\n",dlerror());return 2;}
+            RESOLVE(PFN_vkCreateInstance,vkCreateInstance)
+            RESOLVE(PFN_vkDestroyInstance,vkDestroyInstance)
+            RESOLVE(PFN_vkEnumeratePhysicalDevices,vkEnumeratePhysicalDevices)
+            RESOLVE(PFN_vkGetPhysicalDeviceQueueFamilyProperties,vkGetPhysicalDeviceQueueFamilyProperties)
+            RESOLVE(PFN_vkCreateDevice,vkCreateDevice)
+            RESOLVE(PFN_vkDestroyDevice,vkDestroyDevice)
+            RESOLVE(PFN_vkCreateBuffer,vkCreateBuffer)
+            RESOLVE(PFN_vkDestroyBuffer,vkDestroyBuffer)
+            VkApplicationInfo ai={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName="fex-alloc",.apiVersion=VK_API_VERSION_1_0};
+            VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&ai};
+            VkInstance inst=VK_NULL_HANDLE; VkResult vr=vkCreateInstance(&ici,0,&inst); fprintf(stderr,"CREATE_INSTANCE %d\n",vr); if(vr) return 10;
+            uint32_t pc=0; vr=vkEnumeratePhysicalDevices(inst,&pc,0); if(vr||!pc) return 11;
+            VkPhysicalDevice *ps=calloc(pc,sizeof(*ps)); if(!ps) return 12; vr=vkEnumeratePhysicalDevices(inst,&pc,ps); if(vr) return 13; VkPhysicalDevice p=ps[0]; free(ps);
+            uint32_t qc=0; vkGetPhysicalDeviceQueueFamilyProperties(p,&qc,0); if(!qc) return 14;
+            VkQueueFamilyProperties *qs=calloc(qc,sizeof(*qs)); if(!qs) return 15; vkGetPhysicalDeviceQueueFamilyProperties(p,&qc,qs);
+            uint32_t qi=0; while(qi<qc && !(qs[qi].queueFlags&VK_QUEUE_GRAPHICS_BIT)) ++qi; free(qs); if(qi==qc) return 16;
+            float prio=1.0f; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=qi,.queueCount=1,.pQueuePriorities=&prio};
+            VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
+            VkDevice dev=VK_NULL_HANDLE; vr=vkCreateDevice(p,&dci,0,&dev); fprintf(stderr,"CREATE_DEVICE %d\n",vr); if(vr) return 17;
+            VkAllocationCallbacks ac={.pUserData=0,.pfnAllocation=a,.pfnReallocation=r,.pfnFree=f,.pfnInternalAllocation=ia,.pfnInternalFree=ifr};
+            VkBufferCreateInfo bci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=4096,.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT,.sharingMode=VK_SHARING_MODE_EXCLUSIVE};
+            VkBuffer b=VK_NULL_HANDLE; calls=0; fprintf(stderr,"BEFORE_CREATE_BUFFER custom=%d calls=%u\n",custom,calls);
+            vr=vkCreateBuffer(dev,&bci,custom?&ac:0,&b); fprintf(stderr,"AFTER_CREATE_BUFFER result=%d calls=%u buffer=%p\n",vr,calls,(void*)b);
+            if(vr==VK_SUCCESS){fprintf(stderr,"BEFORE_DESTROY_BUFFER calls=%u\n",calls);vkDestroyBuffer(dev,b,custom?&ac:0);fprintf(stderr,"AFTER_DESTROY_BUFFER calls=%u\n",calls);}
+            vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
+            return vr==VK_SUCCESS ? (custom && calls==0 ? 30 : 0) : 20;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror \
+            -I"$GITHUB_WORKSPACE/External/Vulkan-Headers/include" /tmp/allocator_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/allocator-probe"
+
+      - name: Execute NULL versus guest allocator
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          run_case(){ local n="$1"; shift; set +e; VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s "$FEX" /opt/fex-ci/allocator-probe "$@" >"$R/$n.stdout" 2>"$R/$n.stderr"; local rc=$?; set -e; echo "$rc" >"$R/$n.exit"; }
+          set -e
+          run_case null null
+          run_case custom custom
+          printf 'null='; cat "$R/null.exit"
+          printf 'custom='; cat "$R/custom.exit"
+          cat "$R/null.stderr" "$R/custom.stderr"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-d-vulkan-allocator-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
