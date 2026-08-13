@@ -1,4 +1,4 @@
-name: Agent C repaired-rootfs callback baseline
+name: Agent C callback routing candidate
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  callback-baseline:
+  callback-candidate:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
@@ -72,10 +72,15 @@ jobs:
           VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 report gipa positive \
             >"$R/native-callback.out" 2>"$R/native-callback.err"
 
-      - name: Build exact FEX and Vulkan thunk pair
+      - name: Apply candidate and build FEX Vulkan thunk pair
         shell: bash
         run: |
           set -euxo pipefail
+          python3 fieldwork/investigations/fex-vulkan-thunk-lifecycle/apply_native_first_callback_candidate.py \
+            src/ThunkLibs/libvulkan/Host.cpp
+          git -C src diff --check
+          git -C src diff -- ThunkLibs/libvulkan/Host.cpp > "$R/candidate.diff"
+
           CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
             -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
             -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
@@ -124,7 +129,7 @@ jobs:
             -ldl -o "$ROOTFS/opt/fex-ci/callback-probe"
           file "$ROOTFS/opt/fex-ci/callback-probe" "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6" > "$R/guest-files.txt"
 
-      - name: Run direct and GIPA baseline
+      - name: Run direct and GIPA candidate
         shell: bash
         run: |
           set -uxo pipefail
@@ -138,20 +143,23 @@ jobs:
             local rc=$?
             set -e
             echo "$rc" | tee "$R/$name.exit"
+            cat "$R/$name.err"
           }
           set -e
-          run_case direct /opt/fex-ci/callback-probe report direct positive
-          run_case gipa /opt/fex-ci/callback-probe report gipa positive
+          run_case direct /opt/fex-ci/callback-probe report direct 0
+          run_case gipa /opt/fex-ci/callback-probe report gipa 0
           {
             printf 'direct='; cat "$R/direct.exit"
             printf 'gipa='; cat "$R/gipa.exit"
           } | tee "$R/callback-matrix.txt"
+          test "$(cat "$R/direct.exit")" = 0
+          test "$(cat "$R/gipa.exit")" = 0
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-c-repaired-rootfs-callback-${{ github.run_id }}
+          name: agent-c-callback-candidate-${{ github.run_id }}
           path: receipts
           if-no-files-found: warn
           retention-days: 14
