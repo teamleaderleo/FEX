@@ -1,0 +1,183 @@
+name: Native-first Vulkan semantic matrix
+
+on:
+  push:
+    branches: [ci/native-first-semantic-matrix-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  semantic-matrix:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      FIELDWORK_SHA: 1b268a6742768086aa8355e997c10b4423319ba6
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      HOST_BASE: ${{ github.workspace }}/host-baseline
+      HOST_CAND: ${{ github.workspace }}/host-candidate
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST_BASE" "$HOST_CAND"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan1 mesa-vulkan-drivers vulkan-tools
+          printf 'carrier=%s\nfieldwork=%s\nparent=%s\n' \
+            "$(git rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" "$(git rev-parse HEAD^)" > "$R/identity.txt"
+          git status --short > "$R/prebuild-status.txt"
+
+      - name: Build baseline exact product
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host-baseline.log" 2>&1
+          test -x build/Bin/FEX
+          test -x build/Bin/FEXServer
+          test -x build/Bin/thunkgen
+          cp build/HostLibs_64/libvulkan-host.so "$HOST_BASE/libvulkan-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-guest-baseline.log" 2>&1
+          cp guest-build/libvulkan-guest.so "$R/libvulkan-guest-baseline.so"
+
+      - name: Apply peer native-first candidate and rebuild thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git apply --check LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
+          git apply LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
+          git diff --check
+          git diff -- ThunkLibs/libvulkan/Guest.cpp ThunkLibs/libvulkan/Host.cpp > "$R/native-first.diff"
+          cmake --build build --target vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host-candidate.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$HOST_CAND/libvulkan-host.so"
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-guest-candidate.log" 2>&1
+          cp guest-build/libvulkan-guest.so "$R/libvulkan-guest-candidate.so"
+
+      - name: Prepare amd64 rootfs and probes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 \
+            /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/callback"
+
+          cat >/tmp/null-gipa.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <string.h>
+          typedef void (*PFN)(void);
+          typedef PFN (*GIPA)(void*, const char*);
+          int main(int argc, char **argv) {
+            if (argc != 2) return 64;
+            void *h = dlopen("libvulkan.so.1", RTLD_NOW|RTLD_LOCAL);
+            if (!h) { fprintf(stderr,"DLERROR %s\n", dlerror()); return 2; }
+            GIPA g = (GIPA)dlsym(h,"vkGetInstanceProcAddr");
+            if (!g) return 3;
+            PFN p = g(NULL,"vkCreateDebugReportCallbackEXT");
+            fprintf(stderr,"NULL_GIPA ptr=%p expected=%s\n",(void*)p,argv[1]);
+            if (!strcmp(argv[1],"null")) return p ? 30 : 0;
+            if (!strcmp(argv[1],"nonnull")) return p ? 0 : 31;
+            return 64;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/null-gipa.c -ldl -o "$ROOTFS/opt/fex-ci/null-gipa"
+
+      - name: Execute baseline and native-first candidate
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          run_case() {
+            local prefix="$1" host="$2" guest="$3" name="$4"; shift 4
+            cp "$guest" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+            set +e
+            VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$host" \
+              "$FEX" "$@" > "$R/${prefix}-${name}.stdout" 2> "$R/${prefix}-${name}.stderr"
+            local rc=$?
+            set -e
+            echo "$rc" > "$R/${prefix}-${name}.exit"
+          }
+          set -e
+          BASE_GUEST="$R/libvulkan-guest-baseline.so"
+          CAND_GUEST="$R/libvulkan-guest-candidate.so"
+
+          run_case base "$HOST_BASE" "$BASE_GUEST" null-gipa /opt/fex-ci/null-gipa nonnull
+          run_case base "$HOST_BASE" "$BASE_GUEST" report-direct /opt/fex-ci/callback report direct positive
+          run_case base "$HOST_BASE" "$BASE_GUEST" report-gipa /opt/fex-ci/callback report gipa positive
+          run_case base "$HOST_BASE" "$BASE_GUEST" utils-direct /opt/fex-ci/callback utils direct positive
+          run_case base "$HOST_BASE" "$BASE_GUEST" utils-gipa /opt/fex-ci/callback utils gipa positive
+
+          run_case cand "$HOST_CAND" "$CAND_GUEST" null-gipa /opt/fex-ci/null-gipa null
+          run_case cand "$HOST_CAND" "$CAND_GUEST" report-direct /opt/fex-ci/callback report direct positive
+          run_case cand "$HOST_CAND" "$CAND_GUEST" report-gipa /opt/fex-ci/callback report gipa positive
+          run_case cand "$HOST_CAND" "$CAND_GUEST" utils-direct /opt/fex-ci/callback utils direct positive
+          run_case cand "$HOST_CAND" "$CAND_GUEST" utils-gipa /opt/fex-ci/callback utils gipa positive
+
+          for prefix in base cand; do
+            for name in null-gipa report-direct report-gipa utils-direct utils-gipa; do
+              printf '%s_%s=' "$prefix" "$name"
+              cat "$R/${prefix}-${name}.exit"
+            done
+          done | tee "$R/final-matrix.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-first-semantic-matrix-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
