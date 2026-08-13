@@ -1,4 +1,4 @@
-name: Agent C Vulkan guest load SIGILL tracer
+name: Agent C repaired-rootfs callback baseline
 
 on:
   push:
@@ -9,11 +9,12 @@ permissions:
   contents: read
 
 jobs:
-  trace:
+  callback-baseline:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
       FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_SHA: 1b268a6742768086aa8355e997c10b4423319ba6
       DEBIAN_FRONTEND: noninteractive
       ROOTFS: ${{ github.workspace }}/rootfs
       R: ${{ github.workspace }}/receipts
@@ -29,15 +30,23 @@ jobs:
           path: src
           submodules: recursive
           fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
 
-      - name: Dependencies and identity
+      - name: Identity and dependencies
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$R" "$HOST"
           test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          test "$(git -C fieldwork rev-parse HEAD)" = "$FIELDWORK_SHA"
           {
             echo "fex_sha=$(git -C src rev-parse HEAD)"
+            echo "fieldwork_sha=$(git -C fieldwork rev-parse HEAD)"
             echo "ci_sha=$GITHUB_SHA"
             uname -a
             uname -m
@@ -45,11 +54,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
-            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils-x86-64-linux-gnu \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools
 
-      - name: Native ARM64 Lavapipe control
+      - name: Native ARM64 callback control
         shell: bash
         run: |
           set -euxo pipefail
@@ -57,8 +66,13 @@ jobs:
           test -n "$LVP_ICD"
           echo "$LVP_ICD" > "$R/lvp-icd.txt"
           VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
+          cc -O2 -Wall -Wextra \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c \
+            -ldl -o /tmp/callback-arm64
+          VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 report gipa positive \
+            >"$R/native-callback.out" 2>"$R/native-callback.err"
 
-      - name: Build focused FEX and Vulkan thunks
+      - name: Build exact FEX and Vulkan thunk pair
         shell: bash
         run: |
           set -euxo pipefail
@@ -79,11 +93,9 @@ jobs:
             -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" \
             -DX86_DEV_ROOTFS=/ >"$R/cmake-guest.log" 2>&1
           cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
-          file guest/libvulkan-guest.so "$HOST/libvulkan-host.so" > "$R/thunk-files.txt"
-          x86_64-linux-gnu-objdump -d guest/libvulkan-guest.so > "$R/guest-objdump.txt"
-          grep -n -B2 -A4 '0f 3f' "$R/guest-objdump.txt" | head -120 > "$R/op-thunk-sites.txt" || true
+          file src/build/Bin/FEX "$HOST/libvulkan-host.so" guest/libvulkan-guest.so > "$R/artifacts.file.txt"
 
-      - name: Build amd64 rootfs with diagnostic guest X11 symbols
+      - name: Build repaired amd64 rootfs and callback probe
         shell: bash
         run: |
           set -euxo pipefail
@@ -104,79 +116,42 @@ jobs:
           void *XGetVisualInfo(void) { return 0; }
           const char *XDisplayString(void) { return ":fex-ci-stub"; }
           EOF
-          x86_64-linux-gnu-gcc -shared -fPIC -O2 \
-            -Wl,-soname,libX11.so.6 /tmp/x11-stub.c \
-            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
-          x86_64-linux-gnu-readelf -Ws "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6" \
-            | grep -E 'XSync|XGetVisualInfo|XDisplayString' | tee "$R/x11-stub-symbols.txt"
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libX11.so.6 \
+            /tmp/x11-stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
 
-          cat >/tmp/trace.c <<'EOF'
-          #define _GNU_SOURCE
-          #include <dlfcn.h>
-          #include <fcntl.h>
-          #include <signal.h>
-          #include <stdint.h>
-          #include <string.h>
-          #include <sys/ucontext.h>
-          #include <unistd.h>
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c \
+            -ldl -o "$ROOTFS/opt/fex-ci/callback-probe"
+          file "$ROOTFS/opt/fex-ci/callback-probe" "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6" > "$R/guest-files.txt"
 
-          static void putstr(const char *s) { ssize_t n = write(2, s, strlen(s)); (void)n; }
-          static void puthex(uintptr_t v) {
-            static const char h[] = "0123456789abcdef";
-            char b[2 + sizeof(v) * 2 + 2];
-            size_t p = 0; b[p++]='0'; b[p++]='x';
-            for (int i = (int)(sizeof(v) * 2) - 1; i >= 0; --i) b[p++] = h[(v >> (i * 4)) & 15];
-            b[p++]='\n'; ssize_t n = write(2, b, p); (void)n;
-          }
-          static void dump_maps(void) {
-            int fd = open("/proc/self/maps", O_RDONLY);
-            if (fd < 0) return;
-            char b[4096]; ssize_t n;
-            while ((n = read(fd, b, sizeof(b))) > 0) { ssize_t w = write(2, b, (size_t)n); (void)w; }
-            close(fd);
-          }
-          static void on_sigill(int sig, siginfo_t *si, void *vctx) {
-            (void)sig;
-            ucontext_t *ctx = (ucontext_t*)vctx;
-            putstr("SIGILL_CAUGHT\nsi_addr="); puthex((uintptr_t)si->si_addr);
-          #ifdef REG_RIP
-            putstr("rip="); puthex((uintptr_t)ctx->uc_mcontext.gregs[REG_RIP]);
-          #endif
-            putstr("MAPS_BEGIN\n"); dump_maps(); putstr("MAPS_END\n");
-            _exit(132);
-          }
-          int main(void) {
-            struct sigaction sa = {0};
-            sa.sa_sigaction = on_sigill; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
-            sigaction(SIGILL, &sa, 0);
-            putstr("TRACE_BEFORE_DLOPEN\n");
-            void *h = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-            if (!h) { putstr("TRACE_DLOPEN_ERROR\n"); putstr(dlerror()); putstr("\n"); return 2; }
-            putstr("TRACE_AFTER_DLOPEN\n");
-            return 0;
-          }
-          EOF
-          x86_64-linux-gnu-gcc -O0 -g -Wall -Wextra -Werror /tmp/trace.c -ldl -o "$ROOTFS/opt/fex-ci/trace"
-          file "$ROOTFS/opt/fex-ci/trace" "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6" > "$R/trace-files.txt"
-
-      - name: Run Vulkan load with diagnostic guest X11 helpers
+      - name: Run direct and GIPA baseline
         shell: bash
         run: |
           set -uxo pipefail
           FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
-          set +e
-          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
-            "$FEX" /opt/fex-ci/trace >"$R/trace.out" 2>"$R/trace.err"
-          rc=$?
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          run_case() {
+            local name="$1"; shift
+            set +e
+            VK_DRIVER_FILES="$LVP_ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+              "$FEX" "$@" >"$R/$name.out" 2>"$R/$name.err"
+            local rc=$?
+            set -e
+            echo "$rc" | tee "$R/$name.exit"
+          }
           set -e
-          echo "$rc" | tee "$R/trace.exit"
-          cat "$R/trace.err"
+          run_case direct /opt/fex-ci/callback-probe report direct positive
+          run_case gipa /opt/fex-ci/callback-probe report gipa positive
+          {
+            printf 'direct='; cat "$R/direct.exit"
+            printf 'gipa='; cat "$R/gipa.exit"
+          } | tee "$R/callback-matrix.txt"
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-c-vulkan-load-sigill-${{ github.run_id }}
+          name: agent-c-repaired-rootfs-callback-${{ github.run_id }}
           path: receipts
           if-no-files-found: warn
           retention-days: 14
