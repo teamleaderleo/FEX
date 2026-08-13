@@ -1,0 +1,17 @@
+Diagnostic branch status
+
+Validated artifact:
+- range_retirement_prototype.cpp
+- Local build command: g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror
+- Local result: range-retirement prototype: 6/6 PASS
+
+Do not apply fex2608-range-retirement.patch as committed on this branch. A local git apply parser check found an invalid hand-written hunk count. Attempts to replace/delete that artifact were rejected by the repository write gateway after the C++ prototype had already been committed.
+
+The intended first FEX source experiment remains narrow:
+1. Add a Context API that scans CustomIRHandlers for thunk-owned entries whose Data guest target lies in a retiring address range.
+2. Replace each matching entry with a CustomIR tombstone rather than erasing it.
+3. Invalidate translated code at each native PFN key.
+4. Invoke that retirement immediately after a successful GuestMunmap host munmap and before TrackMunmap / ordinary range invalidation.
+5. Treat this only as a causal probe. It does not provide reload revival, host-to-guest callback revocation, or concurrent execution quiescence.
+
+The standalone prototype separately demonstrates the desired later semantics for tombstone revival on same-PFN reload, changed guest load bases, unrelated mappings, and explicit live-binding conflicts.
