@@ -61,7 +61,7 @@ public:
   /**
    * @brief Allows setting up in memory code and other things prior to launchign code execution
    *
-   * @param CTX A valid non-null context instance.
+   * @param CTX The context that we created
    * @param Loader The loader that will be doing all the code loading
    *
    * @return true if we loaded code
@@ -182,16 +182,6 @@ public:
    * @param GuestThunkEntrypoint The thunk entrypoint that the IR handler will redirect to.
    */
   FEX_DEFAULT_VISIBILITY virtual void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) = 0;
-
-  /**
-   * @brief Retires thunk trampoline handlers whose guest destination overlaps an unmapped range.
-   *
-   * This lifecycle hook is used before guest memory is physically unmapped. It retires
-   * discoverability and compiled bridge code; it does not by itself provide an execution-
-   * quiescence guarantee for already in-flight transitions.
-   */
-  FEX_DEFAULT_VISIBILITY virtual void RemoveThunkTrampolineIRHandlersInRange(
-    FEXCore::Core::InternalThreadState* Thread, uintptr_t Start, uintptr_t Length) = 0;
 
   /**
    * @brief Adds additional per-instruction granularity TSO enable/disable information for the given range.
