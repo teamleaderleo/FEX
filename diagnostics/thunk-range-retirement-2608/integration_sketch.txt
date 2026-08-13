@@ -1,0 +1,87 @@
+FEX-2608 narrow source integration sketch
+
+Goal
+----
+Test one causal hypothesis only: native-PFN CustomIR redirects survive after their guest thunk target is unmapped.
+
+Touchpoint 1: FEXCore/include/FEXCore/Core/Context.h
+----------------------------------------------------
+Add beside AddThunkTrampolineIRHandler:
+
+  FEX_DEFAULT_VISIBILITY virtual void RetireThunkTrampolineIRHandlersInRange(
+    FEXCore::Core::InternalThreadState* Thread, uintptr_t Start, uintptr_t Length) = 0;
+
+Touchpoint 2: FEXCore/Source/Interface/Context/Context.h
+------------------------------------------------------
+Add the ContextImpl override beside AddThunkTrampolineIRHandler:
+
+  void RetireThunkTrampolineIRHandlersInRange(
+    FEXCore::Core::InternalThreadState* Thread, uintptr_t Start, uintptr_t Length) override;
+
+Touchpoint 3: FEXCore/Source/Interface/Core/Core.cpp
+---------------------------------------------------
+Implement the method immediately after AddThunkTrampolineIRHandler.
+
+Pseudo-C++ matching the intended experiment:
+
+  void ContextImpl::RetireThunkTrampolineIRHandlersInRange(
+    FEXCore::Core::InternalThreadState* Thread, uintptr_t Start, uintptr_t Length) {
+    if (Length == 0) {
+      return;
+    }
+
+    fextl::vector<uintptr_t> EntrypointsToInvalidate;
+    {
+      std::unique_lock lk(CustomIRMutex);
+      for (auto& [Entrypoint, Entry] : CustomIRHandlers) {
+        if (Entry.Creator != ThunkHandler || Entry.Data == nullptr) {
+          continue;
+        }
+
+        const auto GuestTarget = reinterpret_cast<uintptr_t>(Entry.Data);
+        if (!(GuestTarget >= Start && (GuestTarget - Start) < Length)) {
+          continue;
+        }
+
+        // Replace the live redirect with a CustomIR tombstone. The tombstone must stay
+        // classified as CustomIR so a stale native PFN does not fall through to normal
+        // x86 decoding. For the causal probe, an ExitFunction to guest address zero is
+        // sufficient to distinguish a retired redirect from execution of the old thunk.
+        Entry.Handler = make_retired_thunk_tombstone_handler();
+        Entry.Data = nullptr;
+        EntrypointsToInvalidate.emplace_back(Entrypoint);
+      }
+    }
+
+    for (const auto Entrypoint : EntrypointsToInvalidate) {
+      SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
+    }
+  }
+
+The tombstone handler should use the same IR setup as AddThunkTrampolineIRHandler, preserve the implicit original-callee value in r11/mm0, and ExitFunction to guest address zero instead of the retired GuestThunkEntrypoint.
+
+Important lock rule: collect/mutate under CustomIRMutex, release it, then take the existing code-invalidation path. Do not hold CustomIRMutex across InvalidateGuestCodeRange.
+
+Touchpoint 4: Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
+-----------------------------------------------------------------------------
+In SyscallHandler::GuestMunmap, after a successful allocator/host munmap and before TrackMunmap, call:
+
+  CTX->RetireThunkTrampolineIRHandlersInRange(
+    Thread, reinterpret_cast<uintptr_t>(addr), Size);
+
+Why post-munmap for the first experiment
+----------------------------------------
+This placement cannot retire a still-valid bridge when munmap itself fails. It is enough to test the observed single-threaded Vulkan teardown hypothesis because the stale transfer occurs later in teardown. It deliberately leaves a small concurrent race between host unmap and bridge retirement.
+
+If this changes unpinned vulkaninfo from exit 139 to clean exit or to the explicit tombstone fault, the next experiment should move retirement to a loader-owned pre-unmap phase and decide whether FEX needs an execution grace period.
+
+Explicitly outside this first patch
+-----------------------------------
+- host-to-guest callback trampoline retirement
+- same-PFN tombstone revival on reload
+- compatible alias owner stacks/fallback
+- incompatible alias ABI identity
+- execution leases / epoch grace periods
+- DSO load-instance IDs
+
+Those are not discarded. They are intentionally deferred until the narrow CustomIR survivor hypothesis is tested in real FEX.
