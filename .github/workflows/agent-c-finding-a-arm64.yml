@@ -115,17 +115,18 @@ jobs:
             -DX86_DEV_ROOTFS=/ \
             2>&1 | tee "$RECEIPT_DIR/cmake-host-configure.log"
 
-      - name: Build only FEX plus 64-bit Vulkan host thunk
+      - name: Build only FEX runtime support plus 64-bit Vulkan host thunk
         shell: bash
         run: |
           set -euxo pipefail
-          cmake --build fex-src/build --target vulkan-host-64 -- -j"$(nproc)" -v \
+          cmake --build fex-src/build --target vulkan-host-64 FEXServer -- -j"$(nproc)" -v \
             2>&1 | tee "$RECEIPT_DIR/build-vulkan-host-64.log"
           test -x fex-src/build/Bin/FEX
+          test -x fex-src/build/Bin/FEXServer
           test -x fex-src/build/Bin/thunkgen
           test -f fex-src/build/HostLibs_64/libvulkan-host.so
           cp fex-src/build/HostLibs_64/libvulkan-host.so "$HOST_BASE/libvulkan-host.so"
-          file fex-src/build/Bin/FEX fex-src/build/Bin/thunkgen "$HOST_BASE/libvulkan-host.so" \
+          file fex-src/build/Bin/FEX fex-src/build/Bin/FEXServer fex-src/build/Bin/thunkgen "$HOST_BASE/libvulkan-host.so" \
             | tee "$RECEIPT_DIR/host-artifacts-file.txt"
           readelf -d "$HOST_BASE/libvulkan-host.so" > "$RECEIPT_DIR/host-vulkan-baseline.dynamic.txt"
 
