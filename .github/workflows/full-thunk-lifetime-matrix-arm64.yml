@@ -100,12 +100,11 @@ jobs:
         run: |
           set -uxo pipefail
           FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
-          HOST="$GITHUB_WORKSPACE/../FEX/../../../../tmp/repro/fex-full-thunk-pair/host"
           HOST="/tmp/repro/fex-full-thunk-pair/host"
           run_case() {
             local name="$1"; shift
             set +e
-            (cd "$ROOTFS/opt/fex-ci/full/guest" && \
+            (cd "$ROOTFS/opt/fex-ci/full" && \
               FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 45s \
               "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime "$@") \
               > "$R/$name.stdout" 2> "$R/$name.stderr"
