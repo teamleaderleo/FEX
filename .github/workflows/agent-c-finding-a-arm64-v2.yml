@@ -158,7 +158,10 @@ jobs:
           #include <dlfcn.h>
           #include <string.h>
           #include <unistd.h>
-          static void marker(const char *s) { (void)write(2, s, strlen(s)); }
+          static void marker(const char *s) {
+            size_t n = strlen(s);
+            if (write(2, s, n) != (ssize_t)n) _exit(99);
+          }
           int main(int argc, char **argv) {
             marker("PHASE_MAIN\n");
             if (argc == 1 || strcmp(argv[1], "plain") == 0) { marker("PHASE_PLAIN_EXIT\n"); return 0; }
