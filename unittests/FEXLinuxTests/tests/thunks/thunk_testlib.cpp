@@ -44,6 +44,22 @@ TEST_CASE_METHOD(Fixture, "Trivial") {
   CHECK(GetDoubledValue(10) == 20);
 }
 
+TEST_CASE_METHOD(Fixture, "Guest thunk remains resident after application dlclose") {
+  auto SavedGetDoubledValue = GetDoubledValue;
+  REQUIRE(SavedGetDoubledValue(21) == 42);
+
+  REQUIRE(dlclose(lib) == 0);
+  lib = nullptr;
+
+  // Guest thunk entrypoints can escape the application's ordinary dlopen
+  // handle through native callback/PFN plumbing. The wrapper therefore needs
+  // to stay resident once loaded.
+  auto ResidentHandle = dlopen("libfex_thunk_test.so", RTLD_LAZY | RTLD_NOLOAD);
+  REQUIRE(ResidentHandle != nullptr);
+  REQUIRE(SavedGetDoubledValue(21) == 42);
+  REQUIRE(dlclose(ResidentHandle) == 0);
+}
+
 TEST_CASE_METHOD(Fixture, "Opaque data types") {
   {
     auto data = MakeOpaqueType(0x1234);
