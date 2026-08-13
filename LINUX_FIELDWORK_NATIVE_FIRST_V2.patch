@@ -1,0 +1,105 @@
+diff --git a/ThunkLibs/libvulkan/Guest.cpp b/ThunkLibs/libvulkan/Guest.cpp
+--- a/ThunkLibs/libvulkan/Guest.cpp
++++ b/ThunkLibs/libvulkan/Guest.cpp
+@@ -67,15 +67,20 @@ PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice a_0, const char* a_1) {
+ }
+ 
+ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
+-  if (a_1 == std::string_view {"vkGetDeviceProcAddr"}) {
++  auto Ret = fexfn_pack_vkGetInstanceProcAddr(a_0, a_1);
++  if (!Ret) {
++    return nullptr;
++  }
++
++  if (a_1 == std::string_view {"vkGetInstanceProcAddr"}) {
++    return (PFN_vkVoidFunction)vkGetInstanceProcAddr;
++  }
++  if (a_1 == std::string_view {"vkGetDeviceProcAddr"}) {
+     return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+-  } else {
+-    auto Ret = fexfn_pack_vkGetInstanceProcAddr(a_0, a_1);
+-    if (!Ret) {
+-      return nullptr;
+-    }
+-    return MakeGuestCallable(__FUNCTION__, Ret, a_1);
+   }
++
++  return MakeGuestCallable(__FUNCTION__, Ret, a_1);
+ }
+ }
+
+diff --git a/ThunkLibs/libvulkan/Host.cpp b/ThunkLibs/libvulkan/Host.cpp
+--- a/ThunkLibs/libvulkan/Host.cpp
++++ b/ThunkLibs/libvulkan/Host.cpp
+@@ -358,6 +358,12 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
+     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateInstance;
+   } else if (a_1 == "vkCreateDevice"sv) {
+     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDevice;
++  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {
++    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;
++  } else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {
++    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;
++  } else if (a_1 == "vkCreateDebugUtilsMessengerEXT"sv) {
++    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugUtilsMessengerEXT;
+   } else if (a_1 == "vkAllocateMemory"sv) {
+     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkAllocateMemory;
+   } else if (a_1 == "vkFreeMemory"sv) {
+@@ -397,12 +403,14 @@ static PFN_vkVoidFunction FEXFN_IMPL(vkGetDeviceProcAddr)(VkDevice a_0, const ch
+   // Just return the host facing function pointer
+   // The guest will handle mapping if this exists
+ 
+-  // Check for functions with custom implementations first
++  auto Native = LDR_PTR(vkGetDeviceProcAddr)(a_0, a_1);
++  if (!Native) {
++    return nullptr;
++  }
++
+   if (auto ptr = LookupCustomVulkanFunction(a_1)) {
+     return ptr;
+   }
+-
+-  return LDR_PTR(vkGetDeviceProcAddr)(a_0, a_1);
++  return Native;
+ }
+ 
+ static PFN_vkVoidFunction FEXFN_IMPL(vkGetInstanceProcAddr)(VkInstance a_0, const char* a_1) {
+@@ -413,26 +421,30 @@ static PFN_vkVoidFunction FEXFN_IMPL(vkGetInstanceProcAddr)(VkInstance a_0, cons
+     DoSetupWithInstance(a_0);
+   }
+ 
+-  // Check for functions with custom implementations first
++  auto Native = LDR_PTR(vkGetInstanceProcAddr)(a_0, a_1);
++  if (!Native) {
++    return nullptr;
++  }
++
+   if (auto ptr = LookupCustomVulkanFunction(a_1)) {
+     // If this function belongs to an instance extension, requery its address.
+     // This ensures fexldr_ptr_* is valid if the application creates a minimal
+     // VkInstance with no extensions before creating its actual instance.
+     using namespace std::string_view_literals;
+     if (a_1 == "vkGetRandROutputDisplayEXT"sv && !LDR_PTR(vkGetRandROutputDisplayEXT)) {
+-      (void*&)LDR_PTR(vkGetRandROutputDisplayEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkGetRandROutputDisplayEXT");
++      (void*&)LDR_PTR(vkGetRandROutputDisplayEXT) = (void*)Native;
+     }
+     if (a_1 == "vkAcquireXlibDisplayEXT"sv && !LDR_PTR(vkAcquireXlibDisplayEXT)) {
+-      (void*&)LDR_PTR(vkAcquireXlibDisplayEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkAcquireXlibDisplayEXT");
++      (void*&)LDR_PTR(vkAcquireXlibDisplayEXT) = (void*)Native;
+     }
+     const char* XcbPresent = "vkGetPhysicalDeviceXcbPresentationSupportKHR";
+     if (a_1 == std::string_view {XcbPresent} && !LDR_PTR(vkGetPhysicalDeviceXcbPresentationSupportKHR)) {
+-      (void*&)LDR_PTR(vkGetPhysicalDeviceXcbPresentationSupportKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, XcbPresent);
++      (void*&)LDR_PTR(vkGetPhysicalDeviceXcbPresentationSupportKHR) = (void*)Native;
+     }
+     const char* XlibPresent = "vkGetPhysicalDeviceXlibPresentationSupportKHR";
+     if (a_1 == std::string_view {XlibPresent} && !LDR_PTR(vkGetPhysicalDeviceXlibPresentationSupportKHR)) {
+-      (void*&)LDR_PTR(vkGetPhysicalDeviceXlibPresentationSupportKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, XlibPresent);
++      (void*&)LDR_PTR(vkGetPhysicalDeviceXlibPresentationSupportKHR) = (void*)Native;
+     }
+ 
+     return ptr;
+   }
+ 
+-  return LDR_PTR(vkGetInstanceProcAddr)(a_0, a_1);
++  return Native;
+ }
