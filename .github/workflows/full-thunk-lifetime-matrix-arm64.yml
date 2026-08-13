@@ -1,4 +1,4 @@
-name: Thunk shared-evict rebind diagnostic ARM64
+name: Thunk exact all-cache rebind diagnostic ARM64
 
 on:
   push:
@@ -53,60 +53,156 @@ jobs:
           tar xf /tmp/repro.tar.gz -C /tmp/repro
           sed -n '315,345p' /tmp/repro/fex-full-thunk-pair/guest/main.cpp > "$R/fixture-rebind-site.txt"
 
-      - name: Apply shared exact-entry eviction diagnostic
+      - name: Apply exact all-cache invalidation diagnostic
         shell: bash
         run: |
           set -euxo pipefail
           python3 - <<'PY'
           from pathlib import Path
 
-          p = Path('src/FEXCore/Source/Interface/Core/LookupCache.h')
-          s = p.read_text()
-          marker = '''  void InvalidateRange(uint64_t Start, uint64_t Length) {
-              auto lk = AcquireWriteLock();'''
-          insert = '''  // Diagnostic: erase one exact compiled entry without relying on CodePages.
-            bool InvalidateExactEntry(uint64_t Address) {
-              auto lk = AcquireWriteLock();
-              return Erase(Address, lk);
-            }
+          def replace_one(path, old, new, label):
+              p = Path(path)
+              s = p.read_text()
+              if old not in s:
+                  raise SystemExit(f'{label} missing in {path}')
+              p.write_text(s.replace(old, new, 1))
 
-            void InvalidateRange(uint64_t Start, uint64_t Length) {
-              auto lk = AcquireWriteLock();'''
-          if marker not in s:
-              raise SystemExit('GuestToHostMap insertion marker missing')
-          p.write_text(s.replace(marker, insert, 1))
+          # Shared L3 exact erase and per-thread L1/L2 exact clear.
+          replace_one(
+              'src/FEXCore/Source/Interface/Core/LookupCache.h',
+              '  void InvalidateRange(uint64_t Start, uint64_t Length) {\n    auto lk = AcquireWriteLock();',
+              '''  bool InvalidateExactEntry(uint64_t Address) {
+                auto lk = AcquireWriteLock();
+                return Erase(Address, lk);
+              }
+
+              void InvalidateRange(uint64_t Start, uint64_t Length) {
+                auto lk = AcquireWriteLock();''',
+              'GuestToHostMap exact insertion')
+          replace_one(
+              'src/FEXCore/Source/Interface/Core/LookupCache.h',
+              '  // Invalidates all L1/L2 entries for all guest block that intersect the given range\n  bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {',
+              '''  void InvalidateExactEntry(uint64_t Address) {
+                auto lk = Shared->AcquireWriteLock();
+                InvalidateCache(Address, lk);
+              }
+
+              // Invalidates all L1/L2 entries for all guest block that intersect the given range
+              bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {''',
+              'LookupCache exact insertion')
+
+          # Public Context exact-entry API.
+          replace_one(
+              'src/FEXCore/include/FEXCore/Core/Context.h',
+              '''  FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
+              FEX_DEFAULT_VISIBILITY virtual void
+              InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;''',
+              '''  FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
+              FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeEntry(uint64_t Address) = 0;
+              FEX_DEFAULT_VISIBILITY virtual void
+              InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
+              FEX_DEFAULT_VISIBILITY virtual void
+              InvalidateThreadCachedCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) = 0;''',
+              'Context public exact declarations')
+          replace_one(
+              'src/FEXCore/Source/Interface/Context/Context.h',
+              '''  void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+              void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;''',
+              '''  void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+              void InvalidateCodeBuffersCodeEntry(uint64_t Address) override;
+              void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
+              void InvalidateThreadCachedCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override;''',
+              'ContextImpl exact declarations')
+
+          # Exact shared/local Context implementations.
+          replace_one(
+              'src/FEXCore/Source/Interface/Core/Core.cpp',
+              'void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {',
+              '''void ContextImpl::InvalidateCodeBuffersCodeEntry(uint64_t Address) {
+                LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+                std::scoped_lock lk {CodeBufferListLock};
+                size_t Erased = 0;
+                for (auto it = CodeBufferList.begin(); it != CodeBufferList.end();) {
+                  if (auto Strong = it->lock()) {
+                    Erased += Strong->LookupCache->InvalidateExactEntry(Address) ? 1 : 0;
+                    ++it;
+                  } else {
+                    it = CodeBufferList.erase(it);
+                  }
+                }
+                fprintf(stderr, "DIAG_EXACT_SHARED H=%#lx erased=%zu\\n", Address, Erased);
+              }
+
+              void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {''',
+              'Core shared exact implementation')
+          replace_one(
+              'src/FEXCore/Source/Interface/Core/Core.cpp',
+              'void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {',
+              '''void ContextImpl::InvalidateThreadCachedCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
+                LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+                Thread->LookupCache->InvalidateExactEntry(Address);
+                fprintf(stderr, "DIAG_EXACT_LOCAL H=%#lx thread=%p\\n", Address, Thread);
+              }
+
+              void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {''',
+              'Core local exact implementation')
+
+          # Syscall-handler interface and Linux thread-manager implementation.
+          replace_one(
+              'src/FEXCore/include/FEXCore/HLE/SyscallHandler.h',
+              '  virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}\n',
+              '''  virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
+              virtual void InvalidateGuestCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {}
+              ''',
+              'SyscallHandler exact virtual')
+          replace_one(
+              'src/Source/Tools/LinuxEmulation/LinuxSyscalls/ThreadManager.h',
+              '''  void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
+                std::lock_guard lk(ThreadCreationMutex);''',
+              '''  void InvalidateGuestCodeEntry(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Address) {
+                std::lock_guard lk(ThreadCreationMutex);
+                auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), CallingThread);
+                CTX->InvalidateCodeBuffersCodeEntry(Address);
+                for (auto& Thread : Threads) {
+                  CTX->InvalidateThreadCachedCodeEntry(Thread->Thread, Address);
+                }
+              }
+
+              void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
+                std::lock_guard lk(ThreadCreationMutex);''',
+              'ThreadManager exact implementation')
+          replace_one(
+              'src/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.h',
+              '''  uint64_t GuestMprotect(FEXCore::Core::InternalThreadState*, void* addr, size_t len, int prot);
+              uint64_t GuestShmat''',
+              '''  uint64_t GuestMprotect(FEXCore::Core::InternalThreadState*, void* addr, size_t len, int prot);
+              void InvalidateGuestCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
+                TM.InvalidateGuestCodeEntry(Thread, Address);
+              }
+              uint64_t GuestShmat''',
+              'Linux SyscallHandler exact override')
+
+          # Instrument registry replacement and use exact invalidation in retirement.
+          replace_one(
+              'src/FEXCore/Source/Interface/Core/Core.cpp',
+              '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  HasCustomIRHandlers = true;\n',
+              '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  fprintf(stderr, "DIAG_CUSTOM_ADD H=%#lx inserted=%d data=%p\\n", Entrypoint, InsertedIterator.second ? 1 : 0, Data);\n  HasCustomIRHandlers = true;\n',
+              'CustomIR add trace')
+          replace_one(
+              'src/FEXCore/Source/Interface/Core/Core.cpp',
+              '''  CustomIRHandlers.erase(Entrypoint);
+                HasCustomIRHandlers = !CustomIRHandlers.empty();
+                SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
+              }''',
+              '''  auto Erased = CustomIRHandlers.erase(Entrypoint);
+                HasCustomIRHandlers = !CustomIRHandlers.empty();
+                SyscallHandler->InvalidateGuestCodeEntry(Thread, Entrypoint);
+                fprintf(stderr, "DIAG_CUSTOM_REMOVE H=%#lx handler=%zu\\n", Entrypoint, Erased);
+              }''',
+              'CustomIR exact retirement')
 
           p = Path('src/FEXCore/Source/Interface/Core/Core.cpp')
           s = p.read_text()
-          old = '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  HasCustomIRHandlers = true;\n'
-          new = '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  fprintf(stderr, "DIAG_CUSTOM_ADD H=%#lx inserted=%d data=%p\\n", Entrypoint, InsertedIterator.second ? 1 : 0, Data);\n  HasCustomIRHandlers = true;\n'
-          if old not in s:
-              raise SystemExit('AddCustomIREntrypoint insertion site missing')
-          s = s.replace(old, new, 1)
-
-          old = '''  CustomIRHandlers.erase(Entrypoint);
-            HasCustomIRHandlers = !CustomIRHandlers.empty();
-            SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
-          }'''
-          if old not in s:
-              raise SystemExit('RemoveCustomIREntrypoint block missing')
-          new = '''  auto Erased = CustomIRHandlers.erase(Entrypoint);
-            HasCustomIRHandlers = !CustomIRHandlers.empty();
-            SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
-
-            size_t ExactEvictions = 0;
-            {
-              std::scoped_lock lk {CodeBufferListLock};
-              for (auto& Weak : CodeBufferList) {
-                if (auto Strong = Weak.lock()) {
-                  ExactEvictions += Strong->LookupCache->InvalidateExactEntry(Entrypoint) ? 1 : 0;
-                }
-              }
-            }
-            fprintf(stderr, "DIAG_CUSTOM_REMOVE H=%#lx handler=%zu shared_exact=%zu\\n", Entrypoint, Erased, ExactEvictions);
-          }'''
-          s = s.replace(old, new, 1)
-
           old = '''    if (Result->Data != (void*)GuestThunkEntrypoint) {
                 // NOTE: This may happen in Vulkan thunks if the Vulkan driver resolves two different symbols
                 //       to the same function (e.g. vkGetPhysicalDeviceFeatures2/vkGetPhysicalDeviceFeatures2KHR)
@@ -114,11 +210,7 @@ jobs:
               }
           '''
           if old not in s:
-              old = '''    if (Result->Data != (void*)GuestThunkEntrypoint) {
-                // NOTE: This may happen in Vulkan thunks if the Vulkan driver resolves two different symbols
-                //       to the same function (e.g. vkGetPhysicalDeviceFeatures2/vkGetPhysicalDeviceFeatures2KHR)
-                LogMan::Msg::EFmt("Input address for AddThunkTrampoline is already linked elsewhere");
-              }'''
+              old = old.rstrip()
           if old not in s:
               raise SystemExit('duplicate thunk block missing')
           new = '''    if (Result->Data != (void*)GuestThunkEntrypoint) {
@@ -130,7 +222,14 @@ jobs:
           p.write_text(s.replace(old, new, 1))
           PY
           git -C src diff --check
-          git -C src diff -- FEXCore/Source/Interface/Core/LookupCache.h FEXCore/Source/Interface/Core/Core.cpp > "$R/shared-evict.diff"
+          git -C src diff -- \
+            FEXCore/Source/Interface/Core/LookupCache.h \
+            FEXCore/include/FEXCore/Core/Context.h \
+            FEXCore/Source/Interface/Context/Context.h \
+            FEXCore/Source/Interface/Core/Core.cpp \
+            FEXCore/include/FEXCore/HLE/SyscallHandler.h \
+            Source/Tools/LinuxEmulation/LinuxSyscalls/ThreadManager.h \
+            Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.h > "$R/exact-all-cache.diff"
 
       - name: Build diagnostic FEX and full thunk pair
         shell: bash
@@ -186,6 +285,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: thunk-shared-evict-rebind-${{ github.run_id }}
+          name: thunk-exact-all-cache-rebind-${{ github.run_id }}
           path: receipts-rebind
           retention-days: 30
