@@ -51,8 +51,10 @@ jobs:
           echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
           mkdir /tmp/repro
           tar xf /tmp/repro.tar.gz -C /tmp/repro
+          grep -R -n -E 'Link after re-register|LinkAddress(ToFunction)?|link_address_to_function|re-register' /tmp/repro/fex-full-thunk-pair > "$R/fixture-link-sites.txt" || true
+          cat "$R/fixture-link-sites.txt"
 
-      - name: Apply narrow retire-rebind diagnostic
+      - name: Instrument duplicate registration and retirement
         shell: bash
         run: |
           set -euxo pipefail
@@ -60,6 +62,19 @@ jobs:
           from pathlib import Path
           p = Path('src/FEXCore/Source/Interface/Core/Core.cpp')
           s = p.read_text()
+
+          old = '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  HasCustomIRHandlers = true;\n'
+          new = '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  fprintf(stderr, "DIAG_CUSTOM_ADD H=%#lx inserted=%d creator=%p data=%p\\n", Entrypoint, InsertedIterator.second ? 1 : 0, Creator, Data);\n  HasCustomIRHandlers = true;\n'
+          if old not in s:
+              raise SystemExit('AddCustomIREntrypoint insertion site missing')
+          s = s.replace(old, new, 1)
+
+          old = '  CustomIRHandlers.erase(Entrypoint);\n  HasCustomIRHandlers = !CustomIRHandlers.empty();\n  SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);\n'
+          new = '  auto Erased = CustomIRHandlers.erase(Entrypoint);\n  fprintf(stderr, "DIAG_CUSTOM_REMOVE H=%#lx erased=%zu\\n", Entrypoint, Erased);\n  HasCustomIRHandlers = !CustomIRHandlers.empty();\n  SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);\n  fprintf(stderr, "DIAG_CUSTOM_INVALIDATED H=%#lx\\n", Entrypoint);\n'
+          if old not in s:
+              raise SystemExit('RemoveCustomIREntrypoint site missing')
+          s = s.replace(old, new, 1)
+
           old = '''    if (Result->Data != (void*)GuestThunkEntrypoint) {
                 // NOTE: This may happen in Vulkan thunks if the Vulkan driver resolves two different symbols
                 //       to the same function (e.g. vkGetPhysicalDeviceFeatures2/vkGetPhysicalDeviceFeatures2KHR)
@@ -73,18 +88,19 @@ jobs:
                 LogMan::Msg::EFmt("Input address for AddThunkTrampoline is already linked elsewhere");
               }'''
           if old not in s:
-              raise SystemExit('target block missing')
+              raise SystemExit('duplicate thunk block missing')
           new = '''    if (Result->Data != (void*)GuestThunkEntrypoint) {
-                LogMan::Msg::EFmt("DIAGNOSTIC: retiring old thunk link before rebinding");
+                fprintf(stderr, "DIAG_DUP H=%#lx OLD=%p NEW=%#lx\\n", Entrypoint, Result->Data, GuestThunkEntrypoint);
                 RemoveCustomIREntrypoint(nullptr, Entrypoint);
+                fprintf(stderr, "DIAG_DUP_READD H=%#lx NEW=%#lx\\n", Entrypoint, GuestThunkEntrypoint);
                 AddThunkTrampolineIRHandler(Entrypoint, GuestThunkEntrypoint);
                 return;
               }'''
-          p.write_text(s.replace(old, new, 1))
+          s = s.replace(old, new, 1)
+          p.write_text(s)
           PY
           git -C src diff --check
           git -C src diff -- FEXCore/Source/Interface/Core/Core.cpp > "$R/rebind.diff"
-          grep -n -A12 -B4 'DIAGNOSTIC: retiring' src/FEXCore/Source/Interface/Core/Core.cpp > "$R/rebind-snippet.txt"
 
       - name: Build diagnostic FEX and full thunk pair
         shell: bash
@@ -132,8 +148,8 @@ jobs:
           rc=$?
           set -e
           echo "$rc" > "$R/rebind.exit"
-          cat "$R/rebind.stdout"
-          cat "$R/rebind.stderr"
+          grep -E 'DIAG_|generation|reload|re-register|retained|fresh|callback|native host stable' "$R/rebind.stdout" "$R/rebind.stderr" > "$R/key-lines.txt" || true
+          cat "$R/key-lines.txt"
           exit 0
 
       - name: Upload receipts
