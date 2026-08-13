@@ -84,7 +84,25 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
 }
 }
 
+static void* GuestThunkLifetimePin {};
+
 void OnInit() {
+  // Diagnostic lifetime experiment: keep this guest thunk image resident for
+  // the lifetime of the process. The Vulkan thunk publishes guest code
+  // addresses into FEX bridge state, so this isolates whether allowing the
+  // DSO to unmap while those bridges survive is sufficient to explain the
+  // teardown crash.
+  //
+  // This is deliberately a coarse compatibility experiment rather than a
+  // general lifecycle solution. A complete solution needs to retire every
+  // bridge that targets a guest DSO before that DSO can be unmapped.
+  GuestThunkLifetimePin = dlopen("libvulkan.so.1", RTLD_LAZY | RTLD_NODELETE);
+  if (!GuestThunkLifetimePin) {
+    fprintf(stderr, "FEXDBG Vulkan guest thunk RTLD_NODELETE pin failed: %s\n", dlerror());
+  } else {
+    fprintf(stderr, "FEXDBG Vulkan guest thunk pinned RTLD_NODELETE handle=%p\n", GuestThunkLifetimePin);
+  }
+
   // TODO: Load libX11 on-demand instead
   void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);
   fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
