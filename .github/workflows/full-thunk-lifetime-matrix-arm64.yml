@@ -65,8 +65,7 @@ jobs:
           # this does not depend on CodePages/CachedCodePages reverse indexes.
           p = Path('src/FEXCore/Source/Interface/Core/LookupCache.h')
           s = p.read_text()
-          marker = '''  // Invalidates all L1/L2 entries for all guest block that intersect the given range
-          bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {'''
+          marker = '  bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {'
           insert = '''  // Diagnostic: invalidate one exact entry even when it has no guest code-page registration.
           bool InvalidateExactEntry(uint64_t Address) {
             auto lk = Shared->AcquireWriteLock();
@@ -74,7 +73,6 @@ jobs:
             return Shared->Erase(Address, lk);
           }
 
-          // Invalidates all L1/L2 entries for all guest block that intersect the given range
           bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {'''
           if marker not in s:
               raise SystemExit('LookupCache insertion marker missing')
