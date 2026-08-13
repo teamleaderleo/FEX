@@ -1,0 +1,109 @@
+name: Vulkan guest X11 bootstrap A-B
+
+on:
+  push:
+    branches: [ci/vulkan-guest-x11-bootstrap-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  x11-bootstrap:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev
+          printf 'fex=%s\ncarrier=%s\n' "$(git -C src rev-parse HEAD)" "$GITHUB_SHA" > "$R/identity.txt"
+
+      - name: Build exact FEX and Vulkan thunks
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" > "$R/build-host.log" 2>&1
+          cmake -S src/ThunkLibs/GuestLibs -B guest-build -G Ninja -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" > "$R/build-guest.log" 2>&1
+          test -x src/build/Bin/FEX
+          test -x src/build/Bin/FEXServer
+          test -f src/build/HostLibs_64/libvulkan-host.so
+          test -f guest-build/libvulkan-guest.so
+
+      - name: Prepare amd64 rootfs and phase probe
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/phase.c <<'EOF'
+          #include <dlfcn.h>
+          #include <string.h>
+          #include <unistd.h>
+          static void m(const char *s){size_t n=strlen(s); if(write(2,s,n)!=(ssize_t)n)_exit(99);}
+          int main(void){m("BEFORE_DLOPEN\n"); void *h=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL); if(!h){m("DLOPEN_ERROR\n"); return 2;} m("AFTER_DLOPEN\n"); _exit(0);}
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/phase.c -ldl -o "$ROOTFS/opt/fex-ci/phase"
+
+      - name: Baseline without x86 X11
+        run: |
+          set +e
+          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$GITHUB_WORKSPACE/src/build/HostLibs_64" "$GITHUB_WORKSPACE/src/build/Bin/FEX" /opt/fex-ci/phase > "$R/no-x11.stdout" 2> "$R/no-x11.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/no-x11.exit"
+
+      - name: Add only x86 X11 symbols
+        run: |
+          set -euxo pipefail
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          file "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6" > "$R/x11-stub.file"
+
+      - name: Candidate with x86 X11 symbols
+        run: |
+          set +e
+          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$GITHUB_WORKSPACE/src/build/HostLibs_64" "$GITHUB_WORKSPACE/src/build/Bin/FEX" /opt/fex-ci/phase > "$R/with-x11.stdout" 2> "$R/with-x11.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/with-x11.exit"
+          printf 'no_x11=%s\nwith_x11=%s\n' "$(cat "$R/no-x11.exit")" "$rc" | tee "$R/matrix.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-guest-x11-bootstrap-${{ github.run_id }}
+          path: receipts
+          if-no-files-found: warn
