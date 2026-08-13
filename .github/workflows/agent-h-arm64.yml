@@ -52,47 +52,65 @@ jobs:
           set -euxo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          p=Path('Source/Tools/LinuxEmulation/Thunks.cpp')
-          s=p.read_text()
-          old='  fextl::unordered_map<GuestcallInfo, HostToGuestTrampolinePtr*, GuestcallInfoHash> GuestcallToHostTrampoline;'
-          new='''  fextl::unordered_map<GuestcallInfo, HostToGuestTrampolinePtr*, GuestcallInfoHash> GuestcallToHostTrampoline;
-            // Diagnostic only: one stable published trampoline per callback signature/HostPacker.
-            fextl::unordered_map<void*, HostToGuestTrampolinePtr*> StableCallbackByHostPacker;'''
-          if old not in s: raise SystemExit('trampoline map marker missing')
-          s=s.replace(old,new,1)
+          p = Path('Source/Tools/LinuxEmulation/Thunks.cpp')
+          s = p.read_text()
 
-          old='''  if (!Trampoline.HostPacker) {
-            LogMan::Msg::DFmt("Thunks: Finalizing trampoline at {} with host packer {}", fmt::ptr(TrampolineAddress), fmt::ptr(HostPacker));
-            Trampoline.HostPacker = HostPacker;
-          }
-          }'''
-          new='''  auto ThunkHandler = reinterpret_cast<ThunkHandler_impl*>(FEX::HLE::_SyscallHandler->GetThunkHandler());
-          std::lock_guard lk(ThunkHandler->ThunksMutex);
+          marker = '  fextl::unordered_map<GuestcallInfo, HostToGuestTrampolinePtr*, GuestcallInfoHash> GuestcallToHostTrampoline;'
+          if marker not in s:
+              raise SystemExit('trampoline map marker missing')
+          s = s.replace(marker, marker + '\n  // Diagnostic only: stable published host trampoline per callback HostPacker/signature.\n'
+                        '  fextl::unordered_map<void*, HostToGuestTrampolinePtr*> StableCallbackByHostPacker;', 1)
 
-          if (!Trampoline.HostPacker) {
-            LogMan::Msg::DFmt("Thunks: Finalizing trampoline at {} with host packer {}", fmt::ptr(TrampolineAddress), fmt::ptr(HostPacker));
-            Trampoline.HostPacker = HostPacker;
-          }
+          start_marker = 'FEX_DEFAULT_VISIBILITY void FinalizeHostTrampolineForGuestFunction(HostToGuestTrampolinePtr* TrampolineAddress, void* HostPacker) {'
+          start = s.find(start_marker)
+          if start < 0:
+              raise SystemExit('finalize start missing')
+          end_marker = '\nnamespace ThunkFunctions {'
+          end = s.find(end_marker, start)
+          if end < 0:
+              raise SystemExit('finalize end missing')
 
-          auto [It, Inserted] = ThunkHandler->StableCallbackByHostPacker.emplace(HostPacker, TrampolineAddress);
-          if (!Inserted && It->second != TrampolineAddress) {
-            auto& Stable = GetInstanceInfo(It->second);
-            fprintf(stderr,
-                    "DIAG_CALLBACK_REBIND packer=%p stable=%p new=%p old_unpack=%#lx new_unpack=%#lx old_target=%#lx new_target=%#lx\\n",
-                    HostPacker, It->second, TrampolineAddress, Stable.GuestUnpacker, Trampoline.GuestUnpacker, Stable.GuestTarget,
-                    Trampoline.GuestTarget);
-            Stable.GuestUnpacker = Trampoline.GuestUnpacker;
-            Stable.GuestTarget = Trampoline.GuestTarget;
-          } else if (Inserted) {
-            fprintf(stderr, "DIAG_CALLBACK_STABLE packer=%p trampoline=%p unpack=%#lx target=%#lx\\n", HostPacker, TrampolineAddress,
-                    Trampoline.GuestUnpacker, Trampoline.GuestTarget);
+          replacement = r'''FEX_DEFAULT_VISIBILITY void FinalizeHostTrampolineForGuestFunction(HostToGuestTrampolinePtr* TrampolineAddress, void* HostPacker) {
+            if (TrampolineAddress == nullptr) {
+              return;
+            }
+
+            auto& Trampoline = GetInstanceInfo(TrampolineAddress);
+            LOGMAN_THROW_A_FMT(Trampoline.CallCallback == (uintptr_t)&ThunkHandler_impl::CallCallback, "Invalid trampoline at {} passed to {}",
+                               fmt::ptr(TrampolineAddress), __FUNCTION__);
+
+            auto ThunkHandler = reinterpret_cast<ThunkHandler_impl*>(FEX::HLE::_SyscallHandler->GetThunkHandler());
+            std::lock_guard lk(ThunkHandler->ThunksMutex);
+
+            if (!Trampoline.HostPacker) {
+              LogMan::Msg::DFmt("Thunks: Finalizing trampoline at {} with host packer {}", fmt::ptr(TrampolineAddress), fmt::ptr(HostPacker));
+              Trampoline.HostPacker = HostPacker;
+            }
+
+            auto [It, Inserted] = ThunkHandler->StableCallbackByHostPacker.emplace(HostPacker, TrampolineAddress);
+            if (Inserted) {
+              fprintf(stderr, "DIAG_CALLBACK_STABLE packer=%p trampoline=%p unpack=%#lx target=%#lx\n", HostPacker, TrampolineAddress,
+                      Trampoline.GuestUnpacker, Trampoline.GuestTarget);
+              return;
+            }
+
+            if (It->second != TrampolineAddress) {
+              auto& Stable = GetInstanceInfo(It->second);
+              fprintf(stderr,
+                      "DIAG_CALLBACK_REBIND packer=%p stable=%p new=%p old_unpack=%#lx new_unpack=%#lx old_target=%#lx new_target=%#lx\n",
+                      HostPacker, It->second, TrampolineAddress, Stable.GuestUnpacker, Trampoline.GuestUnpacker, Stable.GuestTarget,
+                      Trampoline.GuestTarget);
+              Stable.GuestUnpacker = Trampoline.GuestUnpacker;
+              Stable.GuestTarget = Trampoline.GuestTarget;
+            }
           }
-          }'''
-          if old not in s: raise SystemExit('finalize block missing')
-          p.write_text(s.replace(old,new,1))
+          '''
+          s = s[:start] + replacement + s[end:]
+          p.write_text(s)
           PY
           git diff --check
           git diff -- Source/Tools/LinuxEmulation/Thunks.cpp > "$R/callback-rebind.diff"
+          grep -n -A45 -B5 'FinalizeHostTrampolineForGuestFunction' Source/Tools/LinuxEmulation/Thunks.cpp > "$R/finalize-snippet.txt"
 
       - name: Build diagnostic FEX and full pair
         shell: bash
