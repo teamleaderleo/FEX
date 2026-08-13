@@ -1,0 +1,140 @@
+name: Linux Fieldwork Vulkan runtime differential
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
+    paths:
+      - LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
+      - .github/workflows/linux-fieldwork-vulkan-runtime.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, candidate]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    env:
+      FEX_PORTABLE: 1
+      FEX_SILENTLOG: 0
+      FEX_OUTPUTLOG: stderr
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-callback-ci
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang lld clang-tools libclang-dev llvm-dev pkg-config ccache gcc-x86-64-linux-gnu g++-x86-64-linux-gnu gcc-i686-linux-gnu g++-i686-linux-gnu libcap-dev libglfw3-dev libepoxy-dev python3-dev libsdl2-dev libasound2-dev libdrm-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libgl-dev libegl-dev libvulkan-dev mesa-vulkan-drivers
+
+      - name: Select source variant
+        if: matrix.variant == 'candidate'
+        run: |
+          set -euxo pipefail
+          git apply --check LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
+          git apply LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
+          git diff --check
+
+      - name: Configure and build FEX
+        run: |
+          set -euxo pipefail
+          CLANG_DIR=$(dirname "$(find /usr/lib/llvm-18 -type f -name ClangConfig.cmake -print -quit)")
+          LLVM_DIR=$(dirname "$(find /usr/lib/llvm-18 -type f -name LLVMConfig.cmake -print -quit)")
+          CC=clang CXX=clang++ cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
+            -DUSE_LINKER=lld -DENABLE_LTO=False -DENABLE_ASSERTIONS=True \
+            -DBUILD_TESTING=False -DBUILD_THUNKS=True -DBUILD_FEXCONFIG=False \
+            -DENABLE_CLANG_THUNKS=True -DRANGES_NATIVE=OFF \
+            -DClang_DIR="$CLANG_DIR" -DLLVM_DIR="$LLVM_DIR"
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      - name: Compile probes and X11 fixture
+        run: |
+          set -euxo pipefail
+          P=fieldwork/investigations/fex-vulkan-thunk-lifecycle
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$P/fex_vulkan_callback_probe.c" -ldl -o /tmp/callback-x86_64
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$P/procaddr_semantics_probe.c" -ldl -o /tmp/procaddr-x86_64
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC \
+            -Wl,-soname,libX11.so.6 "$P/x11_symbol_fixture.c" -o /tmp/libX11.so.6
+
+      - name: Build minimal x86 rootfs
+        run: |
+          set -euxo pipefail
+          sudo systemctl start docker || true
+          sudo docker pull --platform linux/amd64 ubuntu:24.04
+          cid=$(sudo docker create --platform linux/amd64 ubuntu:24.04)
+          mkdir -p rootfs
+          sudo docker export "$cid" | sudo tar -C rootfs -xf -
+          sudo docker rm "$cid"
+          sudo mkdir -p rootfs/tmp rootfs/usr/lib/x86_64-linux-gnu
+          sudo cp /tmp/callback-x86_64 rootfs/tmp/callback-x86_64
+          sudo cp /tmp/procaddr-x86_64 rootfs/tmp/procaddr-x86_64
+          sudo cp /tmp/libX11.so.6 rootfs/usr/lib/x86_64-linux-gnu/libX11.so.6
+          sudo cp install/share/fex-emu/GuestThunks/libvulkan-guest.so rootfs/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+
+      - name: Run FEX discriminator matrix
+        run: |
+          set -euxo pipefail
+          FEX=install/bin/FEX
+          THUNKCONFIG=install/share/fex-emu/ThunksDB.json
+          GUESTDIR=install/share/fex-emu/GuestThunks
+          HOSTDIR=install/lib/fex-emu/HostThunks
+          ICD=$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)
+          mkdir -p "$HOME/.fex-emu" evidence
+          cat >"$HOME/.fex-emu/Config.json" <<JSON
+          {"Config":{"RootFS":"$GITHUB_WORKSPACE/rootfs","ThunkConfig":"$GITHUB_WORKSPACE/$THUNKCONFIG"},"ThunksDB":{"Vulkan":1}}
+          JSON
+          run_case() {
+            name=$1; shift
+            set +e
+            VK_ICD_FILENAMES="$ICD" FEX_ROOTFS="$GITHUB_WORKSPACE/rootfs" \
+              FEX_THUNKCONFIG="$GITHUB_WORKSPACE/$THUNKCONFIG" \
+              FEX_THUNKGUESTLIBS="$GITHUB_WORKSPACE/$GUESTDIR" \
+              FEX_THUNKHOSTLIBS="$GITHUB_WORKSPACE/$HOSTDIR" \
+              "$FEX" "$@" >"evidence/$name.log" 2>&1
+            status=$?
+            set -e
+            echo "$status" >"evidence/$name.status"
+            echo "$name=$status"
+            cat "evidence/$name.log"
+          }
+          run_case direct-report /tmp/callback-x86_64 report direct 0
+          run_case direct-utils /tmp/callback-x86_64 utils direct 0
+          run_case dynamic-report /tmp/callback-x86_64 report gipa 0
+          run_case dynamic-utils /tmp/callback-x86_64 utils gipa 0
+          run_case procaddr /tmp/procaddr-x86_64
+          for f in evidence/*.status; do echo "$(basename "$f" .status)=$(cat "$f")"; done | sort | tee evidence/status-matrix.txt
+
+          test "$(cat evidence/direct-report.status)" = 0
+          test "$(cat evidence/direct-utils.status)" = 0
+          if test "${{ matrix.variant }}" = candidate; then
+            test "$(cat evidence/dynamic-report.status)" = 0
+            test "$(cat evidence/dynamic-utils.status)" = 0
+            test "$(cat evidence/procaddr.status)" = 0
+          else
+            test "$(cat evidence/dynamic-report.status)" != 0
+            test "$(cat evidence/procaddr.status)" != 0
+          fi
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-runtime-${{ matrix.variant }}-${{ github.run_id }}
+          path: evidence
+          retention-days: 7
