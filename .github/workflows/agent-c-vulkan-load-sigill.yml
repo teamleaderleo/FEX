@@ -47,7 +47,16 @@ jobs:
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils-x86-64-linux-gnu \
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
-            libxrandr-dev libxrender-dev
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools
+
+      - name: Native ARM64 Lavapipe control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" > "$R/lvp-icd.txt"
+          VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
 
       - name: Build focused FEX and Vulkan thunks
         shell: bash
@@ -74,7 +83,7 @@ jobs:
           x86_64-linux-gnu-objdump -d guest/libvulkan-guest.so > "$R/guest-objdump.txt"
           grep -n -B2 -A4 '0f 3f' "$R/guest-objdump.txt" | head -120 > "$R/op-thunk-sites.txt" || true
 
-      - name: Build amd64 rootfs and SIGILL tracer
+      - name: Build amd64 rootfs with diagnostic guest X11 symbols
         shell: bash
         run: |
           set -euxo pipefail
@@ -89,6 +98,17 @@ jobs:
           cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11-stub.c <<'EOF'
+          long XSync(void) { return 0; }
+          void *XGetVisualInfo(void) { return 0; }
+          const char *XDisplayString(void) { return ":fex-ci-stub"; }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 \
+            -Wl,-soname,libX11.so.6 /tmp/x11-stub.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-readelf -Ws "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6" \
+            | grep -E 'XSync|XGetVisualInfo|XDisplayString' | tee "$R/x11-stub-symbols.txt"
 
           cat >/tmp/trace.c <<'EOF'
           #define _GNU_SOURCE
@@ -137,9 +157,9 @@ jobs:
           }
           EOF
           x86_64-linux-gnu-gcc -O0 -g -Wall -Wextra -Werror /tmp/trace.c -ldl -o "$ROOTFS/opt/fex-ci/trace"
-          file "$ROOTFS/opt/fex-ci/trace" > "$R/trace-file.txt"
+          file "$ROOTFS/opt/fex-ci/trace" "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6" > "$R/trace-files.txt"
 
-      - name: Run traced Vulkan load
+      - name: Run Vulkan load with diagnostic guest X11 helpers
         shell: bash
         run: |
           set -uxo pipefail
