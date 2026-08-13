@@ -60,10 +60,15 @@ jobs:
         run: |
           cmake --build build --target vulkan-host-64 guest-libs -j"$(nproc)"
 
-      - name: Inspect generated debug utils layout
+      - name: Inspect generated Vulkan callback layouts
         run: |
           set -euxo pipefail
-          generated=build/gen_64/thunkgen_host_libvulkan.inl
-          test -f "$generated"
-          grep -n -A24 -B6 'guest_layout<VkDebugUtilsMessengerCreateInfoEXT>' "$generated"
-          grep -n -A24 -B6 'host_layout<VkDebugUtilsMessengerCreateInfoEXT>' "$generated"
+          find build -type f \( -name '*.inl' -o -name '*.h' -o -name '*.hpp' \) -print0 \
+            | xargs -0 grep -n -H -A18 -B6 'VkDebugUtilsMessengerCreateInfoEXT' \
+            | head -240 \
+            | tee /tmp/debug-utils-generated.txt || true
+          find build -type f \( -name '*.inl' -o -name '*.h' -o -name '*.hpp' \) -print0 \
+            | xargs -0 grep -n -H -A14 -B4 'VkDeviceDeviceMemoryReportCreateInfoEXT' \
+            | head -200 \
+            | tee /tmp/device-memory-report-generated.txt || true
+          wc -l /tmp/debug-utils-generated.txt /tmp/device-memory-report-generated.txt
