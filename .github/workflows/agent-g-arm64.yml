@@ -1,0 +1,234 @@
+name: Agent G ARM64 exact thunk retirement
+
+on:
+  push:
+    branches: [ci/agent-g-arm64-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact-retire:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'fex=%s\nfieldwork=%s\ncarrier=%s\n' \
+            "$(git rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" "$GITHUB_SHA" > "$R/identity.txt"
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+
+      - name: Apply exact pre-unmap retirement diagnostic
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def repl(path, old, new, label):
+              p=Path(path); s=p.read_text()
+              if old not in s: raise SystemExit(f'{label} missing in {path}')
+              p.write_text(s.replace(old,new,1))
+
+          # Exact one-entry local+shared cache invalidation for the owning thread.
+          repl(
+              'FEXCore/Source/Interface/Core/LookupCache.h',
+              '  // Invalidates all L1/L2 entries for all guest block that intersect the given range\n  bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {',
+              '''  bool InvalidateExactEntry(uint64_t Address) {
+                auto lk = Shared->AcquireWriteLock();
+                InvalidateCache(Address, lk);
+                return Shared->Erase(Address, lk);
+              }
+
+              // Invalidates all L1/L2 entries for all guest block that intersect the given range
+              bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {''',
+              'LookupCache exact entry')
+
+          repl(
+              'FEXCore/include/FEXCore/Core/Context.h',
+              '  FEX_DEFAULT_VISIBILITY virtual void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) = 0;',
+              '''  FEX_DEFAULT_VISIBILITY virtual void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) = 0;
+              FEX_DEFAULT_VISIBILITY virtual void
+              RetireThunkTrampolineIRHandler(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) = 0;''',
+              'public retire declaration')
+          repl(
+              'FEXCore/Source/Interface/Context/Context.h',
+              '  void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) override;',
+              '''  void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) override;
+              void RetireThunkTrampolineIRHandler(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) override;''',
+              'impl retire declaration')
+          repl(
+              'FEXCore/Source/Interface/Core/Core.cpp',
+              'void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {',
+              '''void ContextImpl::RetireThunkTrampolineIRHandler(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) {
+                RemoveCustomIREntrypoint(Thread, Entrypoint);
+                bool SharedErased = false;
+                if (Thread) {
+                  SharedErased = Thread->LookupCache->InvalidateExactEntry(Entrypoint);
+                }
+                fprintf(stderr, "DIAG_EXACT_RETIRE H=%#lx thread=%p shared=%d\\n", Entrypoint, Thread, SharedErased ? 1 : 0);
+              }
+
+              void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {''',
+              'exact retire implementation')
+
+          p=Path('Source/Tools/LinuxEmulation/Thunks.h'); s=p.read_text()
+          marker='namespace FEX::HLE {\n'
+          if marker not in s: raise SystemExit('thunks namespace missing')
+          s=s.replace(marker,'namespace FEXCore::Core { struct InternalThreadState; }\n\n'+marker,1)
+          old='  virtual void AppendThunkDefinitions(std::span<const FEXCore::IR::ThunkDefinition> Definitions) = 0;'
+          new='''  virtual void AppendThunkDefinitions(std::span<const FEXCore::IR::ThunkDefinition> Definitions) = 0;
+              virtual void RetireGuestRange(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Length) = 0;'''
+          if old not in s: raise SystemExit('thunks interface missing')
+          p.write_text(s.replace(old,new,1))
+
+          p=Path('Source/Tools/LinuxEmulation/Thunks.cpp'); s=p.read_text()
+          if '#include <FEXCore/fextl/vector.h>' not in s:
+              s=s.replace('#include <FEXCore/fextl/unordered_map.h>\n','#include <FEXCore/fextl/unordered_map.h>\n#include <FEXCore/fextl/vector.h>\n',1)
+          old='  fextl::unordered_map<GuestcallInfo, HostToGuestTrampolinePtr*, GuestcallInfoHash> GuestcallToHostTrampoline;'
+          new='''  fextl::unordered_map<GuestcallInfo, HostToGuestTrampolinePtr*, GuestcallInfoHash> GuestcallToHostTrampoline;
+              fextl::unordered_map<uintptr_t, uintptr_t> LinkedHostToGuest;'''
+          if old not in s: raise SystemExit('owner map marker missing')
+          s=s.replace(old,new,1)
+          old='  void AppendThunkDefinitions(std::span<const FEXCore::IR::ThunkDefinition> Definitions) override {'
+          new='''  void RetireGuestRange(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Length) override;
+
+              void AppendThunkDefinitions(std::span<const FEXCore::IR::ThunkDefinition> Definitions) override {'''
+          if old not in s: raise SystemExit('owner method marker missing')
+          s=s.replace(old,new,1)
+          old='''FEX_DEFAULT_VISIBILITY HostToGuestTrampolinePtr*
+          MakeHostTrampolineForGuestFunction'''
+          new='''void ThunkHandler_impl::RetireGuestRange(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Length) {
+              if (!Thread || !Length) return;
+              fextl::vector<uintptr_t> ToRetire;
+              {
+                std::lock_guard lk(ThunksMutex);
+                for (auto& [Host, Target] : LinkedHostToGuest) {
+                  if (Target >= Base && Target - Base < Length) {
+                    ToRetire.emplace_back(Host);
+                    fprintf(stderr, "DIAG_EXACT_MATCH H=%#lx T=%#lx range=%#lx+%#lx\\n", Host, Target, Base, Length);
+                  }
+                }
+                for (auto Host : ToRetire) LinkedHostToGuest.erase(Host);
+              }
+              auto CTX = static_cast<FEXCore::Context::Context*>(Thread->CTX);
+              for (auto Host : ToRetire) CTX->RetireThunkTrampolineIRHandler(Thread, Host);
+            }
+
+            FEX_DEFAULT_VISIBILITY HostToGuestTrampolinePtr*
+            MakeHostTrampolineForGuestFunction'''
+          if old not in s: raise SystemExit('retire definition marker missing')
+          s=s.replace(old,new,1)
+          old='    CTX->AddThunkTrampolineIRHandler(args->original_callee, args->target_addr);\n'
+          new='''    auto ThunkHandler = reinterpret_cast<ThunkHandler_impl*>(FEX::HLE::_SyscallHandler->GetThunkHandler());
+                CTX->AddThunkTrampolineIRHandler(args->original_callee, args->target_addr);
+                {
+                  std::lock_guard lk(ThunkHandler->ThunksMutex);
+                  ThunkHandler->LinkedHostToGuest[args->original_callee] = args->target_addr;
+                }
+                fprintf(stderr, "DIAG_EXACT_OWNER H=%#lx T=%#lx\\n", args->original_callee, args->target_addr);
+          '''
+          if old not in s: raise SystemExit('link owner marker missing')
+          p.write_text(s.replace(old,new,1))
+
+          p=Path('Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp'); s=p.read_text()
+          if '#include "Thunks.h"' not in s:
+              s=s.replace('#include "LinuxSyscalls/Syscalls.h"\n','#include "LinuxSyscalls/Syscalls.h"\n#include "Thunks.h"\n',1)
+          old='  bool PendingResourceDeletion;\n\n  {\n    // Frontend calls this with nullptr Thread during initialization.'
+          new='''  bool PendingResourceDeletion;
+
+              if (Thread && Size) {
+                if (auto* Thunks = GetThunkHandler()) {
+                  Thunks->RetireGuestRange(Thread, reinterpret_cast<uintptr_t>(addr), Size);
+                }
+              }
+
+              {
+                // Frontend calls this with nullptr Thread during initialization.'''
+          if old not in s: raise SystemExit('preunmap marker missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          git diff --check
+          git diff > "$R/diagnostic.diff"
+
+      - name: Build diagnostic FEX and full pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
+          cmake --build build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build.log" 2>&1
+          cd /tmp/repro/fex-full-thunk-pair
+          make clean
+          make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/fixture-build.log" 2>&1
+
+      - name: Prepare rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci/full"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/full/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute exact retirement discriminator
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          HOST="/tmp/repro/fex-full-thunk-pair/host"
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/full" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime --force-different) > "$R/run.stdout" 2> "$R/run.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/run.exit"
+          grep -E 'DIAG_EXACT|generation|unmapped|reserved|reload|retained|re-register|fresh|callback|native host stable|signal=|exit=' "$R/run.stdout" "$R/run.stderr" > "$R/key-lines.txt" || true
+          cat "$R/key-lines.txt"
+          exit 0
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-g-exact-retire-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
