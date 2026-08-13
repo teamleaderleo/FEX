@@ -44,8 +44,8 @@ jobs:
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
             libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
             libvulkan1 mesa-vulkan-drivers vulkan-tools
-          printf 'carrier=%s\nfieldwork=%s\nparent=%s\n' \
-            "$(git rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" "$(git rev-parse HEAD^)" > "$R/identity.txt"
+          printf 'carrier=%s\nfieldwork=%s\n' \
+            "$(git rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" > "$R/identity.txt"
           git status --short > "$R/prebuild-status.txt"
 
       - name: Build baseline exact product
@@ -120,15 +120,15 @@ jobs:
           typedef void (*PFN)(void);
           typedef PFN (*GIPA)(void*, const char*);
           int main(int argc, char **argv) {
-            if (argc != 2) return 64;
+            if (argc != 3) return 64;
             void *h = dlopen("libvulkan.so.1", RTLD_NOW|RTLD_LOCAL);
             if (!h) { fprintf(stderr,"DLERROR %s\n", dlerror()); return 2; }
             GIPA g = (GIPA)dlsym(h,"vkGetInstanceProcAddr");
             if (!g) return 3;
-            PFN p = g(NULL,"vkCreateDebugReportCallbackEXT");
-            fprintf(stderr,"NULL_GIPA ptr=%p expected=%s\n",(void*)p,argv[1]);
-            if (!strcmp(argv[1],"null")) return p ? 30 : 0;
-            if (!strcmp(argv[1],"nonnull")) return p ? 0 : 31;
+            PFN p = g(NULL, argv[1]);
+            fprintf(stderr,"NULL_GIPA command=%s ptr=%p expected=%s\n",argv[1],(void*)p,argv[2]);
+            if (!strcmp(argv[2],"null")) return p ? 30 : 0;
+            if (!strcmp(argv[2],"nonnull")) return p ? 0 : 31;
             return 64;
           }
           EOF
@@ -155,20 +155,22 @@ jobs:
           BASE_GUEST="$R/libvulkan-guest-baseline.so"
           CAND_GUEST="$R/libvulkan-guest-candidate.so"
 
-          run_case base "$HOST_BASE" "$BASE_GUEST" null-gipa /opt/fex-ci/null-gipa nonnull
+          run_case base "$HOST_BASE" "$BASE_GUEST" null-debug-report /opt/fex-ci/null-gipa vkCreateDebugReportCallbackEXT null
+          run_case base "$HOST_BASE" "$BASE_GUEST" null-shader /opt/fex-ci/null-gipa vkCreateShaderModule nonnull
           run_case base "$HOST_BASE" "$BASE_GUEST" report-direct /opt/fex-ci/callback report direct positive
           run_case base "$HOST_BASE" "$BASE_GUEST" report-gipa /opt/fex-ci/callback report gipa positive
           run_case base "$HOST_BASE" "$BASE_GUEST" utils-direct /opt/fex-ci/callback utils direct positive
           run_case base "$HOST_BASE" "$BASE_GUEST" utils-gipa /opt/fex-ci/callback utils gipa positive
 
-          run_case cand "$HOST_CAND" "$CAND_GUEST" null-gipa /opt/fex-ci/null-gipa null
+          run_case cand "$HOST_CAND" "$CAND_GUEST" null-debug-report /opt/fex-ci/null-gipa vkCreateDebugReportCallbackEXT null
+          run_case cand "$HOST_CAND" "$CAND_GUEST" null-shader /opt/fex-ci/null-gipa vkCreateShaderModule null
           run_case cand "$HOST_CAND" "$CAND_GUEST" report-direct /opt/fex-ci/callback report direct positive
           run_case cand "$HOST_CAND" "$CAND_GUEST" report-gipa /opt/fex-ci/callback report gipa positive
           run_case cand "$HOST_CAND" "$CAND_GUEST" utils-direct /opt/fex-ci/callback utils direct positive
           run_case cand "$HOST_CAND" "$CAND_GUEST" utils-gipa /opt/fex-ci/callback utils gipa positive
 
           for prefix in base cand; do
-            for name in null-gipa report-direct report-gipa utils-direct utils-gipa; do
+            for name in null-debug-report null-shader report-direct report-gipa utils-direct utils-gipa; do
               printf '%s_%s=' "$prefix" "$name"
               cat "$R/${prefix}-${name}.exit"
             done
