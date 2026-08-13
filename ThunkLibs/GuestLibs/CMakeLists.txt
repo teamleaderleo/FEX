@@ -133,6 +133,16 @@ function(add_guest_lib NAME SONAME)
   target_compile_definitions(${NAME}-guest PRIVATE GUEST_THUNK_LIBRARY)
   target_link_libraries(${NAME}-guest PRIVATE lib${NAME}-guest-deps)
 
+  # Guest thunk entrypoints and continuations can outlive an application's
+  # ordinary dlopen handle. Keep normal guest wrappers resident once loaded.
+  # VDSO is freestanding and follows separate lifetime rules.
+  if (NOT NAME STREQUAL "VDSO")
+    target_compile_definitions(${NAME}-guest PRIVATE
+      FEX_GUEST_THUNK_SELF_PIN=1
+      FEX_GUEST_THUNK_SONAME="${SONAME}")
+    target_link_libraries(${NAME}-guest PRIVATE dl)
+  endif()
+
   ## Make signed overflow well defined 2's complement overflow
   target_compile_options(${NAME}-guest PRIVATE -fwrapv)
   if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
