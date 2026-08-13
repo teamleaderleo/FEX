@@ -61,10 +61,12 @@ jobs:
           } | tee "$RECEIPT_DIR/identity.txt"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build clang lld libclang-dev llvm-dev pkg-config \
+            cmake ninja-build clang-18 lld lld-18 libclang-18-dev llvm-18-dev pkg-config \
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools
+          test -f /usr/lib/llvm-18/lib/cmake/clang/ClangConfig.cmake
+          test -f /usr/lib/llvm-18/lib/cmake/llvm/LLVMConfig.cmake
 
       - name: Native ARM64 Lavapipe control
         shell: bash
@@ -87,9 +89,11 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          CC=clang CXX=clang++ cmake -S fex-src -B fex-src/build -G Ninja \
+          CC=clang-18 CXX=clang++-18 cmake -S fex-src -B fex-src/build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
             -DENABLE_LTO=OFF \
             -DENABLE_ASSERTIONS=ON \
             -DBUILD_TESTING=OFF \
