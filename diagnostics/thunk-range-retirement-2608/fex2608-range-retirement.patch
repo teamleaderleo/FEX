@@ -1,17 +1,15 @@
 diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
-index ec61b90b..00000000 100644
 --- a/FEXCore/include/FEXCore/Core/Context.h
 +++ b/FEXCore/include/FEXCore/Core/Context.h
-@@ -205,6 +205,16 @@ public:
+@@ -205,6 +205,15 @@ public:
     */
    FEX_DEFAULT_VISIBILITY virtual void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) = 0;
  
 +  /**
-+   * @brief Retires thunk trampoline handlers whose guest destination falls in an unmapped guest range.
++   * @brief Retires thunk trampoline handlers whose guest destination falls in a retiring guest range.
 +   *
-+   * Retired handlers remain registered as tombstones so a stale native function pointer does not fall through
-+   * to ordinary guest instruction decoding. A later AddThunkTrampolineIRHandler call may revive the same native
-+   * entrypoint with a new guest destination.
++   * This diagnostic API preserves a CustomIR tombstone at the native entrypoint so stale native PFNs do not
++   * fall through to ordinary guest instruction decoding after their guest thunk target disappears.
 +   */
 +  FEX_DEFAULT_VISIBILITY virtual void RetireThunkTrampolineIRHandlersInRange(
 +    FEXCore::Core::InternalThreadState* Thread, uintptr_t Start, uintptr_t Length) = 0;
@@ -19,8 +17,8 @@ index ec61b90b..00000000 100644
    /**
     * @brief Adds additional per-instruction granularity TSO enable/disable information for the given range.
     *
- diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
-index 5c5d4cd9..00000000 100644
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
 --- a/FEXCore/Source/Interface/Context/Context.h
 +++ b/FEXCore/Source/Interface/Context/Context.h
 @@ -255,6 +255,8 @@ public:
@@ -32,77 +30,14 @@ index 5c5d4cd9..00000000 100644
  
    void AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) override;
  
- diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index a39c9a13..00000000 100644
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
-@@ -1004,10 +1004,7 @@ ContextImpl::AddCustomIREntrypoint(uintptr_t Entrypoint, CustomIREntrypointHand
+@@ -1059,6 +1059,52 @@ void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Gu
+   }
  }
  
- void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) {
--  LOGMAN_THROW_A_FMT(Entrypoint, "Tried to link null pointer address to guest function");
--  LOGMAN_THROW_A_FMT(GuestThunkEntrypoint, "Tried to link address to null pointer guest function");
--  if (!Config.Is64BitMode) {
--    LOGMAN_THROW_A_FMT((Entrypoint >> 32) == 0, "Tried to link 64-bit address in 32-bit mode");
--    LOGMAN_THROW_A_FMT((GuestThunkEntrypoint >> 32) == 0, "Tried to link 64-bit address in 32-bit mode");
--  }
-+  LOGMAN_THROW_A_FMT(Entrypoint && GuestThunkEntrypoint, "Tried to link a null thunk trampoline address");
- 
-   LogMan::Msg::DFmt("Thunks: Adding guest trampoline from address {:#x} to guest function {:#x}", Entrypoint, GuestThunkEntrypoint);
- 
--  auto Result = AddCustomIREntrypoint(
--    Entrypoint,
--    [this, GuestThunkEntrypoint](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
-+  if (!Config.Is64BitMode) {
-+    LOGMAN_THROW_A_FMT((Entrypoint >> 32) == 0, "Tried to link 64-bit address in 32-bit mode");
-+    LOGMAN_THROW_A_FMT((GuestThunkEntrypoint >> 32) == 0, "Tried to link 64-bit address in 32-bit mode");
-+  }
-+
-+  CustomIREntrypointHandler Handler = [this, GuestThunkEntrypoint](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
-       auto IRHeader = emit->_IRHeader(emit->Invalid(), Entrypoint, 0, 0, 0, 0);
-       auto Block = emit->CreateCodeNode(true, 0);
-       IRHeader.first->Blocks = emit->WrapNode(Block);
-@@ -1028,20 +1025,84 @@ void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Gu
-       }
-       emit->_ExitFunction(IR::OpSize::i64Bit, emit->Constant(GuestThunkEntrypoint), IR::BranchHint::None, emit->Invalid(), emit->Invalid());
--    },
--    ThunkHandler, (void*)GuestThunkEntrypoint);
-+  };
- 
--  if (Result.has_value()) {
--    if (Result->Creator != ThunkHandler) {
-+  bool RevivedTombstone {};
-+  {
-+    std::unique_lock lk(CustomIRMutex);
-+    auto [It, Inserted] = CustomIRHandlers.emplace(
-+      Entrypoint, CustomIRHandlerEntry {Handler, ThunkHandler, reinterpret_cast<void*>(GuestThunkEntrypoint)});
-+    HasCustomIRHandlers = true;
-+
-+    if (!Inserted) {
-+      auto& Existing = It->second;
-+      if (Existing.Creator != ThunkHandler) {
-+        ERROR_AND_DIE_FMT("Input address for AddThunkTrampoline is already linked by another module");
-+      }
-+
-+      if (Existing.Data == nullptr) {
-+        // Range retirement leaves a tombstone at the native PFN. A new registration revives it.
-+        Existing = CustomIRHandlerEntry {Handler, ThunkHandler, reinterpret_cast<void*>(GuestThunkEntrypoint)};
-+        RevivedTombstone = true;
-+      } else if (Existing.Data != reinterpret_cast<void*>(GuestThunkEntrypoint)) {
-+        // NOTE: This may happen in Vulkan thunks if the Vulkan driver resolves two different symbols
-+        //       to the same function (e.g. vkGetPhysicalDeviceFeatures2/vkGetPhysicalDeviceFeatures2KHR).
-+        // Keep the existing live binding in this narrow diagnostic prototype.
-+        LogMan::Msg::EFmt("Input address for AddThunkTrampoline is already linked elsewhere");
-+      }
-+    }
-+  }
-+
-+  if (RevivedTombstone) {
-+    // The old tombstone may itself have translated code cached at Entrypoint.
-+    SyscallHandler->InvalidateGuestCodeRange(nullptr, Entrypoint, 1);
-+  }
-+}
-+
 +void ContextImpl::RetireThunkTrampolineIRHandlersInRange(
 +  FEXCore::Core::InternalThreadState* Thread, uintptr_t Start, uintptr_t Length) {
 +  if (Length == 0) {
@@ -126,8 +61,9 @@ index a39c9a13..00000000 100644
 +      LogMan::Msg::DFmt("Thunks: Retiring guest trampoline from address {:#x}; target {:#x} is in retiring range {:#x}-{:#x}",
 +                        Entrypoint, GuestTarget, Start, Start + Length);
 +
-+      // Preserve the CustomIR classification. If stale guest code calls the native PFN after retirement,
-+      // route it to guest address zero rather than asking the frontend to decode the native PFN as x86.
++      // Preserve the CustomIR classification. A stale native PFN will now route to guest address zero instead of
++      // asking the frontend to decode the native PFN itself as x86. This is a diagnostic tombstone, not the final
++      // stale-call API contract.
 +      Entry.Handler = [this](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
 +        auto IRHeader = emit->_IRHeader(emit->Invalid(), Entrypoint, 0, 0, 0, 0);
 +        auto Block = emit->CreateCodeNode(true, 0);
@@ -149,134 +85,29 @@ index a39c9a13..00000000 100644
 +    }
 +  }
 +
-+  // Do not hold CustomIRMutex while taking the code-invalidation path.
++  // Avoid taking the code-invalidation path while CustomIRMutex is held.
 +  for (const auto Entrypoint : EntrypointsToInvalidate) {
 +    SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
 +  }
 +}
 +
-+void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {
-+  LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
-+  ForceTSOValidRanges.Insert(ValidRanges);
-+  ForceTSOInstructions.merge(std::move(Instructions));
-+}
-+
-+void ContextImpl::RemoveForceTSOInformation(uint64_t Address, uint64_t Size) {
-+  LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
-+
-+  ForceTSOValidRanges.Remove({Address, Address + Size});
-+  ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.upper_bound(Address + Size));
-+}
-+
-+void ContextImpl::MarkMonoBackpatcherBlock(uint64_t BlockEntry) {
-+  MonoBackpatcherBlock.store(BlockEntry, std::memory_order_relaxed);
-+}
-+
-+void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) {
-+  LOGMAN_THROW_A_FMT(Config.Is64BitMode || !(Entrypoint >> 32), "64-bit Entrypoint in 32-bit mode {:x}", Entrypoint);
-+
-+  std::scoped_lock lk(CustomIRMutex);
-+
-+  CustomIRHandlers.erase(Entrypoint);
-+  HasCustomIRHandlers = !CustomIRHandlers.empty();
-+  SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
-+}
-+
-+void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
-+  auto Thread = Frame->Thread;
-+  auto CTX = static_cast<ContextImpl*>(Thread->CTX);
-+  {
-+    auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
-+
-+    if (Size == 8) {
-+      *reinterpret_cast<uint64_t*>(Address) = Value;
-+    } else if (Size == 4) {
-+      *reinterpret_cast<uint32_t*>(Address) = Value;
-+    } else {
-+      ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
-+    }
-+  }
-+
-+  CTX->SyscallHandler->InvalidateGuestCodeRange(Thread, Address, Size);
-+}
-+
-+void ContextImpl::ConfigureAOTGen(FEXCore::Core::InternalThreadState* Thread, fextl::set<uint64_t>* ExternalBranches, uint64_t SectionMaxAddress) {
-+  Thread->FrontendDecoder->SetExternalBranches(ExternalBranches);
-+}
-+} // namespace FEXCore::Context
--      ERROR_AND_DIE_FMT("Input address for AddThunkTrampoline is already linked by another module");
--    }
--    if (Result->Data != (void*)GuestThunkEntrypoint) {
--      // NOTE: This may happen in Vulkan thunks if the Vulkan driver resolves two different symbols
--      //       to the same function (e.g. vkGetPhysicalDeviceFeatures2/vkGetPhysicalDeviceFeatures2KHR)
--      LogMan::Msg::EFmt("Input address for AddThunkTrampoline is already linked elsewhere");
--    }
--  }
--}
--
--void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {
--  LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
--  ForceTSOValidRanges.Insert(ValidRanges);
--  ForceTSOInstructions.merge(std::move(Instructions));
--}
--
--void ContextImpl::RemoveForceTSOInformation(uint64_t Address, uint64_t Size) {
--  LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
--
--  ForceTSOValidRanges.Remove({Address, Address + Size});
--  ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.upper_bound(Address + Size));
--}
--
--void ContextImpl::MarkMonoBackpatcherBlock(uint64_t BlockEntry) {
--  MonoBackpatcherBlock.store(BlockEntry, std::memory_order_relaxed);
--}
--
--void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) {
--  LOGMAN_THROW_A_FMT(Config.Is64BitMode || !(Entrypoint >> 32), "64-bit Entrypoint in 32-bit mode {:x}", Entrypoint);
--
--  std::scoped_lock lk(CustomIRMutex);
--
--  CustomIRHandlers.erase(Entrypoint);
--  HasCustomIRHandlers = !CustomIRHandlers.empty();
--  SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
--}
--
--void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
--  auto Thread = Frame->Thread;
--  auto CTX = static_cast<ContextImpl*>(Thread->CTX);
--  {
--    auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
--
--    if (Size == 8) {
--      *reinterpret_cast<uint64_t*>(Address) = Value;
--    } else if (Size == 4) {
--      *reinterpret_cast<uint32_t*>(Address) = Value;
--    } else {
--      ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
--    }
--  }
--
--  CTX->SyscallHandler->InvalidateGuestCodeRange(Thread, Address, Size);
--}
--
--void ContextImpl::ConfigureAOTGen(FEXCore::Core::InternalThreadState* Thread, fextl::set<uint64_t>* ExternalBranches, uint64_t SectionMaxAddress) {
--  Thread->FrontendDecoder->SetExternalBranches(ExternalBranches);
--}
--} // namespace FEXCore::Context
- diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
-index cdad4b21..00000000 100644
+ void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {
+   LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+   ForceTSOValidRanges.Insert(ValidRanges);
+
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
 --- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
 +++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
-@@ -365,6 +365,15 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
+@@ -365,6 +365,14 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
        if (Result == -1) {
          return -errno;
        }
      }
 +
-+    // Narrow causal probe for thunk lifetime. This intentionally runs after a successful host munmap so a failed
-+    // munmap cannot retire still-valid bridges, but before the existing VMA/code-cache teardown. It does not close
-+    // the concurrent check-to-unmap race; if this changes the Vulkan teardown result, move retirement to an explicit
-+    // loader-owned pre-unmap phase or add a grace-period mechanism as the next experiment.
++    // Narrow causal probe: retire FEX-owned native-PFN redirects immediately after a successful host unmap and
++    // before the existing VMA/code-cache teardown. Placing this after successful munmap avoids retiring bridges
++    // when munmap fails. It deliberately does not claim concurrent unload safety; if this changes the Vulkan
++    // teardown result, the next design step is an explicit pre-unmap retirement/grace-period boundary.
 +    CTX->RetireThunkTrampolineIRHandlersInRange(
 +      Thread, reinterpret_cast<uintptr_t>(addr), Size);
 +
