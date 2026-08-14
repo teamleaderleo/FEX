@@ -1,0 +1,288 @@
+name: Agent C Vulkan 32-bit pNext inventory
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/agent-c-vulkan-load-sigill-20260814
+    paths:
+      - .github/workflows/agent-c-pnext-inventory.yml
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Audit pNext inventories
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p receipts
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import collections
+          import json
+          import pathlib
+          import re
+          import xml.etree.ElementTree as ET
+
+          root = pathlib.Path('src')
+          interface_path = root / 'ThunkLibs/libvulkan/libvulkan_interface.cpp'
+          host_path = root / 'ThunkLibs/libvulkan/Host.cpp'
+          xml_path = root / 'External/Vulkan-Headers/registry/vk.xml'
+          header_paths = [
+              root / 'External/Vulkan-Headers/include/vulkan/vulkan_core.h',
+              root / 'External/Vulkan-Headers/include/vulkan/vulkan_wayland.h',
+              root / 'External/Vulkan-Headers/include/vulkan/vulkan_xcb.h',
+              root / 'External/Vulkan-Headers/include/vulkan/vulkan_xlib.h',
+              root / 'External/Vulkan-Headers/include/vulkan/vulkan_xlib_xrandr.h',
+          ]
+
+          interface = interface_path.read_text()
+          host = host_path.read_text()
+
+          # 1) Structures actually visible under FEX's Linux Vulkan platform defines.
+          struct_blocks: dict[str, str] = {}
+          struct_re = re.compile(r'typedef\s+struct\s+(Vk[A-Za-z0-9_]+)\s*\{(.*?)\}\s*\1\s*;', re.S)
+          for header in header_paths:
+              text = header.read_text(errors='replace')
+              for m in struct_re.finditer(text):
+                  name, body = m.group(1), m.group(2)
+                  if re.search(r'\bpNext\b', body):
+                      struct_blocks[name] = body
+          header_pnext = set(struct_blocks)
+
+          # 2) Active interface annotations. Commented entries are intentionally not counted.
+          annotations = set()
+          annotation_re = re.compile(r'^\s*struct\s+fex_gen_config<&(?P<name>Vk[A-Za-z0-9_]+)::pNext>\s*:\s*fexgen::custom_repack')
+          for line in interface.splitlines():
+              if line.lstrip().startswith('//'):
+                  continue
+              m = annotation_re.match(line)
+              if m:
+                  annotations.add(m.group('name'))
+
+          # 3) Host hook inventory, where DEFAULT and NONDEFAULT are both explicit coverage markers.
+          host_hooks = set()
+          hook_kind = {}
+          hook_re = re.compile(r'^VULKAN_(DEFAULT|NONDEFAULT)_CUSTOM_REPACK\((Vk[A-Za-z0-9_]+)\)')
+          for line in host.splitlines():
+              stripped = line.strip()
+              if stripped.startswith('//'):
+                  continue
+              m = hook_re.match(stripped)
+              if m:
+                  host_hooks.add(m.group(2))
+                  hook_kind[m.group(2)] = m.group(1)
+
+          # 4) Recursive sType handlers. Parse only the actual next_handlers initializer.
+          handler_block_match = re.search(r'next_handlers\s*\{(.*?)\n\};', host, re.S)
+          if not handler_block_match:
+              raise SystemExit('could not locate next_handlers initializer')
+          handler_block = handler_block_match.group(1)
+          handlers = set(re.findall(r'converters<[^,>]+,\s*(Vk[A-Za-z0-9_]+)\s*>', handler_block))
+
+          # 5) Vulkan XML tells us which structures are legal pNext extension nodes.
+          tree = ET.parse(xml_path)
+          xml_root = tree.getroot()
+          xml_structs = {}
+          structextends = {}
+          for t in xml_root.findall('./types/type'):
+              if t.get('category') != 'struct':
+                  continue
+              name = t.get('name')
+              if not name:
+                  name_node = t.find('name')
+                  name = name_node.text if name_node is not None else None
+              if not name:
+                  continue
+              xml_structs[name] = t
+              ext = t.get('structextends', '')
+              structextends[name] = tuple(x.strip() for x in ext.split(',') if x.strip())
+
+          extension_nodes = {name for name in header_pnext if structextends.get(name)}
+          top_level_roots = header_pnext - extension_nodes
+
+          # Map types to their core/extension providers to make triage useful.
+          providers = collections.defaultdict(set)
+          for feature in xml_root.findall('./feature'):
+              number = feature.get('number') or feature.get('name') or 'core'
+              for req in feature.findall('./require'):
+                  for t in req.findall('type'):
+                      name = t.get('name')
+                      if name:
+                          providers[name].add(f'CORE_{number}')
+          for ext in xml_root.findall('./extensions/extension'):
+              ext_name = ext.get('name') or 'UNKNOWN_EXTENSION'
+              for req in ext.findall('./require'):
+                  for t in req.findall('type'):
+                      name = t.get('name')
+                      if name:
+                          providers[name].add(ext_name)
+
+          def risk_for(name: str):
+              body = struct_blocks.get(name, '')
+              declarations = []
+              for decl in body.split(';'):
+                  clean = ' '.join(decl.split())
+                  if clean:
+                      declarations.append(clean)
+              other_pointer_members = [d for d in declarations if '*' in d and not re.search(r'\bpNext\b', d)]
+              abi_tokens = sorted(set(re.findall(r'\b(?:size_t|uintptr_t|intptr_t|PFN_[A-Za-z0-9_]+)\b', body)))
+              has_unionish = 'VkDeviceOrHostAddress' in body or 'VkDescriptorDataEXT' in body
+              return {
+                  'other_pointer_members': other_pointer_members,
+                  'abi_tokens': abi_tokens,
+                  'has_unionish_member': has_unionish,
+                  'pointer_risk': bool(other_pointer_members or abi_tokens or has_unionish),
+              }
+
+          def provider_rank(name: str):
+              ps = providers.get(name, set())
+              if any(p.startswith('CORE_') for p in ps):
+                  return 0
+              if any(p.startswith('VK_KHR_') for p in ps):
+                  return 1
+              if any(p.startswith('VK_EXT_') for p in ps):
+                  return 2
+              return 3
+
+          missing_annotations = header_pnext - annotations
+          annotation_not_in_headers = annotations - header_pnext
+          annotation_host_missing = annotations - host_hooks
+          host_annotation_missing = host_hooks - annotations
+          missing_handlers = extension_nodes - handlers
+          orphan_handlers = handlers - extension_nodes
+
+          missing_rows = []
+          for name in sorted(missing_handlers, key=lambda n: (provider_rank(n), not risk_for(n)['pointer_risk'], n)):
+              risk = risk_for(name)
+              missing_rows.append({
+                  'name': name,
+                  'providers': sorted(providers.get(name, [])),
+                  'structextends': list(structextends.get(name, [])),
+                  'annotated': name in annotations,
+                  'host_hook': name in host_hooks,
+                  'hook_kind': hook_kind.get(name),
+                  **risk,
+              })
+
+          summary = {
+              'header_pnext_structs': len(header_pnext),
+              'xml_legal_extension_nodes': len(extension_nodes),
+              'top_level_pnext_roots': len(top_level_roots),
+              'active_interface_annotations': len(annotations),
+              'active_host_hook_markers': len(host_hooks),
+              'recursive_next_handlers': len(handlers),
+              'missing_annotations': len(missing_annotations),
+              'annotation_not_in_headers': len(annotation_not_in_headers),
+              'annotation_host_missing': len(annotation_host_missing),
+              'host_annotation_missing': len(host_annotation_missing),
+              'missing_legal_extension_handlers': len(missing_handlers),
+              'orphan_handlers': len(orphan_handlers),
+              'missing_handler_pointer_risk': sum(1 for row in missing_rows if row['pointer_risk']),
+          }
+
+          out = pathlib.Path('receipts')
+          (out / 'inventory.json').write_text(json.dumps({
+              'summary': summary,
+              'missing_handlers': missing_rows,
+              'missing_annotations': sorted(missing_annotations),
+              'annotation_not_in_headers': sorted(annotation_not_in_headers),
+              'annotation_host_missing': sorted(annotation_host_missing),
+              'host_annotation_missing': sorted(host_annotation_missing),
+              'orphan_handlers': sorted(orphan_handlers),
+              'top_level_roots': sorted(top_level_roots),
+          }, indent=2) + '\n')
+
+          def write_set(path, values):
+              (out / path).write_text(''.join(f'{x}\n' for x in sorted(values)))
+
+          write_set('missing-annotations.txt', missing_annotations)
+          write_set('annotation-host-missing.txt', annotation_host_missing)
+          write_set('host-annotation-missing.txt', host_annotation_missing)
+          write_set('orphan-handlers.txt', orphan_handlers)
+          write_set('top-level-roots.txt', top_level_roots)
+
+          with (out / 'missing-legal-extension-handlers.tsv').open('w') as f:
+              f.write('name\tpointer_risk\tproviders\tstructextends\tother_pointer_members\tabi_tokens\n')
+              for row in missing_rows:
+                  f.write('\t'.join([
+                      row['name'],
+                      '1' if row['pointer_risk'] else '0',
+                      ','.join(row['providers']),
+                      ','.join(row['structextends']),
+                      ' | '.join(row['other_pointer_members']),
+                      ','.join(row['abi_tokens']),
+                  ]) + '\n')
+
+          lines = [
+              '# 32-bit Vulkan pNext inventory audit',
+              '',
+              'Exact FEX candidate: `c011366706eaf65a00380003989b3a10811212b6`',
+              '',
+              '## Counts',
+              '',
+          ]
+          for key, value in summary.items():
+              lines.append(f'- `{key}`: **{value}**')
+          lines += [
+              '',
+              '## Highest-priority missing legal extension nodes',
+              '',
+              'Ordered core, KHR, EXT, vendor; pointer/ABI-sensitive entries first within each class.',
+              '',
+          ]
+          for row in missing_rows[:60]:
+              providers_text = ', '.join(row['providers']) or 'provider not resolved'
+              risk_text = 'pointer/ABI-sensitive' if row['pointer_risk'] else 'pNext-only/scalar by simple scan'
+              lines.append(f"- `{row['name']}` — {risk_text}; {providers_text}; extends {', '.join(row['structextends'])}")
+          if not missing_rows:
+              lines.append('- none')
+          lines += [
+              '',
+              '## Synchronization checks',
+              '',
+              f"- interface annotation without host hook marker: {len(annotation_host_missing)}",
+              f"- host hook marker without interface annotation: {len(host_annotation_missing)}",
+              f"- recursive handler not identified as a legal XML extension node: {len(orphan_handlers)}",
+              '',
+              'This audit does not claim every missing legal node is immediately reachable in a real workload. It identifies nodes that the current 32-bit recursive pNext translator cannot accept without aborting if they appear in a repacked chain.',
+          ]
+          (out / 'summary.md').write_text('\n'.join(lines) + '\n')
+
+          print(json.dumps(summary, indent=2))
+          print('\nTOP MISSING LEGAL EXTENSION NODES:')
+          for row in missing_rows[:40]:
+              print(f"{row['name']}\tpointer_risk={int(row['pointer_risk'])}\tproviders={','.join(row['providers'])}\textends={','.join(row['structextends'])}")
+
+          # The audit itself should fail only for the two inventories that are supposed
+          # to be mechanically synchronized. Missing legal extension handlers are the
+          # research result, not a workflow failure.
+          if annotation_host_missing or host_annotation_missing:
+              raise SystemExit('interface and Host custom-repack inventories diverge')
+          PY
+
+          cat receipts/summary.md
+
+      - name: Upload receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-pnext-inventory-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
