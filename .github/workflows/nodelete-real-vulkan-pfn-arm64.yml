@@ -76,7 +76,7 @@ jobs:
           grep -q 'FLAGS_1.*NODELETE' "$R/guest-dynamic.txt"
           grep -Fq 'SONAME)             Library soname: [libvulkan.so.1]' "$R/guest-dynamic.txt"
 
-      - name: Create amd64 rootfs and retained PFN probe
+      - name: Create amd64 rootfs and retained PFN stress probe
         shell: bash
         run: |
           set -euxo pipefail
@@ -115,7 +115,7 @@ jobs:
           typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(void *, const char *);
           typedef VkResult (*PFN_vkEnumerateInstanceVersion)(uint32_t *);
 
-          static int mapped(void *p) {
+          static int mapped(void *p, int verbose) {
             FILE *f = fopen("/proc/self/maps", "r");
             char line[512];
             uintptr_t x = (uintptr_t)p;
@@ -123,48 +123,83 @@ jobs:
             while (fgets(line, sizeof(line), f)) {
               unsigned long a, b;
               if (sscanf(line, "%lx-%lx", &a, &b) == 2 && x >= a && x < b) {
-                fprintf(stderr, "MAP %p %s", p, line);
+                if (verbose) fprintf(stderr, "MAP %p %s", p, line);
                 fclose(f);
                 return 1;
               }
             }
             fclose(f);
-            fprintf(stderr, "UNMAPPED %p\n", p);
+            if (verbose) fprintf(stderr, "UNMAPPED %p\n", p);
             return 0;
           }
 
           int main(void) {
+            enum { CYCLES = 256 };
             void *vulkan = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
             if (!vulkan) { fprintf(stderr, "DLERROR %s\n", dlerror()); return 2; }
-            PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(vulkan, "vkGetInstanceProcAddr");
-            if (!gipa) return 3;
-            PFN_vkEnumerateInstanceVersion pfn = (PFN_vkEnumerateInstanceVersion)gipa(NULL, "vkEnumerateInstanceVersion");
-            if (!pfn) return 4;
-            uint32_t before = 0, after = 0;
-            VkResult r1 = pfn(&before);
-            fprintf(stderr, "BEFORE_CLOSE gipa=%p pfn=%p result=%d version=%u\n", (void *)gipa, (void *)pfn, r1, before);
-            mapped((void *)gipa);
+            PFN_vkGetInstanceProcAddr gipa0 = (PFN_vkGetInstanceProcAddr)dlsym(vulkan, "vkGetInstanceProcAddr");
+            if (!gipa0) return 3;
+            PFN_vkEnumerateInstanceVersion pfn0 = (PFN_vkEnumerateInstanceVersion)gipa0(NULL, "vkEnumerateInstanceVersion");
+            if (!pfn0) return 4;
+            uint32_t expected = 0, after = 0;
+            VkResult r1 = pfn0(&expected);
+            fprintf(stderr, "BEFORE_CLOSE gipa=%p pfn=%p result=%d version=%u\n", (void *)gipa0, (void *)pfn0, r1, expected);
+            mapped((void *)gipa0, 1);
             if (r1 != 0) return 5;
             if (dlclose(vulkan) != 0) { fprintf(stderr, "DLCLOSE_ERROR %s\n", dlerror()); return 6; }
             fprintf(stderr, "AFTER_DLCLOSE\n");
-            if (mapped((void *)gipa) != 1) return 7;
-            VkResult r2 = pfn(&after);
-            fprintf(stderr, "AFTER_CLOSE_CALL pfn=%p result=%d version=%u\n", (void *)pfn, r2, after);
-            if (r2 != 0 || after != before) return 8;
-            void *again = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-            if (!again) return 9;
-            PFN_vkGetInstanceProcAddr gipa2 = (PFN_vkGetInstanceProcAddr)dlsym(again, "vkGetInstanceProcAddr");
-            fprintf(stderr, "REOPEN gipa_old=%p gipa_new=%p\n", (void *)gipa, (void *)gipa2);
-            if (gipa2 != gipa) return 10;
-            dlclose(again);
-            fprintf(stderr, "REAL_NODELETE_VULKAN_PFN_OK\n");
+            if (mapped((void *)gipa0, 1) != 1) return 7;
+            VkResult r2 = pfn0(&after);
+            fprintf(stderr, "AFTER_CLOSE_CALL pfn=%p result=%d version=%u\n", (void *)pfn0, r2, after);
+            if (r2 != 0 || after != expected) return 8;
+
+            for (unsigned i = 0; i < CYCLES; ++i) {
+              void *again = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+              if (!again) { fprintf(stderr, "REOPEN_DLERROR cycle=%u %s\n", i, dlerror()); return 20; }
+              PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(again, "vkGetInstanceProcAddr");
+              if (!gipa) return 21;
+              PFN_vkEnumerateInstanceVersion pfn = (PFN_vkEnumerateInstanceVersion)gipa(NULL, "vkEnumerateInstanceVersion");
+              if (!pfn) return 22;
+              if (gipa != gipa0) {
+                fprintf(stderr, "GIPA_DRIFT cycle=%u old=%p new=%p\n", i, (void *)gipa0, (void *)gipa);
+                return 23;
+              }
+              if (pfn != pfn0) {
+                fprintf(stderr, "PFN_DRIFT cycle=%u old=%p new=%p\n", i, (void *)pfn0, (void *)pfn);
+                return 24;
+              }
+              uint32_t reopened = 0;
+              VkResult rr = pfn(&reopened);
+              if (rr != 0 || reopened != expected) {
+                fprintf(stderr, "REOPEN_CALL_FAIL cycle=%u result=%d version=%u expected=%u\n", i, rr, reopened, expected);
+                return 25;
+              }
+              if (dlclose(again) != 0) {
+                fprintf(stderr, "REOPEN_DLCLOSE_ERROR cycle=%u %s\n", i, dlerror());
+                return 26;
+              }
+              uint32_t retained = 0;
+              VkResult rp = pfn0(&retained);
+              if (rp != 0 || retained != expected) {
+                fprintf(stderr, "RETAINED_CALL_FAIL cycle=%u result=%d version=%u expected=%u\n", i, rp, retained, expected);
+                return 27;
+              }
+              if ((i % 32) == 0) {
+                if (mapped((void *)gipa0, 1) != 1) return 28;
+                fprintf(stderr, "STRESS_PROGRESS cycle=%u gipa=%p pfn=%p version=%u\n", i, (void *)gipa, (void *)pfn, retained);
+              }
+            }
+
+            if (mapped((void *)gipa0, 1) != 1) return 29;
+            fprintf(stderr, "STRESS_CYCLES=%u\n", (unsigned)CYCLES);
+            fprintf(stderr, "REAL_NODELETE_VULKAN_PFN_STRESS_OK\n");
             return 0;
           }
           EOF
           x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/pfn.c -ldl -o "$ROOTFS/opt/fex-ci/pfn"
           file "$ROOTFS/opt/fex-ci/pfn" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1" > "$R/x86-files.txt"
 
-      - name: Run real retained PFN lifecycle
+      - name: Run real retained PFN lifecycle stress
         shell: bash
         run: |
           set -uxo pipefail
@@ -178,7 +213,8 @@ jobs:
           echo "$rc" | tee "$R/pfn.exit"
           cat "$R/pfn.err"
           test "$rc" -eq 0
-          grep -q 'REAL_NODELETE_VULKAN_PFN_OK' "$R/pfn.err"
+          grep -q 'STRESS_CYCLES=256' "$R/pfn.err"
+          grep -q 'REAL_NODELETE_VULKAN_PFN_STRESS_OK' "$R/pfn.err"
 
       - name: Upload receipts
         if: always()
