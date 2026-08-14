@@ -73,19 +73,24 @@ jobs:
               raise SystemExit(f'shared AddBlockMapping line count={s.count(needle)}')
           s = s.replace(needle, replacement, 1)
 
-          local_old = '''    for (const auto& CodePage : Entry.CodePages) {
-              CachedCodePages[CodePage >> 12].insert(Address);
-            }'''.replace('              ', '      ')
+          cache_fn = s.find('  void CacheBlockMapping(')
+          if cache_fn < 0:
+              raise SystemExit('CacheBlockMapping function missing')
+          loop_start = s.find('    for (const auto& CodePage : Entry.CodePages) {', cache_fn)
+          if loop_start < 0:
+              raise SystemExit('CacheBlockMapping code-page loop missing')
+          loop_end = s.find('\n    }\n\n    // Do L1', loop_start)
+          if loop_end < 0:
+              raise SystemExit('CacheBlockMapping code-page loop end missing')
+          loop_end += len('\n    }')
           local_new = '''    if (Entry.CodePages.empty()) {
               CachedCodePages[Address >> 12].insert(Address);
             } else {
               for (const auto& CodePage : Entry.CodePages) {
                 CachedCodePages[CodePage >> 12].insert(Address);
               }
-            }'''.replace('              ', '      ')
-          if s.count(local_old) != 1:
-              raise SystemExit(f'local CacheBlockMapping block count={s.count(local_old)}')
-          s = s.replace(local_old, local_new, 1)
+            }'''
+          s = s[:loop_start] + local_new + s[loop_end:]
           p.write_text(s)
 
           core = Path('src/FEXCore/Source/Interface/Core/Core.cpp')
