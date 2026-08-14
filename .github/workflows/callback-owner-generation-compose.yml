@@ -46,6 +46,10 @@ jobs:
         run: python3 .github/fieldwork/fix_retirement_lock_order.py src
       - name: Apply revoked-H state
         run: python3 .github/fieldwork/add_revoked_h_state.py src
+      - name: Apply pre-MAP_FIXED retirement
+        run: python3 owner-helper/.github/fieldwork/pre_map_fixed_retire.py src
+      - name: Apply MAP_FIXED rollback transaction
+        run: python3 owner-helper/.github/fieldwork/add_map_fixed_rollback_transaction.py src
       - name: Apply VMA OwnerID
         run: python3 owner-helper/.github/fieldwork/add_vma_owner_id.py src
       - name: Apply owner-aware retained claims
