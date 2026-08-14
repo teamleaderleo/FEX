@@ -1,0 +1,312 @@
+name: Agent C Vulkan instance pNext debug-utils callback
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-instance-pnext-debug-utils.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+  DEBIAN_FRONTEND: noninteractive
+  ROOTFS: ${{ github.workspace }}/rootfs-amd64
+  HOST: ${{ github.workspace }}/host
+  R: ${{ github.workspace }}/receipts
+  FEX_PORTABLE: 1
+
+jobs:
+  pnext-callback:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Identity and dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          {
+            echo "fex_sha=$(git -C src rev-parse HEAD)"
+            uname -a
+            uname -m
+          } | tee "$R/identity.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools \
+            vulkan-validationlayers debootstrap
+
+      - name: Build probe and prove native creation-time callback
+        shell: bash
+        run: |
+          set -euxo pipefail
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" > "$R/lvp-icd.txt"
+          VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
+
+          cat >/tmp/instance-pnext-debug-utils.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #define VK_NO_PROTOTYPES
+          #include <vulkan/vulkan.h>
+
+          static volatile uint32_t callback_count;
+
+          VKAPI_ATTR VkBool32 VKAPI_CALL callback(
+              VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+              VkDebugUtilsMessageTypeFlagsEXT types,
+              const VkDebugUtilsMessengerCallbackDataEXT *data,
+              void *user) {
+            (void)user;
+            ++callback_count;
+            fprintf(stderr, "PNEXT_CALLBACK count=%u severity=%u types=%u id=%s message=%s\n",
+                    callback_count, (unsigned)severity, (unsigned)types,
+                    data && data->pMessageIdName ? data->pMessageIdName : "<null>",
+                    data && data->pMessage ? data->pMessage : "<null>");
+            fflush(stderr);
+            return VK_FALSE;
+          }
+
+          static int has_layer(PFN_vkEnumerateInstanceLayerProperties enumerate, const char *wanted) {
+            uint32_t count = 0;
+            if (enumerate(&count, NULL) != VK_SUCCESS) return 0;
+            VkLayerProperties *props = calloc(count ? count : 1, sizeof(*props));
+            if (!props) return 0;
+            if (enumerate(&count, props) != VK_SUCCESS) { free(props); return 0; }
+            int found = 0;
+            for (uint32_t i = 0; i < count; ++i) if (!strcmp(props[i].layerName, wanted)) found = 1;
+            free(props);
+            return found;
+          }
+
+          static int has_extension(PFN_vkEnumerateInstanceExtensionProperties enumerate, const char *wanted) {
+            uint32_t count = 0;
+            if (enumerate(NULL, &count, NULL) != VK_SUCCESS) return 0;
+            VkExtensionProperties *props = calloc(count ? count : 1, sizeof(*props));
+            if (!props) return 0;
+            if (enumerate(NULL, &count, props) != VK_SUCCESS) { free(props); return 0; }
+            int found = 0;
+            for (uint32_t i = 0; i < count; ++i) if (!strcmp(props[i].extensionName, wanted)) found = 1;
+            free(props);
+            return found;
+          }
+
+          int main(void) {
+            void *vk = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!vk) { fprintf(stderr, "DLOPEN=%s\n", dlerror()); return 10; }
+            PFN_vkCreateInstance create_instance = (PFN_vkCreateInstance)dlsym(vk, "vkCreateInstance");
+            PFN_vkDestroyInstance destroy_instance = (PFN_vkDestroyInstance)dlsym(vk, "vkDestroyInstance");
+            PFN_vkEnumerateInstanceLayerProperties enumerate_layers =
+              (PFN_vkEnumerateInstanceLayerProperties)dlsym(vk, "vkEnumerateInstanceLayerProperties");
+            PFN_vkEnumerateInstanceExtensionProperties enumerate_extensions =
+              (PFN_vkEnumerateInstanceExtensionProperties)dlsym(vk, "vkEnumerateInstanceExtensionProperties");
+            if (!create_instance || !destroy_instance || !enumerate_layers || !enumerate_extensions) return 11;
+
+            const char *layer = "VK_LAYER_KHRONOS_validation";
+            const char *extension = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+            int layer_ok = has_layer(enumerate_layers, layer);
+            int ext_ok = has_extension(enumerate_extensions, extension);
+            fprintf(stderr, "PNEXT_PREFLIGHT validation_layer=%d debug_utils=%d callback=%p\n",
+                    layer_ok, ext_ok, (void*)callback);
+            fflush(stderr);
+            if (!layer_ok || !ext_ok) return 12;
+
+            VkDebugUtilsMessengerCreateInfoEXT debug = {
+              .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+              .pNext = NULL,
+              .flags = 0,
+              .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+                                 VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+                                 VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                                 VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+              .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                             VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                             VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+              .pfnUserCallback = callback,
+              .pUserData = NULL,
+            };
+            VkApplicationInfo app = {
+              .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+              .pNext = NULL,
+              .pApplicationName = "fex-instance-pnext-debug-utils",
+              .applicationVersion = 1,
+              .pEngineName = "none",
+              .engineVersion = 1,
+              .apiVersion = VK_API_VERSION_1_0,
+            };
+            const char *layers[] = { layer };
+            const char *extensions[] = { extension };
+            VkInstanceCreateInfo ici = {
+              .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+              .pNext = &debug,
+              /* Reserved bit deliberately provokes validation during vkCreateInstance. */
+              .flags = (VkInstanceCreateFlags)0x80000000u,
+              .pApplicationInfo = &app,
+              .enabledLayerCount = 1,
+              .ppEnabledLayerNames = layers,
+              .enabledExtensionCount = 1,
+              .ppEnabledExtensionNames = extensions,
+            };
+
+            fprintf(stderr, "PNEXT_BEFORE_CREATE callback_count=%u pnext=%p callback=%p flags=0x%x\n",
+                    callback_count, (void*)&debug, (void*)callback, (unsigned)ici.flags);
+            fflush(stderr);
+            VkInstance instance = VK_NULL_HANDLE;
+            VkResult result = create_instance(&ici, NULL, &instance);
+            fprintf(stderr, "PNEXT_AFTER_CREATE result=%d instance=%p callback_count=%u\n",
+                    result, (void*)instance, callback_count);
+            fflush(stderr);
+
+            uint32_t count_after_create = callback_count;
+            if (instance != VK_NULL_HANDLE) {
+              fprintf(stderr, "PNEXT_BEFORE_DESTROY callback_count=%u\n", callback_count);
+              fflush(stderr);
+              destroy_instance(instance, NULL);
+              fprintf(stderr, "PNEXT_AFTER_DESTROY callback_count=%u\n", callback_count);
+              fflush(stderr);
+            }
+            if (dlclose(vk) != 0) return 13;
+            fprintf(stderr, "PNEXT_RETURN callback_count=%u count_after_create=%u\n",
+                    callback_count, count_after_create);
+            fflush(stderr);
+            return count_after_create > 0 ? 0 : 30;
+          }
+          EOF
+
+          cc -O2 -g -Wall -Wextra -Werror \
+            -Isrc/External/Vulkan-Headers/include \
+            /tmp/instance-pnext-debug-utils.c -ldl -o /tmp/pnext-arm64
+          x86_64-linux-gnu-gcc -O2 -g -Wall -Wextra -Werror \
+            -Isrc/External/Vulkan-Headers/include \
+            /tmp/instance-pnext-debug-utils.c -ldl -o /tmp/pnext-x86_64
+          file /tmp/pnext-arm64 /tmp/pnext-x86_64 | tee "$R/probes.file.txt"
+
+          set +e
+          VK_DRIVER_FILES="$LVP_ICD" /tmp/pnext-arm64 >"$R/native.out" 2>"$R/native.err"
+          native_rc=$?
+          set -e
+          echo "$native_rc" | tee "$R/native.exit"
+          cat "$R/native.err"
+          test "$native_rc" -eq 0
+          grep -q '^PNEXT_CALLBACK ' "$R/native.err"
+          grep -q '^PNEXT_AFTER_CREATE .*callback_count=[1-9]' "$R/native.err"
+
+      - name: Build exact candidate and focused x86-64 Vulkan thunk pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DUSE_LINKER=lld \
+            -DENABLE_LTO=OFF \
+            -DENABLE_ASSERTIONS=ON \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF \
+            -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none \
+            -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v >"$R/build-host.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+
+          cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
+          file src/build/Bin/FEX src/build/Bin/FEXServer "$HOST/libvulkan-host.so" guest/libvulkan-guest.so | tee "$R/built.file.txt"
+
+      - name: Build package-resolved amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo debootstrap \
+            --arch=amd64 --foreign --variant=minbase --components=main,universe \
+            --include=libvulkan1,libx11-6 \
+            noble "$ROOTFS" http://archive.ubuntu.com/ubuntu \
+            >"$R/debootstrap.log" 2>&1
+          sudo find "$ROOTFS" -type f -name '*.deb' -print | sort > "$R/rootfs-debs.txt"
+          sed -n 's/^I: Extracting \([^ ]*\)\.\.\.$/\1/p' "$R/debootstrap.log" | sort -u > "$R/rootfs-already-extracted.txt"
+          : > "$R/rootfs-deferred-extracted.txt"
+          while IFS= read -r deb; do
+            pkg="$(dpkg-deb -f "$deb" Package)"
+            if grep -Fxq "$pkg" "$R/rootfs-already-extracted.txt"; then
+              continue
+            fi
+            echo "$pkg" >> "$R/rootfs-deferred-extracted.txt"
+            sudo dpkg-deb -x "$deb" "$ROOTFS"
+          done < "$R/rootfs-debs.txt"
+
+          sudo cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
+          sudo mkdir -p "$ROOTFS/usr/local/bin"
+          sudo install -m755 /tmp/pnext-x86_64 "$ROOTFS/usr/local/bin/instance-pnext-debug-utils"
+
+          X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          test -e "$X11"
+          for sym in XSync XGetVisualInfo XDisplayString; do
+            x86_64-linux-gnu-readelf -Ws "$X11" | grep -E " ${sym}(@|$)" | head -1
+          done
+
+      - name: Run x86-64 creation-time callback through FEX
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          set +e
+          timeout 90s env \
+            VK_DRIVER_FILES="$LVP_ICD" \
+            FEX_ROOTFS="$ROOTFS" \
+            FEX_THUNKHOSTLIBS="$HOST" \
+            "$FEX" /usr/local/bin/instance-pnext-debug-utils \
+            >"$R/fex.out" 2>"$R/fex.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/fex.exit"
+          cat "$R/fex.err"
+
+          {
+            echo "native_exit=$(cat "$R/native.exit")"
+            echo "fex_exit=$rc"
+            if grep -q '^PNEXT_AFTER_CREATE ' "$R/fex.err"; then echo 'after_create=1'; else echo 'after_create=0'; fi
+            if grep -q '^PNEXT_CALLBACK ' "$R/fex.err"; then echo 'guest_callback_observed=1'; else echo 'guest_callback_observed=0'; fi
+            if test "$rc" -eq 132; then echo 'sigill_like=1'; else echo 'sigill_like=0'; fi
+            if test "$rc" -eq 139; then echo 'sigsegv_like=1'; else echo 'sigsegv_like=0'; fi
+          } | tee "$R/summary.txt"
+
+          test "$rc" -ne 124
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-instance-pnext-debug-utils-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
