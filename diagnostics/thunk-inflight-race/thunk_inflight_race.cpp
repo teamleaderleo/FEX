@@ -35,8 +35,14 @@ bool Touch(const char* Path) {
     return false;
   }
   static constexpr char Marker[] = "go\n";
-  (void)::write(FD, Marker, sizeof(Marker) - 1);
+  const ssize_t Written = ::write(FD, Marker, sizeof(Marker) - 1);
+  const int SavedErrno = errno;
   (void)::close(FD);
+  if (Written != static_cast<ssize_t>(sizeof(Marker) - 1)) {
+    std::fprintf(stderr, "INFLIGHT write %s failed written=%zd errno=%d (%s)\n",
+                 Path, Written, SavedErrno, std::strerror(SavedErrno));
+    return false;
+  }
   return true;
 }
 
