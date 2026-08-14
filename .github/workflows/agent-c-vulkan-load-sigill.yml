@@ -1,4 +1,4 @@
-name: Agent C GDPA availability semantics
+name: Agent C final Vulkan proc routing matrix
 
 on:
   push:
@@ -11,11 +11,12 @@ permissions:
   contents: read
 
 jobs:
-  gdpa-semantics:
+  final-head:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
-      FEX_SHA: 4f8130c298433a7a9165392d33fc0a3e6be3202b
+      FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+      FIELDWORK_SHA: 1b268a6742768086aa8355e997c10b4423319ba6
       DEBIAN_FRONTEND: noninteractive
       ROOTFS: ${{ github.workspace }}/rootfs
       R: ${{ github.workspace }}/receipts
@@ -31,6 +32,12 @@ jobs:
           path: src
           submodules: recursive
           fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
 
       - name: Identity and dependencies
         shell: bash
@@ -40,6 +47,7 @@ jobs:
           test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
           {
             echo "fex_sha=$(git -C src rev-parse HEAD)"
+            echo "fieldwork_sha=$(git -C fieldwork rev-parse HEAD)"
             echo "ci_sha=$GITHUB_SHA"
             uname -a
             uname -m
@@ -52,10 +60,86 @@ jobs:
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools
 
-      - name: Build GDPA semantics probe and native control
+      - name: Build native and guest-side probes
         shell: bash
         run: |
           set -euxo pipefail
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" > "$R/lvp-icd.txt"
+          VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
+
+          cc -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c \
+            -ldl -o /tmp/callback-arm64
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c \
+            -ldl -o /tmp/callback-x86_64
+          VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 report gipa positive >"$R/native-report.out" 2>"$R/native-report.err"
+          VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 utils gipa positive >"$R/native-utils.out" 2>"$R/native-utils.err"
+
+          cat >/tmp/null-gipa.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <string.h>
+          typedef void (*PFN)(void);
+          typedef PFN (*GIPA)(void*, const char*);
+          int main(int argc, char **argv) {
+            if (argc != 3) return 64;
+            void *h = dlopen("libvulkan.so.1", RTLD_NOW|RTLD_LOCAL);
+            if (!h) { fprintf(stderr, "DLERROR %s\n", dlerror()); return 2; }
+            GIPA g = (GIPA)dlsym(h,"vkGetInstanceProcAddr");
+            if (!g) return 3;
+            PFN p = g(NULL, argv[1]);
+            fprintf(stderr,"NULL_GIPA command=%s ptr=%p expected=%s\n",argv[1],(void*)p,argv[2]);
+            if (!strcmp(argv[2],"null")) return p ? 30 : 0;
+            if (!strcmp(argv[2],"nonnull")) return p ? 0 : 31;
+            return 64;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/null-gipa.c -ldl -o /tmp/null-gipa-x86_64
+
+          cat >/tmp/self-gipa.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          typedef void (*PFN)(void);
+          typedef void *VkInstance;
+          typedef int32_t VkResult;
+          typedef PFN (*GIPA)(VkInstance, const char *);
+          typedef PFN (*GDPA)(void *, const char *);
+          typedef struct { int32_t sType; const void *pNext; const char *pApplicationName; uint32_t applicationVersion; const char *pEngineName; uint32_t engineVersion; uint32_t apiVersion; } VkApplicationInfo;
+          typedef struct { int32_t sType; const void *pNext; uint32_t flags; const VkApplicationInfo *pApplicationInfo; uint32_t enabledLayerCount; const char *const *ppEnabledLayerNames; uint32_t enabledExtensionCount; const char *const *ppEnabledExtensionNames; } VkInstanceCreateInfo;
+          typedef VkResult (*CreateInstance)(const VkInstanceCreateInfo *, const void *, VkInstance *);
+          int main(void) {
+            void *h = dlopen("libvulkan.so.1", RTLD_NOW|RTLD_LOCAL);
+            if (!h) return 2;
+            GIPA gipa = (GIPA)dlsym(h,"vkGetInstanceProcAddr");
+            GDPA gdpa = (GDPA)dlsym(h,"vkGetDeviceProcAddr");
+            CreateInstance create = (CreateInstance)dlsym(h,"vkCreateInstance");
+            if (!gipa || !gdpa || !create) return 3;
+            VkApplicationInfo app = {0, 0, "self-gipa", 1, "none", 1, (1u << 22)};
+            VkInstanceCreateInfo ci = {1, 0, 0, &app, 0, 0, 0, 0};
+            VkInstance instance = 0;
+            VkResult r = create(&ci, 0, &instance);
+            if (r != 0 || !instance) return 10;
+            PFN self_gipa = gipa(instance,"vkGetInstanceProcAddr");
+            PFN self_gdpa = gipa(instance,"vkGetDeviceProcAddr");
+            PFN destroy = self_gipa ? ((GIPA)self_gipa)(instance,"vkDestroyInstance") : 0;
+            PFN null_gipa = gipa(0,"vkGetInstanceProcAddr");
+            PFN null_gdpa = gipa(0,"vkGetDeviceProcAddr");
+            fprintf(stderr,"SELF_RESULT instance_gipa=%p instance_gdpa=%p destroy=%p null_gipa=%p null_gdpa=%p direct_gipa=%p direct_gdpa=%p\n",
+                    (void*)self_gipa,(void*)self_gdpa,(void*)destroy,(void*)null_gipa,(void*)null_gdpa,(void*)gipa,(void*)gdpa);
+            if (self_gipa != (PFN)gipa) return 20;
+            if (self_gdpa != (PFN)gdpa) return 21;
+            if (!destroy) return 22;
+            if (null_gipa != (PFN)gipa) return 23;
+            if (null_gdpa) return 24;
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/self-gipa.c -ldl -o /tmp/self-gipa-x86_64
+
           cat >/tmp/gdpa-probe.c <<'EOF'
           #include <dlfcn.h>
           #include <stdint.h>
@@ -63,121 +147,72 @@ jobs:
           #include <stdlib.h>
           #include <unistd.h>
           #include <vulkan/vulkan.h>
-
           int main(void) {
             void *lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
             if (!lib) { fprintf(stderr, "DLERROR %s\n", dlerror()); return 2; }
-
             PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
             PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)dlsym(lib, "vkGetDeviceProcAddr");
             PFN_vkCreateInstance create_instance = (PFN_vkCreateInstance)dlsym(lib, "vkCreateInstance");
             if (!gipa || !gdpa || !create_instance) return 3;
-
-            VkApplicationInfo app = {
-              .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-              .pApplicationName = "gdpa-semantics",
-              .applicationVersion = 1,
-              .pEngineName = "none",
-              .engineVersion = 1,
-              .apiVersion = VK_API_VERSION_1_0,
-            };
-            VkInstanceCreateInfo ici = {
-              .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-              .pApplicationInfo = &app,
-            };
+            VkApplicationInfo app = {.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName="gdpa-semantics",.applicationVersion=1,.pEngineName="none",.engineVersion=1,.apiVersion=VK_API_VERSION_1_0};
+            VkInstanceCreateInfo ici = {.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
             VkInstance instance = VK_NULL_HANDLE;
             VkResult r = create_instance(&ici, NULL, &instance);
-            if (r != VK_SUCCESS || instance == VK_NULL_HANDLE) {
-              fprintf(stderr, "CREATE_INSTANCE result=%d\n", r);
-              return 10;
-            }
-
-            PFN_vkEnumeratePhysicalDevices enumerate = (PFN_vkEnumeratePhysicalDevices)gipa(instance, "vkEnumeratePhysicalDevices");
-            PFN_vkGetPhysicalDeviceQueueFamilyProperties get_qprops =
-              (PFN_vkGetPhysicalDeviceQueueFamilyProperties)gipa(instance, "vkGetPhysicalDeviceQueueFamilyProperties");
-            PFN_vkCreateDevice create_device = (PFN_vkCreateDevice)gipa(instance, "vkCreateDevice");
-            PFN_vkDestroyInstance destroy_instance = (PFN_vkDestroyInstance)gipa(instance, "vkDestroyInstance");
-            PFN_vkVoidFunction gipa_shader = gipa(instance, "vkCreateShaderModule");
+            if (r != VK_SUCCESS || instance == VK_NULL_HANDLE) return 10;
+            PFN_vkEnumeratePhysicalDevices enumerate = (PFN_vkEnumeratePhysicalDevices)gipa(instance,"vkEnumeratePhysicalDevices");
+            PFN_vkGetPhysicalDeviceQueueFamilyProperties get_qprops = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)gipa(instance,"vkGetPhysicalDeviceQueueFamilyProperties");
+            PFN_vkCreateDevice create_device = (PFN_vkCreateDevice)gipa(instance,"vkCreateDevice");
+            PFN_vkDestroyInstance destroy_instance = (PFN_vkDestroyInstance)gipa(instance,"vkDestroyInstance");
+            PFN_vkVoidFunction gipa_shader = gipa(instance,"vkCreateShaderModule");
             if (!enumerate || !get_qprops || !create_device || !destroy_instance || !gipa_shader) return 11;
-
             uint32_t physical_count = 0;
-            r = enumerate(instance, &physical_count, NULL);
+            r = enumerate(instance,&physical_count,NULL);
             if (r != VK_SUCCESS || physical_count == 0) return 12;
-            VkPhysicalDevice *physical = calloc(physical_count, sizeof(*physical));
+            VkPhysicalDevice *physical = calloc(physical_count,sizeof(*physical));
             if (!physical) return 13;
-            r = enumerate(instance, &physical_count, physical);
+            r = enumerate(instance,&physical_count,physical);
             if (r != VK_SUCCESS || physical_count == 0) return 14;
-
             uint32_t queue_count = 0;
-            get_qprops(physical[0], &queue_count, NULL);
+            get_qprops(physical[0],&queue_count,NULL);
             if (queue_count == 0) return 15;
-            VkQueueFamilyProperties *qprops = calloc(queue_count, sizeof(*qprops));
+            VkQueueFamilyProperties *qprops = calloc(queue_count,sizeof(*qprops));
             if (!qprops) return 16;
-            get_qprops(physical[0], &queue_count, qprops);
+            get_qprops(physical[0],&queue_count,qprops);
             uint32_t family = UINT32_MAX;
-            for (uint32_t i = 0; i < queue_count; ++i) {
-              if (qprops[i].queueCount > 0) { family = i; break; }
-            }
+            for (uint32_t i=0;i<queue_count;++i) if (qprops[i].queueCount > 0) { family=i; break; }
             if (family == UINT32_MAX) return 17;
-
             float priority = 1.0f;
-            VkDeviceQueueCreateInfo qci = {
-              .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-              .queueFamilyIndex = family,
-              .queueCount = 1,
-              .pQueuePriorities = &priority,
-            };
-            VkDeviceCreateInfo dci = {
-              .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-              .queueCreateInfoCount = 1,
-              .pQueueCreateInfos = &qci,
-            };
+            VkDeviceQueueCreateInfo qci = {.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=family,.queueCount=1,.pQueuePriorities=&priority};
+            VkDeviceCreateInfo dci = {.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
             VkDevice device = VK_NULL_HANDLE;
-            r = create_device(physical[0], &dci, NULL, &device);
-            if (r != VK_SUCCESS || device == VK_NULL_HANDLE) {
-              fprintf(stderr, "CREATE_DEVICE result=%d\n", r);
-              return 18;
-            }
-
-            PFN_vkVoidFunction destroy_device = gdpa(device, "vkDestroyDevice");
-            PFN_vkVoidFunction alloc_memory = gdpa(device, "vkAllocateMemory");
-            PFN_vkVoidFunction shader = gdpa(device, "vkCreateShaderModule");
-            PFN_vkVoidFunction wrong_create_instance = gdpa(device, "vkCreateInstance");
-            PFN_vkVoidFunction wrong_debug_report = gdpa(device, "vkCreateDebugReportCallbackEXT");
-            PFN_vkVoidFunction self_gdpa = gdpa(device, "vkGetDeviceProcAddr");
-
-            fprintf(stderr,
-                    "GDPA_RESULT destroy_device=%p alloc_memory=%p shader=%p gipa_shader=%p create_instance=%p debug_report=%p self_gdpa=%p direct_gdpa=%p\n",
-                    (void*)destroy_device, (void*)alloc_memory, (void*)shader, (void*)gipa_shader,
-                    (void*)wrong_create_instance, (void*)wrong_debug_report, (void*)self_gdpa, (void*)gdpa);
-
+            r = create_device(physical[0],&dci,NULL,&device);
+            if (r != VK_SUCCESS || device == VK_NULL_HANDLE) return 18;
+            PFN_vkVoidFunction destroy_device = gdpa(device,"vkDestroyDevice");
+            PFN_vkVoidFunction alloc_memory = gdpa(device,"vkAllocateMemory");
+            PFN_vkVoidFunction shader = gdpa(device,"vkCreateShaderModule");
+            PFN_vkVoidFunction wrong_create_instance = gdpa(device,"vkCreateInstance");
+            PFN_vkVoidFunction wrong_debug_report = gdpa(device,"vkCreateDebugReportCallbackEXT");
+            PFN_vkVoidFunction self_gdpa = gdpa(device,"vkGetDeviceProcAddr");
+            fprintf(stderr,"GDPA_RESULT destroy_device=%p alloc_memory=%p shader=%p gipa_shader=%p create_instance=%p debug_report=%p self_gdpa=%p direct_gdpa=%p\n",
+                    (void*)destroy_device,(void*)alloc_memory,(void*)shader,(void*)gipa_shader,(void*)wrong_create_instance,(void*)wrong_debug_report,(void*)self_gdpa,(void*)gdpa);
             if (!destroy_device) return 20;
             if (!alloc_memory) return 21;
             if (!shader) return 22;
-            if (!gipa_shader) return 23;
             if (wrong_create_instance) return 24;
             if (wrong_debug_report) return 25;
-
-            ((PFN_vkDestroyDevice)destroy_device)(device, NULL);
-            destroy_instance(instance, NULL);
-            free(qprops);
-            free(physical);
+            if (self_gdpa != (PFN_vkVoidFunction)gdpa) return 26;
+            ((PFN_vkDestroyDevice)destroy_device)(device,NULL);
+            destroy_instance(instance,NULL);
+            free(qprops); free(physical);
             _exit(0);
           }
           EOF
-
-          cc -O2 -Wall -Wextra -Werror -Isrc/External/Vulkan-Headers/include \
-            /tmp/gdpa-probe.c -ldl -o /tmp/gdpa-arm64
-          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -Isrc/External/Vulkan-Headers/include \
-            /tmp/gdpa-probe.c -ldl -o /tmp/gdpa-x86_64
-
-          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
-          test -n "$LVP_ICD"
-          echo "$LVP_ICD" > "$R/lvp-icd.txt"
+          cc -O2 -Wall -Wextra -Werror -Isrc/External/Vulkan-Headers/include /tmp/gdpa-probe.c -ldl -o /tmp/gdpa-arm64
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -Isrc/External/Vulkan-Headers/include /tmp/gdpa-probe.c -ldl -o /tmp/gdpa-x86_64
           VK_DRIVER_FILES="$LVP_ICD" /tmp/gdpa-arm64 >"$R/native-gdpa.out" 2>"$R/native-gdpa.err"
           cat "$R/native-gdpa.err"
 
-      - name: Build exact clean candidate and Vulkan thunk pair
+      - name: Build exact candidate and focused Vulkan thunk pair
         shell: bash
         run: |
           set -euxo pipefail
@@ -196,6 +231,7 @@ jobs:
             -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
             >"$R/cmake-guest.log" 2>&1
           cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
+          file src/build/Bin/FEX src/build/Bin/FEXServer "$HOST/libvulkan-host.so" guest/libvulkan-guest.so >"$R/artifacts.file.txt"
 
       - name: Build repaired amd64 rootfs
         shell: bash
@@ -212,36 +248,56 @@ jobs:
           cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp /tmp/callback-x86_64 "$ROOTFS/opt/fex-ci/callback-probe"
+          cp /tmp/null-gipa-x86_64 "$ROOTFS/opt/fex-ci/null-gipa"
+          cp /tmp/self-gipa-x86_64 "$ROOTFS/opt/fex-ci/self-gipa"
           cp /tmp/gdpa-x86_64 "$ROOTFS/opt/fex-ci/gdpa-probe"
-
           cat >/tmp/x11-stub.c <<'EOF'
           int XSync(void *display, int discard) { (void)display; (void)discard; return 0; }
           void *XGetVisualInfo(void *display, long mask, void *templ, int *count) { (void)display; (void)mask; (void)templ; if (count) *count = 0; return 0; }
           char *XDisplayString(void *display) { (void)display; static char value[] = ":fex-ci-stub"; return value; }
           EOF
-          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 \
-            /tmp/x11-stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11-stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
 
-      - name: Run x86 GDPA semantics under FEX
+      - name: Run final exact-head matrix
         shell: bash
         run: |
           set -uxo pipefail
           FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
           LVP_ICD="$(cat "$R/lvp-icd.txt")"
-          set +e
-          VK_DRIVER_FILES="$LVP_ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
-            "$FEX" /opt/fex-ci/gdpa-probe >"$R/fex-gdpa.out" 2>"$R/fex-gdpa.err"
-          rc=$?
+          run_case() {
+            local name="$1"; shift
+            set +e
+            VK_DRIVER_FILES="$LVP_ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+              "$FEX" "$@" >"$R/$name.out" 2>"$R/$name.err"
+            local rc=$?
+            set -e
+            echo "$rc" | tee "$R/$name.exit"
+            cat "$R/$name.err"
+          }
           set -e
-          echo "$rc" | tee "$R/fex-gdpa.exit"
-          cat "$R/fex-gdpa.err"
-          test "$rc" = 0
+          run_case report-direct /opt/fex-ci/callback-probe report direct 0
+          run_case report-gipa /opt/fex-ci/callback-probe report gipa 0
+          run_case utils-direct /opt/fex-ci/callback-probe utils direct 0
+          run_case utils-gipa /opt/fex-ci/callback-probe utils gipa 0
+          run_case null-report /opt/fex-ci/null-gipa vkCreateDebugReportCallbackEXT null
+          run_case null-shader /opt/fex-ci/null-gipa vkCreateShaderModule null
+          run_case self-gipa /opt/fex-ci/self-gipa
+          run_case gdpa /opt/fex-ci/gdpa-probe
+          {
+            for name in report-direct report-gipa utils-direct utils-gipa null-report null-shader self-gipa gdpa; do
+              printf '%s=' "$name"; cat "$R/$name.exit"
+            done
+          } | tee "$R/final-matrix.txt"
+          for name in report-direct report-gipa utils-direct utils-gipa null-report null-shader self-gipa gdpa; do
+            test "$(cat "$R/$name.exit")" = 0
+          done
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-c-gdpa-semantics-${{ github.run_id }}
+          name: agent-c-final-proc-routing-${{ github.run_id }}
           path: receipts
           if-no-files-found: warn
           retention-days: 30
