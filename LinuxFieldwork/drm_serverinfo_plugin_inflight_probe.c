@@ -25,16 +25,19 @@ static int addr_mapped(uintptr_t addr) {
 
 typedef void (*ConfigureFn)(int, int);
 typedef int (*LoadModuleFn)(const char *);
+typedef void (*SetServerInfoFn)(drmServerInfoPtr);
+typedef int (*DrmOpenFn)(const char *, const char *);
 
 struct worker_state {
   volatile int returned;
   int fd;
+  DrmOpenFn open_fn;
 };
 
 static void *open_worker(void *opaque) {
   struct worker_state *s = (struct worker_state *)opaque;
   fprintf(stderr, "DRM_PLUGIN_PROBE open-enter\n"); fflush(stderr);
-  s->fd = drmOpen("fex-intentionally-missing-drm-driver", NULL);
+  s->fd = s->open_fn("fex-intentionally-missing-drm-driver", NULL);
   s->returned = 1;
   fprintf(stderr, "DRM_PLUGIN_PROBE open-return fd=%d\n", s->fd); fflush(stderr);
   return NULL;
@@ -45,11 +48,17 @@ int main(void) {
   int release[2] = {-1,-1};
   if (pipe(entered) || pipe(release)) { perror("pipe"); return 2; }
 
+  void *drm = dlopen("libdrm.so.2", RTLD_NOW | RTLD_LOCAL);
+  if (!drm) { fprintf(stderr, "drm dlopen: %s\n", dlerror()); return 3; }
+  SetServerInfoFn set_info = (SetServerInfoFn)dlsym(drm, "drmSetServerInfo");
+  DrmOpenFn open_fn = (DrmOpenFn)dlsym(drm, "drmOpen");
+  if (!set_info || !open_fn) { fprintf(stderr, "drm dlsym failed\n"); return 4; }
+
   void *plugin = dlopen("./libdrm-callback-plugin.so", RTLD_NOW | RTLD_LOCAL);
-  if (!plugin) { fprintf(stderr, "plugin dlopen: %s\n", dlerror()); return 3; }
+  if (!plugin) { fprintf(stderr, "plugin dlopen: %s\n", dlerror()); return 5; }
   ConfigureFn configure = (ConfigureFn)dlsym(plugin, "drm_plugin_configure");
   LoadModuleFn callback = (LoadModuleFn)dlsym(plugin, "drm_plugin_load_module");
-  if (!configure || !callback) { fprintf(stderr, "plugin dlsym failed\n"); return 4; }
+  if (!configure || !callback) { fprintf(stderr, "plugin dlsym failed\n"); return 6; }
   configure(entered[1], release[0]);
 
   drmServerInfo info;
@@ -57,16 +66,16 @@ int main(void) {
   info.load_module = callback;
   fprintf(stderr, "DRM_PLUGIN_PROBE set-info callback=%p mapped=%d\n", (void*)callback, addr_mapped((uintptr_t)callback));
   fflush(stderr);
-  drmSetServerInfo(&info);
+  set_info(&info);
 
-  struct worker_state worker = {.returned = 0, .fd = -999};
+  struct worker_state worker = {.returned = 0, .fd = -999, .open_fn = open_fn};
   pthread_t thread;
-  if (pthread_create(&thread, NULL, open_worker, &worker) != 0) { perror("pthread_create"); return 5; }
+  if (pthread_create(&thread, NULL, open_worker, &worker) != 0) { perror("pthread_create"); return 7; }
 
   char b = 0;
   if (read(entered[0], &b, 1) != 1 || b != 'E') {
     fprintf(stderr, "DRM_PLUGIN_PROBE callback-entry-missing\n");
-    return 6;
+    return 8;
   }
   fprintf(stderr, "DRM_PLUGIN_PROBE callback-blocked mapped-before-close=%d\n", addr_mapped((uintptr_t)callback));
   fflush(stderr);
@@ -77,7 +86,7 @@ int main(void) {
   fflush(stderr);
 
   const char release_byte = 'R';
-  if (write(release[1], &release_byte, 1) != 1) { perror("release"); return 7; }
+  if (write(release[1], &release_byte, 1) != 1) { perror("release"); return 9; }
   fprintf(stderr, "DRM_PLUGIN_PROBE released\n"); fflush(stderr);
 
   pthread_join(thread, NULL);
