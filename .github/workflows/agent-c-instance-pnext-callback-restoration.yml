@@ -83,12 +83,12 @@ jobs:
           }'''
           s=s[:start]+new+s[end:]
           call='''  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
-          *a_2.get_pointer() = to_guest(to_host_layout(out));'''
+          *a_2 = to_guest(out);'''
           replacement='''  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
           for (auto it = pnext_restore.rbegin(); it != pnext_restore.rend(); ++it) {
             it->Structure->pNext = it->PNext;
           }
-          *a_2.get_pointer() = to_guest(to_host_layout(out));'''
+          *a_2 = to_guest(out);'''
           if call not in s:
             raise SystemExit('vkCreateInstance native-call region not found')
           p.write_text(s.replace(call,replacement,1))
