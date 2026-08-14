@@ -1,0 +1,111 @@
+name: Vulkan debug allocator baseline control
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/vulkan-debug-allocator-forwarding-clean-20260814]
+    paths:
+      - .github/workflows/vulkan-debug-allocator-baseline.yml
+      - LinuxFieldwork/vk_allocator_debug_extensions.c
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    env:
+      PRODUCT_SHA: 1698747b977cfc426896a30fef471e2cfccd044e
+      PRODUCT_PARENT: 715ff36bff2fd9f2353ab31613dc41ae106f3938
+      FEX_PORTABLE: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: carrier
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          fetch-depth: 2
+          submodules: recursive
+
+      - name: Install dependencies and prove untouched product
+        run: |
+          set -euxo pipefail
+          test "$(git -C product rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git -C product rev-parse HEAD^)" = "$PRODUCT_PARENT"
+          test -z "$(git -C product status --porcelain)"
+          grep -n -E 'vkCreateDebugReportCallbackEXT\)\(a_0, &overridden_callback, nullptr, a_3\)|vkDestroyDebugReportCallbackEXT\)\(a_0, a_1, nullptr\)|vkCreateDebugUtilsMessengerEXT\)\(a_0, &overridden_callback, nullptr, a_3\)' product/ThunkLibs/libvulkan/Host.cpp | tee baseline-discard-sites.txt
+          test "$(wc -l < baseline-discard-sites.txt)" -eq 3
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build nasm clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers
+
+      - name: Build untouched plain FEX Vulkan thunk path
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$PWD" -DGENERATOR_EXE="$PWD/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)"
+
+      - name: Prepare FEX baseline probe
+        run: |
+          set -euxo pipefail
+          mkdir -p receipts host-thunks
+          docker pull --platform=linux/amd64 ubuntu:24.04
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir rootfs-amd64
+          docker export "$cid" | tar -C rootfs-amd64 -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p rootfs-amd64/usr/lib/x86_64-linux-gnu rootfs-amd64/opt/fex-ci
+          cp product/guest-build/libvulkan-guest.so rootfs-amd64/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+          cp product/build/HostLibs_64/libvulkan-host.so host-thunks/libvulkan-host.so
+          x86_64-linux-gnu-gcc -O0 -g -Wall -Wextra -Werror carrier/LinuxFieldwork/vk_allocator_debug_extensions.c -ldl -o rootfs-amd64/opt/fex-ci/debug-allocator-probe
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o rootfs-amd64/usr/lib/x86_64-linux-gnu/libX11.so.6
+
+      - name: Capture untouched FEX debug allocator outcome
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          set +e
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" \
+            timeout 30s product/build/Bin/FEX /opt/fex-ci/debug-allocator-probe \
+            >receipts/fex.stdout 2>receipts/fex.stderr
+          fex_rc=$?
+          set -e
+          printf 'product=%s\nfex=%s\nOUTCOME=untouched_debug_allocator_baseline_captured\n' "$PRODUCT_SHA" "$fex_rc" | tee receipts/final-baseline.txt
+          cat receipts/fex.stderr
+
+      - name: Upload baseline receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-debug-allocator-baseline-${{ github.run_id }}
+          path: |
+            receipts
+            baseline-discard-sites.txt
+          retention-days: 30
