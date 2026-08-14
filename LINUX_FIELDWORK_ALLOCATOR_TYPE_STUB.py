@@ -6,9 +6,11 @@ old = '''// TODO: Should not be opaque, but it's usually NULL anyway. Supporting
 template<>
 struct fex_gen_type<VkAllocationCallbacks> : fexgen::opaque_type {};'''
 new = '''// Linux Fieldwork experiment: expose VkAllocationCallbacks to the normal
-// struct repacker and handle its nested function-pointer members explicitly.
+// struct repacker and handle all pointer-bearing members explicitly.
 template<>
 struct fex_gen_type<VkAllocationCallbacks> : fexgen::emit_layout_wrappers {};
+template<>
+struct fex_gen_config<&VkAllocationCallbacks::pUserData> : fexgen::custom_repack {};
 template<>
 struct fex_gen_config<&VkAllocationCallbacks::pfnAllocation> : fexgen::custom_repack {};
 template<>
@@ -56,12 +58,13 @@ static VKAPI_ATTR void VKAPI_CALL AllocatorInternalFreeStub(void*, size_t, VkInt
   AllocatorCallbackStubFatal("pfnInternalFree");
 }
 
-void fex_custom_repack_entry(host_layout<VkAllocationCallbacks>& into, const guest_layout<VkAllocationCallbacks>&) {
-  into.data.pfnAllocation = AllocatorAllocationStub;
-  into.data.pfnReallocation = AllocatorReallocationStub;
-  into.data.pfnFree = AllocatorFreeStub;
-  into.data.pfnInternalAllocation = AllocatorInternalAllocationStub;
-  into.data.pfnInternalFree = AllocatorInternalFreeStub;
+void fex_custom_repack_entry(host_layout<VkAllocationCallbacks>& into, const guest_layout<VkAllocationCallbacks>& from) {
+  into.data.pUserData = from.data.pUserData.force_get_host_pointer();
+  into.data.pfnAllocation = from.data.pfnAllocation.data ? AllocatorAllocationStub : nullptr;
+  into.data.pfnReallocation = from.data.pfnReallocation.data ? AllocatorReallocationStub : nullptr;
+  into.data.pfnFree = from.data.pfnFree.data ? AllocatorFreeStub : nullptr;
+  into.data.pfnInternalAllocation = from.data.pfnInternalAllocation.data ? AllocatorInternalAllocationStub : nullptr;
+  into.data.pfnInternalFree = from.data.pfnInternalFree.data ? AllocatorInternalFreeStub : nullptr;
 }
 
 bool fex_custom_repack_exit(guest_layout<VkAllocationCallbacks>&, const host_layout<VkAllocationCallbacks>&) {
@@ -70,9 +73,7 @@ bool fex_custom_repack_exit(guest_layout<VkAllocationCallbacks>&, const host_lay
 '''
 host_path.write_text(host.replace(anchor, anchor + insert, 1))
 
-# Trace why the generator still classifies this explicitly custom-repacked type
-# as unsupported. This is diagnostic-only and is applied to the detached product
-# checkout used by the workflow.
+# Trace the compatibility decision for the now-fully-customized allocator type.
 data_path = Path("ThunkLibs/Generator/data_layout.cpp")
 data = data_path.read_text()
 member_needle = '''      if (types.at(type).UsesCustomRepackFor(host_member_field)) {
