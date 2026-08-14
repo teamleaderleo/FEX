@@ -1,0 +1,113 @@
+name: FEX-2608 Vulkan split bridge bitness audit
+
+on:
+  push:
+    branches: [ci/fex2608-nodelete-vulkaninfo-ab-clean-20260814]
+    paths:
+      - .github/workflows/fex2608-vulkan-split-bridge-bitness.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  split-bitness:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      FEX_BASE: e869aa644a16e4332cdc15c1ea0b4d13d482385d
+      R: ${{ github.workspace }}/receipts-split-bitness
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 80
+
+      - name: Checkout split transformer
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-callback-descriptor-20260814
+          path: split-helper
+          fetch-depth: 1
+
+      - name: Prove FEX-2608 source and install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          git diff --exit-code "$FEX_BASE" -- ':!AGENTS.md' ':!CONTRIBUTING.md' ':!.github/**'
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev libcap-dev pkg-config binutils \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            gcc-13-multilib-x86-64-linux-gnu g++-13-multilib-x86-64-linux-gnu libc6-dev-i386-cross \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libgl-dev
+
+      - name: Apply split and audit escaping bridge sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 split-helper/.github/fieldwork/apply_vulkan_split_bridge.py "$GITHUB_WORKSPACE"
+          git diff --check
+          git diff -- ThunkLibs/libvulkan/Guest.cpp ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/split.diff"
+          grep -R -n 'VulkanBridge' ThunkLibs/libvulkan ThunkLibs/GuestLibs | tee "$R/bridge-sites.txt"
+          grep -R -n 'CallHostFunction<FatalError' ThunkLibs/libvulkan | tee "$R/unknown-stub-sites.txt" || true
+
+      - name: Build thunk generator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" > "$R/build-thunkgen.log" 2>&1
+
+      - name: Build and verify 64-bit split
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest64 -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake64.log" 2>&1
+          cmake --build guest64 --target vulkan-guest vulkan-bridge-guest -- -j"$(nproc)" > "$R/build64.log" 2>&1
+          file guest64/libvulkan-guest.so guest64/libfex-vulkan-bridge.so | tee "$R/file64.txt"
+          readelf -d guest64/libvulkan-guest.so > "$R/wrapper64.dynamic"
+          readelf -d guest64/libfex-vulkan-bridge.so > "$R/bridge64.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper64.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge64.dynamic"
+          grep -q 'ELF 64-bit.*x86-64' "$R/file64.txt"
+          stat -c '%n %s' guest64/libvulkan-guest.so guest64/libfex-vulkan-bridge.so | tee "$R/sizes64.txt"
+
+      - name: Build and verify 32-bit split
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest32 -G Ninja \
+            -DBITNESS=32 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_32.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake32.log" 2>&1
+          cmake --build guest32 --target vulkan-guest vulkan-bridge-guest -- -j"$(nproc)" > "$R/build32.log" 2>&1
+          file guest32/libvulkan-guest.so guest32/libfex-vulkan-bridge.so | tee "$R/file32.txt"
+          readelf -d guest32/libvulkan-guest.so > "$R/wrapper32.dynamic"
+          readelf -d guest32/libfex-vulkan-bridge.so > "$R/bridge32.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper32.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge32.dynamic"
+          grep -q 'ELF 32-bit.*Intel 80386' "$R/file32.txt"
+          stat -c '%n %s' guest32/libvulkan-guest.so guest32/libfex-vulkan-bridge.so | tee "$R/sizes32.txt"
+          echo SPLIT_BITNESS_PASS | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex2608-vulkan-split-bridge-bitness-${{ github.run_id }}
+          path: receipts-split-bitness
+          retention-days: 30
