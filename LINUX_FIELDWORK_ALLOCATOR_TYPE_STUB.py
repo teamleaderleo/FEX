@@ -59,7 +59,7 @@ static VKAPI_ATTR void VKAPI_CALL AllocatorInternalFreeStub(void*, size_t, VkInt
 }
 
 void fex_custom_repack_entry(host_layout<VkAllocationCallbacks>& into, const guest_layout<VkAllocationCallbacks>& from) {
-  into.data.pUserData = from.data.pUserData.force_get_host_pointer();
+  into.data.pUserData = const_cast<void*>(from.data.pUserData.force_get_host_pointer());
   into.data.pfnAllocation = from.data.pfnAllocation.data ? AllocatorAllocationStub : nullptr;
   into.data.pfnReallocation = from.data.pfnReallocation.data ? AllocatorReallocationStub : nullptr;
   into.data.pfnFree = from.data.pfnFree.data ? AllocatorFreeStub : nullptr;
