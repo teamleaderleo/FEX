@@ -1,0 +1,159 @@
+name: Thunkgen callback member bridge roles
+
+on:
+  push:
+    branches: [ci/thunkgen-callback-member-bridge-role-unit-20260814]
+    paths:
+      - .github/workflows/thunkgen-callback-member-bridge-role-unit.yml
+      - ThunkLibs/Generator/**
+      - ThunkLibs/include/common/GeneratorInterface.h
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  callback-member:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      R: ${{ github.workspace }}/callback-member-role-receipts
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Checkout exact carrier
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          git rev-parse HEAD | tee "$R/head.txt"
+          git merge-base --is-ancestor 48e28a2ce9da1334feb8d7b77dbade66efa24be2 HEAD
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev
+
+      - name: Build thunkgen
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DX86_DEV_ROOTFS=/ 2>&1 | tee "$R/cmake.log"
+          cmake --build build --target thunkgen -- -j2 2>&1 | tee "$R/build.log"
+
+      - name: Create focused interfaces
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/callback_member.cpp <<'EOF'
+          #include <common/GeneratorInterface.h>
+          template<auto> struct fex_gen_config : fexgen::indirect_guest_calls {};
+          struct Hooks {
+            void* user;
+            int (*cb)(int);
+          };
+          void install(const Hooks* hooks);
+          int direct(int value);
+          template<> struct fex_gen_config<install> {};
+          template<> struct fex_gen_config<direct> {};
+          template<> struct fex_gen_config<&Hooks::user> : fexgen::custom_repack {};
+          template<> struct fex_gen_config<&Hooks::cb> : fexgen::callback_member {};
+          EOF
+
+          cat > /tmp/callback_member_nonfn.cpp <<'EOF'
+          #include <common/GeneratorInterface.h>
+          template<auto> struct fex_gen_config {};
+          struct Bad { int value; };
+          void install(const Bad* hooks);
+          template<> struct fex_gen_config<install> {};
+          template<> struct fex_gen_config<&Bad::value> : fexgen::callback_member {};
+          EOF
+
+          cat > /tmp/callback_member_variadic.cpp <<'EOF'
+          #include <common/GeneratorInterface.h>
+          template<auto> struct fex_gen_config {};
+          struct Bad { void (*cb)(int, ...); };
+          void install(const Bad* hooks);
+          template<> struct fex_gen_config<install> {};
+          template<> struct fex_gen_config<&Bad::cb> : fexgen::callback_member {};
+          EOF
+
+      - name: Verify 64-bit callback member generation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TG="$GITHUB_WORKSPACE/build/Bin/thunkgen"
+          INC="$GITHUB_WORKSPACE/ThunkLibs/include"
+          "$TG" /tmp/callback_member.cpp libtest -guest "$R/guest64.inl" / -- -std=c++20 -isystem "$INC"
+          "$TG" /tmp/callback_member.cpp libtest -host "$R/host64.inl" / -- -std=c++20 -isystem "$INC"
+          "$TG" /tmp/callback_member.cpp libtest -guest-bridge "$R/bridge64.inl" / -- -std=c++20 -isystem "$INC"
+          "$TG" /tmp/callback_member.cpp libtest -guest-bridge-accessors "$R/accessors64.inl" / -- -std=c++20 -isystem "$INC"
+
+          grep -F 'fex_callback_copy_0 = *a_0;' "$R/guest64.inl"
+          grep -F 'fex_callback_copy_0.cb = AllocateHostTrampolineForGuestFunction(a_0->cb);' "$R/guest64.inl"
+          grep -F 'args.a_0 = a_0 ? &fex_callback_copy_0 : nullptr;' "$R/guest64.inl"
+          grep -F 'fex_custom_repack_entry' "$R/host64.inl"
+          grep -F 'FinalizeHostTrampolineForGuestFunction(fex_callback_0_cb);' "$R/host64.inl"
+          grep -F 'data.cb = reinterpret_cast' "$R/host64.inl"
+
+          grep -E 'FEX_BRIDGE_ROLE .*caller=1 unpacker=1 .*int \(int\)' "$R/bridge64.inl"
+          test "$(grep -Ec 'FEX_BRIDGE_ROLE .*int \(int\)' "$R/bridge64.inl")" = 1
+          grep -F 'FEXResidentBridgeInvoker' "$R/accessors64.inl"
+          grep -F 'FEXResidentBridgeUnpacker' "$R/accessors64.inl"
+
+      - name: Verify 32-bit callback member generation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TG="$GITHUB_WORKSPACE/build/Bin/thunkgen"
+          INC="$GITHUB_WORKSPACE/ThunkLibs/include"
+          for mode in guest host guest-bridge guest-bridge-accessors; do
+            case "$mode" in
+              guest) out="$R/guest32.inl";;
+              host) out="$R/host32.inl";;
+              guest-bridge) out="$R/bridge32.inl";;
+              guest-bridge-accessors) out="$R/accessors32.inl";;
+            esac
+            "$TG" /tmp/callback_member.cpp libtest "-$mode" "$out" / -for-32bit-guest -- \
+              -std=c++20 -m32 --target=i686-linux-gnu -isystem "$INC"
+          done
+          grep -F 'fex_callback_copy_0.cb = AllocateHostTrampolineForGuestFunction(a_0->cb);' "$R/guest32.inl"
+          grep -F 'FinalizeHostTrampolineForGuestFunction(fex_callback_0_cb);' "$R/host32.inl"
+          grep -E 'FEX_BRIDGE_ROLE .*caller=1 unpacker=1 .*int \(int\)' "$R/bridge32.inl"
+          test "$(grep -Ec 'FEX_BRIDGE_ROLE .*int \(int\)' "$R/bridge32.inl")" = 1
+
+      - name: Verify invalid member diagnostics
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TG="$GITHUB_WORKSPACE/build/Bin/thunkgen"
+          INC="$GITHUB_WORKSPACE/ThunkLibs/include"
+          set +e
+          "$TG" /tmp/callback_member_nonfn.cpp libtest -guest "$R/nonfn.inl" / -- -std=c++20 -isystem "$INC" >"$R/nonfn.out" 2>"$R/nonfn.err"
+          nonfn_rc=$?
+          "$TG" /tmp/callback_member_variadic.cpp libtest -guest "$R/variadic.inl" / -- -std=c++20 -isystem "$INC" >"$R/variadic.out" 2>"$R/variadic.err"
+          variadic_rc=$?
+          set -e
+          printf 'nonfn=%s\nvariadic=%s\n' "$nonfn_rc" "$variadic_rc" | tee "$R/negative-exits.txt"
+          test "$nonfn_rc" -ne 0
+          test "$variadic_rc" -ne 0
+          grep -F 'callback_member requires a function-pointer field' "$R/nonfn.err"
+          grep -F 'Variadic callback members are not supported' "$R/variadic.err"
+          printf 'THUNKGEN_CALLBACK_MEMBER_BRIDGE_ROLE_OK\n' | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunkgen-callback-member-bridge-role-${{ github.run_id }}
+          path: callback-member-role-receipts
+          retention-days: 30
