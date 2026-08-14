@@ -1,0 +1,287 @@
+name: DRM direct retained callback moved reload
+
+on:
+  push:
+    branches: [diagnostic/drm-direct-resident-callback-member-20260814]
+    paths:
+      - LinuxFieldwork/apply_drm_direct_resident_callback_member_bridge.py
+      - .github/workflows/drm-direct-retained-moved-reload.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  retained:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      SOURCE_SHA: c348a19d91219d4df6cdaa86839607565e001fa2
+      ROOTFS: ${{ github.workspace }}/rootfs-drm-retained
+      R: ${{ github.workspace }}/drm-retained-receipts
+      H: ${{ github.workspace }}/host-drm-retained
+      NATIVE: ${{ github.workspace }}/native-drm-retained
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and clean-source provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H" "$NATIVE"
+          git cat-file -e "$SOURCE_SHA^{commit}"
+          git diff --name-only "$SOURCE_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libdrm-dev libgl-dev binutils
+
+      - name: Apply direct DRM resident bridge plus runtime-only unpacker observability
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_drm_direct_resident_callback_member_bridge.py | tee "$R/transform.txt"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/libdrm_bridge/Guest.cpp')
+          s = p.read_text()
+          old = '#include "thunkgen_bridge_libdrm.inl"\n'
+          new = '''#include "thunkgen_bridge_libdrm.inl"\n#include "thunkgen_bridge_accessors_libdrm.inl"\n\nextern "C" uintptr_t FEXDRMDiagVBlankUnpacker() {\n  using Callback = decltype(drmEventContext::vblank_handler);\n  Callback callback = nullptr;\n  return reinterpret_cast<uintptr_t>(FEXGetResidentCallbackUnpacker(callback));\n}\n'''
+          assert s.count(old) == 1, s.count(old)
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git add -N ThunkLibs/libdrm_bridge/Guest.cpp
+          git diff --check
+          git diff -- ThunkLibs > "$R/runtime-source.diff"
+          grep -q 'FEXDRMDiagVBlankUnpacker' ThunkLibs/libdrm_bridge/Guest.cpp
+
+      - name: Build FEX, DRM host thunk, wrapper and companion
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer drm-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 360 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libdrm-host.so "$H/libdrm-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target drm-guest drm_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 420 "$R/build-guest.log"; exit 1; }
+
+          cp guest/gen/thunkgen_bridge_libdrm.inl "$R/drm-bridge.inl"
+          cp guest/gen/thunkgen_bridge_accessors_libdrm.inl "$R/drm-accessors.inl"
+          grep 'FEX_BRIDGE_ROLE' "$R/drm-bridge.inl" | tee "$R/drm-role-lines.txt"
+          test "$(grep -c 'caller=0 unpacker=1' "$R/drm-role-lines.txt")" -eq 3
+          ! grep -q 'caller=1' "$R/drm-role-lines.txt"
+          readelf -d guest/libdrm-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest/libfex-drm-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-drm-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'RUNPATH.*\$ORIGIN' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          nm -D guest/libfex-drm-bridge.so | tee "$R/bridge.symbols"
+          grep -q 'FEXDRMDiagVBlankUnpacker' "$R/bridge.symbols"
+
+      - name: Build native DRM retention test double
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat >/tmp/fake_drm.c <<'EOF'
+          #include <xf86drm.h>
+          #include <stdint.h>
+          #include <stdio.h>
+
+          typedef void (*vblank_cb_t)(int, unsigned, unsigned, unsigned, void *);
+          static vblank_cb_t saved;
+
+          int drmHandleEvent(int fd, drmEventContextPtr ctx) {
+            if (!ctx || !ctx->vblank_handler) return -10;
+            saved = ctx->vblank_handler;
+            fprintf(stderr, "HOST_DRM_SAVE trampoline=%p\n", (void*)saved);
+            saved(fd, 41, 42, 43, (void*)(uintptr_t)0x11112222);
+            return 0;
+          }
+
+          int drmAvailable(void) {
+            fprintf(stderr, "HOST_DRM_TRIGGER trampoline=%p\n", (void*)saved);
+            if (!saved) return -11;
+            saved(77, 51, 52, 53, (void*)(uintptr_t)0x33334444);
+            return 1;
+          }
+          EOF
+          cc -shared -fPIC -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
+            -Wl,-soname,libdrm.so.2 /tmp/fake_drm.c -o "$NATIVE/libdrm.so.2"
+          readelf -Ws "$NATIVE/libdrm.so.2" | tee "$R/native.symbols"
+          grep -q 'drmHandleEvent' "$R/native.symbols"
+          grep -q 'drmAvailable' "$R/native.symbols"
+
+      - name: Prepare amd64 rootfs and moved-reload probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libdrm-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libdrm.so.2"
+          cp guest/libfex-drm-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-drm-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/drm_retained.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <xf86drm.h>
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/mman.h>
+
+          typedef int (*handle_t)(int, drmEventContextPtr);
+          typedef int (*available_t)(void);
+          typedef uintptr_t (*getaddr_t)(void);
+          struct range { uintptr_t a,b; } old[16]; static int oldn;
+          static volatile unsigned callbacks;
+
+          __attribute__((used,noinline))
+          static void cb(int fd, unsigned seq, unsigned sec, unsigned usec, void *user) {
+            ++callbacks;
+            fprintf(stderr, "DRM_RETAINED_CALLBACK count=%u fd=%d seq=%u tv=%u.%u user=%p\n",
+                    callbacks, fd, seq, sec, usec, user);
+          }
+
+          static int map_has(void *p, const char *needle) {
+            FILE *f=fopen("/proc/self/maps","r"); char l[1024]; uintptr_t x=(uintptr_t)p;
+            if(!f)return -1;
+            while(fgets(l,sizeof l,f)){
+              unsigned long a,b;
+              if(sscanf(l,"%lx-%lx",&a,&b)==2&&x>=a&&x<b){
+                int ok=strstr(l,needle)!=0; fprintf(stderr,"MAP %p %s",p,l); fclose(f); return ok;
+              }
+            }
+            fclose(f); fprintf(stderr,"UNMAPPED %p\n",p); return 0;
+          }
+
+          static void capture_wrapper(void) {
+            FILE*f=fopen("/proc/self/maps","r"); char l[1024]; oldn=0;
+            while(f&&fgets(l,sizeof l,f)&&oldn<16){
+              unsigned long a,b;
+              if(strstr(l,"/usr/lib/x86_64-linux-gnu/libdrm.so.2")&&sscanf(l,"%lx-%lx",&a,&b)==2){
+                old[oldn++]=(struct range){a,b}; fprintf(stderr,"OLD_DRM_RANGE %lx-%lx\n",a,b);
+              }
+            }
+            if(f)fclose(f);
+          }
+
+          static int reserve_old(void) {
+            for(int i=0;i<oldn;i++){
+              size_t n=old[i].b-old[i].a;
+              void*p=mmap((void*)old[i].a,n,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+              if(p==MAP_FAILED){fprintf(stderr,"RESERVE_FAIL %d %lx-%lx errno=%d\n",i,old[i].a,old[i].b,errno);return -1;}
+              fprintf(stderr,"RESERVED_DRM %lx-%lx\n",old[i].a,old[i].b);
+            }
+            return 0;
+          }
+
+          static void *req(void *h, const char *n) {
+            void *p=dlsym(h,n); if(!p)fprintf(stderr,"DLSYM_FAIL %s %s\n",n,dlerror()); return p;
+          }
+
+          int main(void) {
+            void *h=dlopen("libdrm.so.2",RTLD_NOW|RTLD_LOCAL);
+            if(!h){fprintf(stderr,"DRM_OPEN_FAIL %s\n",dlerror());return 2;}
+            handle_t handle=(handle_t)req(h,"drmHandleEvent");
+            if(!handle)return 3;
+            void *bh=dlopen("libfex-drm-bridge.so",RTLD_NOW|RTLD_NOLOAD);
+            if(!bh){fprintf(stderr,"BRIDGE_NOLOAD_FAIL %s\n",dlerror());return 4;}
+            getaddr_t get_unpack=(getaddr_t)req(bh,"FEXDRMDiagVBlankUnpacker");
+            if(!get_unpack)return 5;
+            void *unpack=(void*)get_unpack();
+            fprintf(stderr,"GEN1 handle=%p unpacker=%p\n",(void*)handle,unpack);
+            if(map_has(unpack,"/libfex-drm-bridge.so")!=1)return 6;
+
+            drmEventContext ctx; memset(&ctx,0,sizeof(ctx));
+            ctx.version=DRM_EVENT_CONTEXT_VERSION; ctx.vblank_handler=cb;
+            if(handle(5,&ctx)!=0||callbacks!=1)return 7;
+            capture_wrapper(); if(oldn==0)return 8;
+            dlclose(bh);
+            if(dlclose(h)!=0)return 9;
+            if(map_has((void*)handle,"/usr/lib/x86_64-linux-gnu/libdrm.so.2")!=0)return 10;
+            if(map_has(unpack,"/libfex-drm-bridge.so")!=1)return 11;
+            if(reserve_old()!=0)return 12;
+
+            void *h2=dlopen("libdrm.so.2",RTLD_NOW|RTLD_LOCAL);
+            if(!h2){fprintf(stderr,"DRM_RELOAD_FAIL %s\n",dlerror());return 13;}
+            handle_t handle2=(handle_t)req(h2,"drmHandleEvent");
+            available_t available2=(available_t)req(h2,"drmAvailable");
+            if(!handle2||!available2)return 14;
+            fprintf(stderr,"GEN2 handle_old=%p handle_new=%p moved=%d callbacks_before_trigger=%u\n",
+                    (void*)handle,(void*)handle2,handle!=handle2,callbacks);
+            if(handle==handle2)return 15;
+
+            // Generation 2 deliberately does not call drmHandleEvent. The native
+            // test double therefore retains the generation-1 host trampoline.
+            int rc=available2();
+            fprintf(stderr,"AFTER_RELOAD_TRIGGER rc=%d callbacks=%u\n",rc,callbacks);
+            if(rc!=1||callbacks!=2)return 16;
+            if(dlclose(h2)!=0)return 17;
+            if(map_has(unpack,"/libfex-drm-bridge.so")!=1)return 18;
+            fprintf(stderr,"DRM_RETAINED_MOVED_RELOAD_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
+            /tmp/drm_retained.c -ldl -o "$ROOTFS/opt/fex-ci/drm-retained"
+
+      - name: Execute retained generation-1 callback after moved reload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          set +e
+          LD_LIBRARY_PATH="$NATIVE${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 40s \
+            build/Bin/FEX /opt/fex-ci/drm-retained > "$R/probe.out" 2> "$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          test "$rc" -eq 0
+          grep -q 'HOST_DRM_SAVE trampoline=' "$R/probe.err"
+          grep -q 'DRM_RETAINED_CALLBACK count=1' "$R/probe.err"
+          grep -q 'UNMAPPED ' "$R/probe.err"
+          grep -q 'RESERVED_DRM ' "$R/probe.err"
+          grep -q 'moved=1 callbacks_before_trigger=1' "$R/probe.err"
+          grep -q 'HOST_DRM_TRIGGER trampoline=' "$R/probe.err"
+          grep -q 'DRM_RETAINED_CALLBACK count=2' "$R/probe.err"
+          grep -q 'AFTER_RELOAD_TRIGGER rc=1 callbacks=2' "$R/probe.err"
+          grep -q 'DRM_RETAINED_MOVED_RELOAD_OK' "$R/probe.err"
+          echo DRM_RETAINED_RUNTIME_OK | tee "$R/runtime-gate.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drm-direct-retained-moved-reload-${{ github.run_id }}
+          path: drm-retained-receipts
+          retention-days: 30
