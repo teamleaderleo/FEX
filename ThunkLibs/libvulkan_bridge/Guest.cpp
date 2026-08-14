@@ -8,9 +8,13 @@
 #include "thunkgen_guest_libvulkan_bridge.inl"
 
 extern "C" uintptr_t FEXVulkanBridgeEnumerateInstanceVersionInvoker() {
-  using Signature = VkResult(uint32_t*);
-  return reinterpret_cast<uintptr_t>(
-    &CallHostFunction<fexthunks_invoke_callback<Signature>, VkResult, uint32_t*>);
+  return reinterpret_cast<uintptr_t>(GetCallerForHostFunction(
+    static_cast<PFN_vkEnumerateInstanceVersion>(nullptr)));
+}
+
+extern "C" uintptr_t FEXVulkanBridgeXlibPresentationSupportInvoker() {
+  return reinterpret_cast<uintptr_t>(GetCallerForHostFunction(
+    static_cast<PFN_vkGetPhysicalDeviceXlibPresentationSupportKHR>(nullptr)));
 }
 
 extern "C" uintptr_t FEXVulkanBridgeXSyncUnpacker() {
