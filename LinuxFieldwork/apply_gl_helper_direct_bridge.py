@@ -89,7 +89,7 @@ extern "C" uintptr_t fex_gl_bridge_xdisplaystring_unpacker() {
 cmake = Path('ThunkLibs/GuestLibs/CMakeLists.txt')
 c = cmake.read_text()
 anchor = 'add_guest_lib(GL "libGL.so.1")\n'
-replacement = '''add_guest_lib(GL "libGL.so.1")\nadd_guest_bridge(GL_bridge "libfex-GL-bridge.so"\n  OUTPUT_NAME "fex-GL-bridge"\n  WRAPPER_TARGET GL-guest\n  GENERATOR libGL\n  DEP_TARGETS libGL-guest-deps)\n'''
+replacement = '''add_guest_lib(GL "libGL.so.1")\nadd_guest_bridge(GL_bridge "libfex-GL-bridge.so"\n  OUTPUT_NAME "fex-GL-bridge"\n  WRAPPER_TARGET GL-guest\n  GENERATOR libGL\n  DEP_TARGETS libGL-guest-deps\n  INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../libGL")\n'''
 assert c.count(anchor) == 1, c.count(anchor)
 cmake.write_text(c.replace(anchor, replacement, 1))
 
