@@ -1,0 +1,70 @@
+name: Vulkan split bridge guest build smoke
+
+on:
+  push:
+    branches: [ci/thunk-callback-descriptor-20260814]
+    paths:
+      - .github/fieldwork/apply_vulkan_split_bridge.py
+      - .github/workflows/vulkan-split-bridge-guest-build-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guest-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      R: ${{ github.workspace }}/receipts
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: 71afe476751deac24adabd1adb575fd2337b6e0a
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - name: Dependencies and transform
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libvulkan-dev
+          python3 .github/fieldwork/apply_vulkan_split_bridge.py src
+          git -C src diff --check
+      - name: Build thunkgen only
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build src/build --target thunkgen -- -j"$(nproc)" -v > "$R/build-thunkgen.log" 2>&1
+      - name: Build split Vulkan guest pair
+        run: |
+          set -euxo pipefail
+          cmake -S src/ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest vulkan-bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 260 "$R/build-guest.log"; exit 1; }
+          readelf -d guest-build/libfex-vulkan-bridge.so | tee "$R/bridge.dynamic.txt"
+          readelf -d guest-build/libvulkan-guest.so | tee "$R/wrapper.dynamic.txt"
+          grep -q NODELETE "$R/bridge.dynamic.txt"
+          grep -q 'Shared library: \[libfex-vulkan-bridge.so\]' "$R/wrapper.dynamic.txt"
+          nm -D guest-build/libfex-vulkan-bridge.so | grep fex_vulkan_bridge_find_host_invoker
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan-split-guest-build-${{ github.run_id }}
+          path: receipts
+          retention-days: 7
