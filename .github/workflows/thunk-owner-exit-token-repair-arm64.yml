@@ -1,0 +1,182 @@
+name: Thunk owner exit-token repair ARM64
+
+on:
+  push:
+    branches: [ci/thunk-owner-exit-token-repair-20260814]
+    paths:
+      - diagnostics/thunk-inflight-race/**
+      - .github/fieldwork/add_thunk_owner_exit_token.py
+      - .github/fieldwork/add_inflight_selected_pause.py
+      - .github/fieldwork/**owner**
+      - .github/workflows/thunk-owner-exit-token-repair-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: thunk-owner-exit-token-repair-20260814
+  cancel-in-progress: true
+
+jobs:
+  owner-exit-token:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 80
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-owner-exit-token
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang lld pkg-config libcap-dev \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'carrier=%s\nfex=%s\nhelper=%s\n' \
+            "$GITHUB_SHA" "$(git -C src rev-parse HEAD)" "$(git -C retirement-helper rev-parse HEAD)" \
+            > "$R/identity.txt"
+
+      - name: Build base FEX
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang CXX=clang++ cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-base.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-base.log" 2>&1
+
+      - name: Prepare amd64 rootfs and race probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci" "$ROOTFS/usr/lib/x86_64-linux-gnu"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          x86_64-linux-gnu-g++ -std=c++20 -O2 -g -Wall -Wextra -Wpedantic -Werror -pthread \
+            -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" \
+            diagnostics/thunk-inflight-race/thunk_inflight_race.cpp \
+            -o "$ROOTFS/opt/fex-ci/thunk-inflight-race"
+          file "$ROOTFS/opt/fex-ci/thunk-inflight-race" > "$R/probe.file"
+
+      - name: Apply owner-aware baseline and deterministic barrier
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/merge_callback_tombstone.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          python3 .github/fieldwork/pre_map_fixed_retire.py src
+          python3 .github/fieldwork/add_map_fixed_rollback_transaction.py src
+          python3 .github/fieldwork/add_vma_owner_id.py src
+          python3 .github/fieldwork/add_owner_claim_identity.py src
+          python3 .github/fieldwork/add_inflight_selected_pause.py src
+          git -C src diff --check
+          git -C src diff > "$R/baseline.diff"
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-baseline.log" 2>&1
+
+      - name: Reproduce old-H generation crossing
+        shell: bash
+        run: |
+          set +e
+          FEX_ROOTFS="$ROOTFS" FEX_DIAG_INFLIGHT_SELECT=1 timeout 30s \
+            "$GITHUB_WORKSPACE/src/build/Bin/FEX" /opt/fex-ci/thunk-inflight-race \
+            > "$R/baseline.stdout" 2> "$R/baseline.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/baseline.exit"
+          grep -E 'INFLIGHT |DIAG_INFLIGHT_|DIAG_OWNER_|DIAG_MULTI|DIAG_REVOKED_H|DIAG_MAP_FIXED|DIAG_ROLLBACK' \
+            "$R/baseline.stderr" > "$R/baseline.key" || true
+          cat "$R/baseline.key"
+          test "$rc" = 0
+          grep -q 'INFLIGHT final worker-value=222 reregister=0' "$R/baseline.stderr"
+
+      - name: Apply owner exit-token repair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/add_thunk_owner_exit_token.py src
+          git -C src diff --check
+          git -C src diff > "$R/repair.diff"
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-repair.log" 2>&1
+
+      - name: Run repaired no-reregister and explicit-reregister controls
+        shell: bash
+        run: |
+          set -uxo pipefail
+          run_case() {
+            name="$1"; shift
+            set +e
+            FEX_ROOTFS="$ROOTFS" FEX_DIAG_INFLIGHT_SELECT=1 timeout 30s \
+              "$GITHUB_WORKSPACE/src/build/Bin/FEX" /opt/fex-ci/thunk-inflight-race "$@" \
+              > "$R/$name.stdout" 2> "$R/$name.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            echo "===== $name rc=$rc ====="
+            grep -E 'INFLIGHT |DIAG_INFLIGHT_|DIAG_OWNER_EXIT|DIAG_OWNER_CLAIM|DIAG_MULTI|DIAG_REVOKED_H|DIAG_MAP_FIXED|DIAG_ROLLBACK' \
+              "$R/$name.stderr" | tee "$R/$name.key" || true
+          }
+          set -e
+          run_case repair-no-reregister
+          run_case repair-reregister --reregister
+          printf 'baseline=%s\nrepair-no-reregister=%s\nrepair-reregister=%s\n' \
+            "$(cat "$R/baseline.exit")" "$(cat "$R/repair-no-reregister.exit")" "$(cat "$R/repair-reregister.exit")" \
+            | tee "$R/matrix.txt"
+
+      - name: Assert owner-token causal repair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(cat "$R/baseline.exit")" = 0
+          test "$(cat "$R/repair-no-reregister.exit")" = 139
+          test "$(cat "$R/repair-reregister.exit")" = 0
+          grep -q 'DIAG_OWNER_EXIT_REJECT H=0x700000020000' "$R/repair-no-reregister.stderr"
+          grep -q 'DIAG_REVOKED_H_INSTALL H=0x700000020000' "$R/repair-no-reregister.stderr"
+          if grep -q 'INFLIGHT worker-return value=222' "$R/repair-no-reregister.stderr"; then
+            echo 'repaired stale H crossed to generation 2' >&2
+            exit 1
+          fi
+          grep -q 'DIAG_OWNER_EXIT_REJECT H=0x700000020000' "$R/repair-reregister.stderr"
+          grep -q 'INFLIGHT reregistered H=0x700000020000' "$R/repair-reregister.stderr"
+          grep -q 'INFLIGHT final worker-value=222 reregister=1' "$R/repair-reregister.stderr"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunk-owner-exit-token-${{ github.run_id }}
+          path: receipts-owner-exit-token
+          retention-days: 30
