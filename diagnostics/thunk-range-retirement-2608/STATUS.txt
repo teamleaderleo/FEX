@@ -15,24 +15,54 @@ Critical v1 flaw discovered during source audit:
 - LookupCache::InvalidateCacheRange() finds thread-local L1/L2 entries only through CachedCodePages.
 - Therefore InvalidateGuestCodeRange(H, 1) cannot be trusted to evict an already-compiled synthetic CustomIR entrypoint H. The previous ablation's "invalidate H" axis was not a real exact-H invalidation.
 
-Current v2 artifact:
+Current v2 artifacts:
 - apply_exact_customir_retirement_v2.py
-- Commit adding applicator: 7950f66996c5c2b2accada06e0e80c4ef157809d
-- The applicator verifies all expected source anchors before modifying anything and runs git diff --check after application.
-- No CI runner is attached to this diagnostic branch at present, so this artifact is source-audited but not yet compiled in GitHub Actions.
+- repair_exact_customir_retirement_v2_compile.py
+- .github/workflows/thunk-range-retirement-arm64.yml
+- Applicator commit: 7950f66996c5c2b2accada06e0e80c4ef157809d
+- Shared-map compile repair commit: 307ac96592a263f2cc197a6fae7954f9025a4d5c
+- Successful A/B carrier commit: 384bf4a52a465802afa2b6403ea157e4385ade9b
 
-v2 causal experiment:
+Hosted ARM64 A/B result:
+- Actions run: 31775159912
+- Runner: ubuntu-24.04-arm
+- Job conclusion: success
+- Artifact: exact-customir-retirement-ab-31775159912
+- Artifact SHA-256: 2ff99414a090de96535b15e051272a6ac1947faaf67021e5ed4a863be5a9a916
+
+Baseline discriminator:
+- stable synthetic/native H = 0x0000700000010000
+- generation-1 guest invoker T1 = 0x00007ffff7da2150
+- after dlclose, T1 executable mapping disappeared
+- old DSO span 0x7ffff7da1000..0x7ffff7da6000 was reserved PROT_NONE
+- generation-2 invoker T2 = 0x00007ffff7d9d150, different from T1
+- calling H after reload produced SIGSEGV
+- calling T2 directly returned the expected generation-2 value 100100071
+
+Exact-retirement v2 discriminator:
+- same stable H
+- same T1/T2 addresses and forced-different reload geometry
+- old DSO span still PROT_NONE
+- calling H after reload returned 100100071 and exited 0
+- calling T2 directly also returned 100100071
+
+Interpretation:
+- The real-FEX baseline retains generation-1 ownership across unload, exactly as predicted by the CustomIR lifetime hypothesis.
+- Exact retirement plus exact shared/per-thread H eviction is causally positive: it removes enough generation-1 state for the stable H identity to bind and execute generation 2 cleanly.
+- This result does not depend on same-address ABA reuse because the old span remains PROT_NONE and T2 is at a different guest address.
+- The successful patched call is stronger than merely changing the crash site: H returns the generation-2 value.
+
+Compile repair discovered by first A/B run:
+- The first v2 build failed because CodeBuffer::LookupCache is GuestToHostMap*, while the draft called a helper added to the per-thread LookupCache class.
+- The repair performs shared/L3 exact eviction directly with GuestToHostMap::AcquireWriteLock() plus GuestToHostMap::Erase(H, lock).
+- Per-thread exact L1/L2 eviction remains on LookupCache.
+
+v2 causal experiment semantics:
 1. Add exact shared/L3 eviction for a synthetic entrypoint H via GuestToHostMap::Erase(H), which also delinks inbound direct block links.
 2. Add exact per-thread L1/L2 eviction for H and flush the call/return shadow cache.
 3. Scan CustomIRHandlers for thunk-owned entries whose Data guest target T lies in a successfully unmapped guest range.
 4. Erase those H->T registrations and exact-evict every returned H under the same code-invalidation transaction.
 5. Invoke the retirement after successful GuestMunmap and before ordinary guest-range invalidation.
-
-Interpretation:
-- If unpinned Vulkan teardown stops reaching the old libvulkan-guest.so CallHostFunction address after v2, stale dynamic-PFN CustomIR/compiled-H reachability is strongly implicated.
-- A clean exit is strong positive evidence.
-- A changed failure at H after the mapping is retired is also informative: it proves the old H->T redirect was carrying the dead target even if the application still performs a late call.
-- If the same dead T is reached after logs prove its H->T registration was retired and H was exact-evicted, the leading CustomIR dispatch hypothesis is damaged and another retained reference must be found.
 
 Known limits of v2:
 - GuestMunmap has already performed the kernel unmap before v2 retirement; this is a causal probe, not a race-safe lifetime protocol.
@@ -40,9 +70,9 @@ Known limits of v2:
 - Host-to-guest callback trampolines are not retired.
 - mmap(MAP_FIXED), mremap, shmdt, and other destructive mapping paths are not covered by this first probe.
 - No load-generation/owner identity is attached to H->T registrations yet.
+- The informational retirement log did not appear in the successful run's stderr, so the runtime A/B behavior is the primary discriminator; future instrumentation should use an explicit receipt/counter rather than relying on normal logging configuration.
 
 Next runtime work:
-- Apply v2 to the exact FEX-2608 experimental checkout after the callback-routing diagnostic change.
-- Run unpinned Vulkan with llvmpipe and Venus, recording retirement logs, final exit status, and fault RIP.
-- Run the forced-changed-base libGL fresh-PFN probe to test the same mechanism without Vulkan.
-- If v2 is causally positive, move retirement to a pre-destructive mapping phase and test a peer-thread quiescence barrier before treating any patch as a lifetime repair.
+- Run a real-FEX 2x2 ownership ablation: baseline, registry-only retirement, cache-only exact eviction, and full retirement+eviction. Expected useful split is baseline/registry-only/cache-only stale versus full fresh generation-2 routing.
+- Apply the causally positive cleanup to the Vulkan teardown experiment with llvmpipe and Venus, recording final exit status and the host-PC/si_addr/guest-RIP fault tuple if any failure remains.
+- If the ablation stays positive, move retirement to a pre-destructive mapping phase and test a peer-thread quiescence barrier before treating any patch as a lifetime repair.
