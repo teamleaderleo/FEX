@@ -48,7 +48,7 @@ jobs:
             -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
             -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
             -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=ON \
-            -DENABLE_X86_HOST_DEBUG=ON \
+            -DBUILD_THUNKS=ON -DENABLE_X86_HOST_DEBUG=ON \
             -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DX86_DEV_ROOTFS=/ \
             2>&1 | tee "$R/cmake.log"
 
