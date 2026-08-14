@@ -100,8 +100,8 @@ jobs:
           docker export "$cid" | tar -C "$ROOTFS" -xf -
           docker rm "$cid"
           trap - EXIT
-          mkdir -p "$ROOTFS/opt/fex-ci/full" "$ROOTFS/tmp/fex-fieldwork"
-          chmod 0777 "$ROOTFS/tmp/fex-fieldwork"
+          mkdir -p "$ROOTFS/opt/fex-ci/full" /tmp/fex-fieldwork
+          chmod 0777 /tmp/fex-fieldwork
           cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/full/"
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
@@ -112,7 +112,7 @@ jobs:
           set -uxo pipefail
           FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
           HOST="/tmp/repro/fex-full-thunk-pair/host"
-          BARRIER="$ROOTFS/tmp/fex-fieldwork"
+          BARRIER="/tmp/fex-fieldwork"
           run_case() {
             local name="$1"; shift
             rm -f "$BARRIER/target" "$BARRIER/selected" "$BARRIER/resume"
