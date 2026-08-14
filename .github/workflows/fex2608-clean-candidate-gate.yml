@@ -1,0 +1,345 @@
+name: Clean and gate combined FEX-2608 candidate
+
+on:
+  push:
+    branches: [ci/fex2608-staged-lifetime-integration-20260814]
+    paths:
+      - .github/workflows/fex2608-clean-candidate-gate.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  clean-and-gate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      FEX_BASE: e869aa644a16e4332cdc15c1ea0b4d13d482385d
+      RESEARCH_SHA: d73d8b99790b311a7f53a538bcec54edc21171a5
+      CLEAN_BRANCH: candidate/fex2608-combined-thunk-lifetime-clean
+      PRODUCT: ${{ github.workspace }}/product
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-clean-candidate
+      H: ${{ github.workspace }}/host-vulkan
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout proven research snapshot
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.RESEARCH_SHA }}
+          path: product
+          fetch-depth: 2
+          submodules: recursive
+
+      - name: Checkout retained fixture helpers and probes
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-callback-transactional-retire-20260814
+          path: transaction-helper
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-combined-repair
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Remove experimental DIAG stderr statements only
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          test "$(git -C "$PRODUCT" rev-parse HEAD)" = "$RESEARCH_SHA"
+          test "$(git -C "$PRODUCT" rev-parse HEAD^)" = "$FEX_BASE"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('product')
+          roots = [root / 'FEXCore', root / 'Source/Tools/LinuxEmulation', root / 'ThunkLibs']
+          changed = []
+
+          def strip_diag_fprintf(text: str) -> tuple[str, int]:
+              out = []
+              i = 0
+              removed = 0
+              n = len(text)
+              while i < n:
+                  start = text.find('fprintf(stderr', i)
+                  if start < 0:
+                      out.append(text[i:])
+                      break
+
+                  line_start = text.rfind('\n', i, start) + 1
+                  prefix = text[line_start:start]
+                  # Keep arbitrary inline calls untouched; the experimental logging is statement-level.
+                  if prefix.strip():
+                      out.append(text[i:start + 1])
+                      i = start + 1
+                      continue
+
+                  depth = 0
+                  j = start
+                  in_string = False
+                  in_char = False
+                  escape = False
+                  seen_open = False
+                  while j < n:
+                      c = text[j]
+                      if escape:
+                          escape = False
+                      elif c == '\\' and (in_string or in_char):
+                          escape = True
+                      elif c == '"' and not in_char:
+                          in_string = not in_string
+                      elif c == "'" and not in_string:
+                          in_char = not in_char
+                      elif not in_string and not in_char:
+                          if c == '(':
+                              depth += 1
+                              seen_open = True
+                          elif c == ')':
+                              depth -= 1
+                          elif c == ';' and seen_open and depth == 0:
+                              j += 1
+                              if j < n and text[j] == '\n':
+                                  j += 1
+                              break
+                      j += 1
+                  else:
+                      raise SystemExit(f'unterminated fprintf in source near offset {start}')
+
+                  statement = text[start:j]
+                  if 'DIAG_' in statement:
+                      out.append(text[i:line_start])
+                      i = j
+                      removed += 1
+                  else:
+                      out.append(text[i:j])
+                      i = j
+
+              return ''.join(out), removed
+
+          total = 0
+          for base in roots:
+              for path in base.rglob('*'):
+                  if not path.is_file() or path.suffix not in {'.cpp', '.h', '.c', '.cc', '.hpp'}:
+                      continue
+                  try:
+                      old = path.read_text()
+                  except UnicodeDecodeError:
+                      continue
+                  new, count = strip_diag_fprintf(old)
+                  if count:
+                      path.write_text(new)
+                      changed.append((str(path.relative_to(root)), count))
+                      total += count
+
+          if total == 0:
+              raise SystemExit('no DIAG fprintf statements found')
+          print(f'removed {total} DIAG fprintf statements from {len(changed)} files')
+          for path, count in changed:
+              print(f'{path}: {count}')
+          PY
+
+          ! git -C "$PRODUCT" grep -n 'DIAG_' -- \
+            FEXCore Source/Tools/LinuxEmulation ThunkLibs ':!ThunkLibs/GuestLibs/CMakeLists.txt'
+          git -C "$PRODUCT" diff --check
+          git -C "$PRODUCT" diff --numstat "$RESEARCH_SHA" | tee "$R/diagnostic-cleanup.numstat"
+          awk '$1 != "0" { bad=1 } END { exit bad }' "$R/diagnostic-cleanup.numstat"
+          git -C "$PRODUCT" diff "$RESEARCH_SHA" > "$R/diagnostic-cleanup.diff"
+
+      - name: Create one-commit clean candidate over exact FEX-2608
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git -C "$PRODUCT" config user.name 'Leo'
+          git -C "$PRODUCT" config user.email 'cheerleaderleo@outlook.com'
+          git -C "$PRODUCT" reset --soft "$FEX_BASE"
+          git -C "$PRODUCT" add -A
+          git -C "$PRODUCT" diff --cached --check
+          git -C "$PRODUCT" commit -m 'thunks: preserve escaped bridge and callback lifetimes'
+          git -C "$PRODUCT" rev-parse HEAD | tee "$R/clean-candidate-sha.txt"
+          test "$(git -C "$PRODUCT" rev-parse HEAD^)" = "$FEX_BASE"
+          git -C "$PRODUCT" diff --stat "$FEX_BASE" | tee "$R/clean-candidate.stat"
+          test -f "$PRODUCT/ThunkLibs/libvulkan/GuestBridge.cpp"
+          test -f "$PRODUCT/ThunkLibs/libvulkan/ExtractBridgeSymbols.py"
+          test -f "$PRODUCT/ThunkLibs/libvulkan/ExtractBridgeThunks.py"
+          grep -q 'vkCreateDebugReportCallbackEXT.*sv' "$PRODUCT/ThunkLibs/libvulkan/Host.cpp"
+          grep -q 'vkDestroyDebugReportCallbackEXT.*sv' "$PRODUCT/ThunkLibs/libvulkan/Host.cpp"
+          grep -qi 'nodelete' "$PRODUCT/ThunkLibs/GuestLibs/CMakeLists.txt"
+
+      - name: Install build, Vulkan, and cross dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan1 libvulkan-dev mesa-vulkan-drivers binutils
+
+      - name: Build deterministic fixtures and retained probes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base64 -d \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 \
+            > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 transaction-helper/.github/fieldwork/patch_callback_inflight_fixture.py /tmp/repro/fex-full-thunk-pair
+          python3 transaction-helper/.github/fieldwork/patch_callback_transaction_wait_fixture.py /tmp/repro/fex-full-thunk-pair
+          (cd /tmp/repro/fex-full-thunk-pair && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) \
+            > "$R/build-callback-fixtures.log" 2>&1
+
+          PROBE_DIR=fieldwork/investigations/fex-vulkan-thunk-lifecycle
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            "$PROBE_DIR/fex_vulkan_combined_probe.c" -ldl -o /tmp/fex_vulkan_combined_probe
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            "$PROBE_DIR/fex_vulkan_pfn_unload_probe.c" -ldl -o /tmp/fex_vulkan_pfn_unload_probe
+
+      - name: Build clean candidate directly
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S "$PRODUCT" -B "$PRODUCT/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build "$PRODUCT/build" --target FEX FEXServer vulkan-host-64 thunkgen -- -j"$(nproc)" \
+            > "$R/build-host.log" 2>&1
+          cp "$PRODUCT/build/HostLibs_64/libvulkan-host.so" "$H/libvulkan-host.so"
+
+          cmake -S "$PRODUCT/ThunkLibs/GuestLibs" -B "$PRODUCT/guest-clean" -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$PRODUCT/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$PRODUCT" \
+            -DGENERATOR_EXE="$PRODUCT/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build "$PRODUCT/guest-clean" --target vulkan-guest vulkan-bridge-guest -- -j"$(nproc)" \
+            > "$R/build-guest.log" 2>&1
+
+          readelf -d "$PRODUCT/guest-clean/libvulkan-guest.so" > "$R/wrapper.dynamic"
+          readelf -d "$PRODUCT/guest-clean/libfex-vulkan-bridge.so" > "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp "$PRODUCT/guest-clean/libvulkan-guest.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp "$PRODUCT/guest-clean/libfex-vulkan-bridge.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-vulkan-bridge.so"
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libX11.so.6 \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_x11_stub.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/"
+          cp /tmp/fex_vulkan_combined_probe "$ROOTFS/opt/fex-ci/combined_probe"
+          cp /tmp/fex_vulkan_pfn_unload_probe "$ROOTFS/opt/fex-ci/pfn_unload_probe"
+
+      - name: Gate 1 - active callback drain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FIXTURE_HOST=/tmp/repro/fex-full-thunk-pair/host
+          (cd "$ROOTFS/opt/fex-ci" && \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 30s \
+              "$PRODUCT/build/Bin/FEX" /opt/fex-ci/guest/callback_inflight) \
+            > "$R/callback-inflight.out" 2> "$R/callback-inflight.err"
+          cat "$R/callback-inflight.err"
+          grep -q 'INFLIGHT close-done-before-release=0' "$R/callback-inflight.err"
+          grep -q 'INFLIGHT worker-returned rv=70053' "$R/callback-inflight.err"
+          grep -q 'INFLIGHT dlclose-returned rc=0' "$R/callback-inflight.err"
+          grep -q 'INFLIGHT child stale-first-callback exit=113' "$R/callback-inflight.err"
+          grep -q 'INFLIGHT DRAIN_PASS' "$R/callback-inflight.err"
+
+      - name: Gate 2 - failed munmap rollback and wait-on-Draining
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FIXTURE_HOST=/tmp/repro/fex-full-thunk-pair/host
+          (cd "$ROOTFS/opt/fex-ci" && \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 30s \
+              "$PRODUCT/build/Bin/FEX" /opt/fex-ci/guest/callback_transaction_wait) \
+            > "$R/callback-transaction-wait.out" 2> "$R/callback-transaction-wait.err"
+          cat "$R/callback-transaction-wait.err"
+          grep -q 'TXWAIT before-release munmap-done=0 B-done=0' "$R/callback-transaction-wait.err"
+          grep -q 'TXWAIT munmap-returned rc=-1 errno=22' "$R/callback-transaction-wait.err"
+          grep -q 'TXWAIT A-returned rv=70053' "$R/callback-transaction-wait.err"
+          grep -q 'TXWAIT B-returned rv=70063' "$R/callback-transaction-wait.err"
+          grep -q 'TXWAIT stale-after-close-exit=113' "$R/callback-transaction-wait.err"
+          grep -q 'TXWAIT PASS' "$R/callback-transaction-wait.err"
+
+      - name: Gate 3 - saved dynamic Vulkan PFN after wrapper unload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          VK_ICD_FILENAMES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 30s \
+            "$PRODUCT/build/Bin/FEX" /opt/fex-ci/pfn_unload_probe close \
+            > "$R/pfn-close.out" 2> "$R/pfn-close.err"
+          cat "$R/pfn-close.err"
+          grep -q 'PROBE after-close' "$R/pfn-close.err"
+          grep -q 'PROBE return where=after-real-close result=0' "$R/pfn-close.err"
+          grep -q 'PROBE saved-dynamic-pfn-returned-after-close' "$R/pfn-close.err"
+
+      - name: Gate 4 - combined debug-report plus split lifetime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          VK_ICD_FILENAMES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 30s \
+            "$PRODUCT/build/Bin/FEX" /opt/fex-ci/combined_probe \
+            > "$R/combined-probe.out" 2> "$R/combined-probe.err"
+          cat "$R/combined-probe.err"
+          grep -q 'COMBINED debug-report-created result=0' "$R/combined-probe.err"
+          grep -q 'COMBINED debug-report-destroyed' "$R/combined-probe.err"
+          grep -q 'COMBINED after-app-close wrapper-mapped=0' "$R/combined-probe.err"
+          grep -q 'COMBINED post-close-dynamic-version result=0' "$R/combined-probe.err"
+          grep -q 'COMBINED PASS' "$R/combined-probe.err"
+
+      - name: Push clean candidate only after all gates pass
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CLEAN_SHA="$(cat "$R/clean-candidate-sha.txt")"
+          test "$(git -C "$PRODUCT" rev-parse HEAD)" = "$CLEAN_SHA"
+          git -C "$PRODUCT" push --force-with-lease origin "HEAD:refs/heads/$CLEAN_BRANCH"
+          printf '%s\n' "$CLEAN_SHA" | tee "$R/PASS.clean-candidate.txt"
+
+      - name: Upload clean-candidate receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex2608-clean-candidate-${{ github.run_id }}
+          path: receipts-clean-candidate
+          retention-days: 30
