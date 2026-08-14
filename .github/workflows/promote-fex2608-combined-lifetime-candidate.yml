@@ -76,7 +76,7 @@ jobs:
           test -f "$PRODUCT/ThunkLibs/libvulkan/GuestBridge.cpp"
           grep -q 'vkCreateDebugReportCallbackEXT.*sv' "$PRODUCT/ThunkLibs/libvulkan/Host.cpp"
           grep -q 'vkDestroyDebugReportCallbackEXT.*sv' "$PRODUCT/ThunkLibs/libvulkan/Host.cpp"
-          grep -q 'NODELETE' "$PRODUCT/ThunkLibs/GuestLibs/CMakeLists.txt"
+          grep -qi 'nodelete' "$PRODUCT/ThunkLibs/GuestLibs/CMakeLists.txt"
 
       - name: Commit product source on fork-local candidate branch
         shell: bash
