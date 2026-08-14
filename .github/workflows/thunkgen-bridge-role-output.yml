@@ -6,6 +6,7 @@ on:
     paths:
       - .github/fieldwork/apply_thunkgen_guest_bridge_output.py
       - .github/fieldwork/apply_thunkgen_bridge_roles.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles_compat.py
       - .github/fieldwork/apply_vulkan_direct_thunkgen_bridge.py
       - .github/fieldwork/thunkgen_bridge_role_fixture.cpp
       - .github/workflows/thunkgen-bridge-role-output.yml
@@ -41,6 +42,7 @@ jobs:
             libvulkan-dev mesa-vulkan-drivers
           python3 .github/fieldwork/apply_thunkgen_guest_bridge_output.py .
           python3 .github/fieldwork/apply_thunkgen_bridge_roles.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles_compat.py .
           python3 .github/fieldwork/apply_vulkan_direct_thunkgen_bridge.py .
           git diff --check
           git diff -- ThunkLibs/Generator ThunkLibs/GuestLibs/CMakeLists.txt ThunkLibs/libvulkan \
