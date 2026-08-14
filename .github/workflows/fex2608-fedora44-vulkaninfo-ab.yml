@@ -151,10 +151,16 @@ jobs:
 
           test -x "$ROOTFS/usr/bin/vulkaninfo"
           file "$ROOTFS/usr/bin/vulkaninfo" | tee "$R/x86-vulkaninfo.file"
-          find "$ROOTFS" \( -type f -o -type l \) -name 'libvulkan.so*' -ls \
+          sudo find "$ROOTFS" \( -type f -o -type l \) -name 'libvulkan.so*' -ls \
             | tee "$R/fedora-vulkan-files.txt" || true
-          HOME=/root rpm --root "$ROOTFS" --dbpath /usr/lib/sysimage/rpm \
-            -q vulkan-tools vulkan-loader glibc libX11 | tee "$R/fedora-packages.txt" || true
+          sudo dnf -q \
+            --installroot="$ROOTFS" \
+            --releasever=44 \
+            --forcearch=x86_64 \
+            --setopt="fedora.gpgkey=file://$FEDORA_KEY" \
+            --setopt="updates.gpgkey=file://$FEDORA_KEY" \
+            list installed vulkan-tools vulkan-loader glibc libX11 \
+            > "$R/fedora-packages.txt" 2>&1 || true
           sudo chown -R "$(id -u):$(id -g)" "$ROOTFS"
 
       - name: Run Fedora 44 normal and NODELETE x86 vulkaninfo
@@ -164,11 +170,11 @@ jobs:
           FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
           LVP="$(cat "$R/lvp.txt")"
           LIB="$ROOTFS/usr/lib64/libvulkan.so.1"
-          mkdir -p "$(dirname "$LIB")"
+          sudo mkdir -p "$(dirname "$LIB")"
           run_case() {
             name="$1"; wrapper="$2"
-            rm -f "$LIB"
-            cp "$wrapper" "$LIB"
+            sudo rm -f "$LIB"
+            sudo cp "$wrapper" "$LIB"
             file "$LIB" > "$R/${name}-wrapper.file"
             set +e
             VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 60s \
