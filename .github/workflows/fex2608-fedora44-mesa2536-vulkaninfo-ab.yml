@@ -53,7 +53,7 @@ jobs:
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxrandr-dev libxrender-dev vulkan-tools libvulkan-dev binutils \
-            meson python3-mako python3-yaml python3-packaging flex bison \
+            python3-venv python3-mako python3-yaml python3-packaging flex bison \
             libdrm-dev libexpat1-dev libelf-dev libzstd-dev glslang-tools \
             dnf xz-utils curl file
           ldconfig -p | grep -F 'libvulkan.so.1' | tee "$R/native-vulkan-loader.txt"
@@ -65,7 +65,12 @@ jobs:
           curl -fL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" -o /tmp/mesa.tar.xz
           echo "${MESA_SHA256}  /tmp/mesa.tar.xz" | sha256sum -c -
           tar -C /tmp -xf /tmp/mesa.tar.xz
-          meson setup /tmp/mesa-build "/tmp/mesa-${MESA_VERSION}" \
+          python3 -m venv /tmp/mesa-meson-venv
+          /tmp/mesa-meson-venv/bin/pip install --disable-pip-version-check 'meson==1.4.2' \
+            > "$R/meson-install.log" 2>&1
+          MESON=/tmp/mesa-meson-venv/bin/meson
+          "$MESON" --version | tee "$R/meson-version.txt"
+          "$MESON" setup /tmp/mesa-build "/tmp/mesa-${MESA_VERSION}" \
             --prefix="$MESA_PREFIX" \
             --buildtype=release \
             -Dgallium-drivers=llvmpipe \
@@ -80,7 +85,7 @@ jobs:
             -Dshared-llvm=enabled \
             > "$R/mesa-configure.log" 2>&1
           ninja -C /tmp/mesa-build -j"$(nproc)" > "$R/mesa-build.log" 2>&1
-          meson install -C /tmp/mesa-build > "$R/mesa-install.log" 2>&1
+          "$MESON" install -C /tmp/mesa-build > "$R/mesa-install.log" 2>&1
           find "$MESA_PREFIX/share/vulkan/icd.d" -type f -maxdepth 1 -print | tee "$R/mesa-icds.txt"
           LVP="$(find "$MESA_PREFIX/share/vulkan/icd.d" -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
           test -n "$LVP"
