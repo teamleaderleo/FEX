@@ -1,4 +1,7 @@
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #include "common/Guest.h"
+#pragma GCC diagnostic pop
 
 #include <atomic>
 #include <cerrno>
