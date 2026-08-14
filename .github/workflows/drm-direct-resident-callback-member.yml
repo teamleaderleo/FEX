@@ -1,0 +1,173 @@
+name: DRM direct callback_member resident bridge
+
+on:
+  push:
+    branches: [diagnostic/drm-direct-resident-callback-member-20260814]
+    paths:
+      - LinuxFieldwork/apply_drm_direct_resident_callback_member_bridge.py
+      - LinuxFieldwork/drm_event_callback_probe.c
+      - .github/workflows/drm-direct-resident-callback-member.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drm-direct:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      SOURCE_SHA: c348a19d91219d4df6cdaa86839607565e001fa2
+      ROOTFS: ${{ github.workspace }}/rootfs-drm-direct
+      R: ${{ github.workspace }}/drm-direct-receipts
+      H: ${{ github.workspace }}/host-drm-direct
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and clean-source provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          git cat-file -e "$SOURCE_SHA^{commit}"
+          git diff --name-only "$SOURCE_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libdrm-dev libgl-dev binutils
+
+      - name: Native pipe-fed callback control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cc -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
+            LinuxFieldwork/drm_event_callback_probe.c -ldl -o "$R/native-probe"
+          "$R/native-probe" > "$R/native.stdout" 2> "$R/native.stderr"
+          echo $? | tee "$R/native.exit"
+          cat "$R/native.stderr"
+          grep -q 'DRM_CALLBACK count=1' "$R/native.stderr"
+          grep -q 'MARK handle-return rc=0 callbacks=1' "$R/native.stderr"
+
+      - name: Apply direct resident callback_member transform
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_drm_direct_resident_callback_member_bridge.py | tee "$R/transform.txt"
+          git add -N ThunkLibs/libdrm_bridge/Guest.cpp
+          git diff --check
+          git diff -- ThunkLibs > "$R/source.diff"
+          git diff --name-only -- ThunkLibs | sort | tee "$R/source-files.txt"
+          cat > "$R/expected-source-files.txt" <<'EOF'
+          ThunkLibs/GuestLibs/CMakeLists.txt
+          ThunkLibs/libdrm/Guest.cpp
+          ThunkLibs/libdrm/libdrm_interface.cpp
+          ThunkLibs/libdrm_bridge/Guest.cpp
+          EOF
+          diff -u "$R/expected-source-files.txt" "$R/source-files.txt"
+          grep -q 'fex_gen_config<&drmEventContext::vblank_handler> : fexgen::callback_member' ThunkLibs/libdrm/libdrm_interface.cpp
+          grep -q 'fex_gen_config<&drmEventContext::page_flip_handler> : fexgen::callback_member' ThunkLibs/libdrm/libdrm_interface.cpp
+          grep -q 'fex_gen_config<&drmEventContext::page_flip_handler2> : fexgen::callback_member' ThunkLibs/libdrm/libdrm_interface.cpp
+          grep -q 'fex_gen_config<&drmEventContext::sequence_handler> : fexgen::callback_member' ThunkLibs/libdrm/libdrm_interface.cpp
+          grep -q '#include "thunkgen_bridge_accessors_libdrm.inl"' ThunkLibs/libdrm/Guest.cpp
+          grep -q '#define AllocateHostTrampolineForGuestFunction FEXAllocateResidentHostTrampolineForGuestFunction' ThunkLibs/libdrm/Guest.cpp
+          grep -q 'add_guest_bridge(drm_bridge "libfex-drm-bridge.so"' ThunkLibs/GuestLibs/CMakeLists.txt
+
+      - name: Build FEX, DRM host thunk, wrapper and companion
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer drm-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 360 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libdrm-host.so "$H/libdrm-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target drm-guest drm_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 420 "$R/build-guest.log"; exit 1; }
+
+      - name: Verify direct roles and ELF ownership
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f guest/gen/thunkgen_bridge_libdrm.inl
+          test -f guest/gen/thunkgen_bridge_accessors_libdrm.inl
+          cp guest/gen/thunkgen_bridge_libdrm.inl "$R/drm-bridge.inl"
+          cp guest/gen/thunkgen_bridge_accessors_libdrm.inl "$R/drm-accessors.inl"
+
+          grep 'FEX_BRIDGE_ROLE' "$R/drm-bridge.inl" | tee "$R/drm-role-lines.txt"
+          test "$(grep -c 'caller=0 unpacker=1' "$R/drm-role-lines.txt")" -eq 3
+          ! grep -q 'caller=1' "$R/drm-role-lines.txt"
+          test "$(wc -l < "$R/drm-role-lines.txt")" -eq 3
+
+          grep -n -E 'fex_callback_copy_.*vblank_handler = AllocateHostTrampolineForGuestFunction' \
+            guest/gen/thunkgen_guest_libdrm.inl | tee "$R/generated-nested-marker.txt"
+          grep -n 'FEXAllocateResidentHostTrampolineForGuestFunction' "$R/drm-accessors.inl" \
+            | tee "$R/resident-accessor-marker.txt"
+
+          readelf -d guest/libdrm-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest/libfex-drm-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-drm-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'RUNPATH.*\$ORIGIN' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          size guest/libdrm-guest.so guest/libfex-drm-bridge.so | tee "$R/size.txt"
+          echo DRM_DIRECT_BUILD_ELF_OK | tee "$R/build-gate.txt"
+
+      - name: Prepare amd64 rootfs and guest callback probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libdrm-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libdrm.so.2"
+          cp guest/libfex-drm-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-drm-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
+            LinuxFieldwork/drm_event_callback_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/drm-event-probe"
+
+      - name: Execute direct resident callback_member path
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 30s \
+            build/Bin/FEX /opt/fex-ci/drm-event-probe \
+            > "$R/candidate.stdout" 2> "$R/candidate.stderr"
+          rc=$?
+          echo "$rc" | tee "$R/candidate.exit"
+          cat "$R/candidate.stderr"
+          test "$rc" -eq 0
+          grep -q 'DRM_CALLBACK count=1' "$R/candidate.stderr"
+          grep -q 'MARK handle-return rc=0 callbacks=1' "$R/candidate.stderr"
+          echo DRM_DIRECT_CALLBACK_OK | tee "$R/runtime-gate.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drm-direct-resident-callback-${{ github.run_id }}
+          path: drm-direct-receipts
+          retention-days: 30
