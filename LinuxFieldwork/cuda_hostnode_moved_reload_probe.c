@@ -35,37 +35,62 @@ static void callback_entry(void *user) { callback_body(user); }
 
 struct range { uintptr_t lo, hi; };
 static int line_for_addr(uintptr_t addr, char *path, size_t path_size) {
-  FILE *f = fopen("/proc/self/maps", "r"); if (!f) return -1;
+  FILE *f = fopen("/proc/self/maps", "r");
+  if (!f) return -1;
   char line[4096];
   while (fgets(line, sizeof(line), f)) {
-    unsigned long long lo, hi, off, inode; char perms[8], dev[32], mapped[2048] = {0};
+    unsigned long long lo, hi, off, inode;
+    char perms[8], dev[32], mapped[2048] = {0};
     int n = sscanf(line, "%llx-%llx %7s %llx %31s %llu %2047[^\n]", &lo, &hi, perms, &off, dev, &inode, mapped);
     if (n >= 6 && addr >= (uintptr_t)lo && addr < (uintptr_t)hi) {
-      if (n == 7) { char *p = mapped; while (*p == ' ' || *p == '\t') ++p; snprintf(path, path_size, "%s", p); }
-      else path[0] = 0;
-      fclose(f); return 0;
+      if (n == 7) {
+        char *p = mapped;
+        while (*p == ' ' || *p == '\t') ++p;
+        snprintf(path, path_size, "%s", p);
+      } else {
+        path[0] = 0;
+      }
+      fclose(f);
+      return 0;
     }
   }
-  fclose(f); return -1;
+  fclose(f);
+  return -1;
 }
 static int collect_path_ranges(const char *path, struct range *out, size_t cap) {
-  FILE *f = fopen("/proc/self/maps", "r"); if (!f) return -1;
-  char line[4096]; size_t count = 0;
+  FILE *f = fopen("/proc/self/maps", "r");
+  if (!f) return -1;
+  char line[4096];
+  size_t count = 0;
   while (fgets(line, sizeof(line), f)) {
-    unsigned long long lo, hi, off, inode; char perms[8], dev[32], mapped[2048] = {0};
+    unsigned long long lo, hi, off, inode;
+    char perms[8], dev[32], mapped[2048] = {0};
     int n = sscanf(line, "%llx-%llx %7s %llx %31s %llu %2047[^\n]", &lo, &hi, perms, &off, dev, &inode, mapped);
-    if (n != 7) continue; char *p = mapped; while (*p == ' ' || *p == '\t') ++p;
-    if (strcmp(p, path) != 0) continue; if (count >= cap) { fclose(f); return -2; }
+    if (n != 7) continue;
+    char *p = mapped;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (strcmp(p, path) != 0) continue;
+    if (count >= cap) {
+      fclose(f);
+      return -2;
+    }
     out[count++] = (struct range){(uintptr_t)lo, (uintptr_t)hi};
   }
-  fclose(f); return (int)count;
+  fclose(f);
+  return (int)count;
 }
-static int addr_mapped(uintptr_t addr) { char p[2048]; return line_for_addr(addr, p, sizeof(p)) == 0; }
+static int addr_mapped(uintptr_t addr) {
+  char p[2048];
+  return line_for_addr(addr, p, sizeof(p)) == 0;
+}
 static int reserve_ranges(const struct range *ranges, int count) {
   for (int i = 0; i < count; ++i) {
     size_t len = ranges[i].hi - ranges[i].lo;
     void *p = mmap((void *)ranges[i].lo, len, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE, -1, 0);
-    if (p == MAP_FAILED) { fprintf(stderr, "RESERVE_FAIL %p-%p errno=%d %s\n", (void*)ranges[i].lo, (void*)ranges[i].hi, errno, strerror(errno)); return -1; }
+    if (p == MAP_FAILED) {
+      fprintf(stderr, "RESERVE_FAIL %p-%p errno=%d %s\n", (void*)ranges[i].lo, (void*)ranges[i].hi, errno, strerror(errno));
+      return -1;
+    }
     fprintf(stderr, "RESERVED %p-%p\n", (void*)ranges[i].lo, (void*)ranges[i].hi);
   }
   return 0;
@@ -80,7 +105,8 @@ int main(void) {
 
   char wrapper_path[2048];
   if (line_for_addr((uintptr_t)add1, wrapper_path, sizeof(wrapper_path)) != 0 || !wrapper_path[0]) return 77;
-  struct range ranges[32]; int range_count = collect_path_ranges(wrapper_path, ranges, 32);
+  struct range ranges[32];
+  int range_count = collect_path_ranges(wrapper_path, ranges, 32);
   if (range_count <= 0) { fprintf(stderr, "SKIP ranges=%d path=%s\n", range_count, wrapper_path); return 77; }
 
   CUDA_HOST_NODE_PARAMS params = { .fn = callback_entry, .userData = (void*)(uintptr_t)0x12345678 };
