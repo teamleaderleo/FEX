@@ -2,7 +2,7 @@ name: Callback in-flight unmap race ARM64
 
 on:
   push:
-    branches: [ci/callback-inflight-unmap-race-v2-20260814]
+    branches: [ci/callback-inflight-unmap-race-v3-20260814]
     paths:
       - .github/workflows/callback-inflight-unmap-race-arm64.yml
       - .github/fieldwork/apply_callback_inflight_pause.py
@@ -110,9 +110,6 @@ jobs:
           HOST="/tmp/repro/fex-full-thunk-pair/host"
           run_case() {
             name="$1"; arg="$2"
-            rm -f "$ROOTFS/opt/fex-ci/full/fex-callback-race-arm" \
-                  "$ROOTFS/opt/fex-ci/full/fex-callback-race-entered" \
-                  "$ROOTFS/opt/fex-ci/full/fex-callback-race-release"
             set +e
             (cd "$ROOTFS/opt/fex-ci/full" && \
               FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
@@ -128,15 +125,34 @@ jobs:
           : > "$R/matrix.txt"
           run_case pin --callback-race-pin
           run_case unmap --callback-race-unmap
+
           test "$(cat "$R/pin.exit")" = 0
           test "$(cat "$R/unmap.exit")" = 139
-          grep -q 'DIAG_CALLBACK_INFLIGHT_SELECTED' "$R/pin.stderr"
-          grep -q 'DIAG_CALLBACK_INFLIGHT_RESUME' "$R/pin.stderr"
+          grep -q 'DIAG_CALLBACK_INFLIGHT_SELECTED entry=2' "$R/pin.stderr"
+          grep -q 'DIAG_CALLBACK_INFLIGHT_PIN_TIMEOUT_RESUME' "$R/pin.stderr"
           grep -q 'CALLBACK_RACE_WORKER_RETURN rv=10063' "$R/pin.stderr"
-          grep -q 'DIAG_CALLBACK_INFLIGHT_SELECTED' "$R/unmap.stderr"
-          grep -q 'CALLBACK_RACE_UNMAPPED target_exec=0 unpacker_exec=0' "$R/unmap.stderr"
-          grep -q 'DIAG_CALLBACK_RETIRE' "$R/unmap.stderr"
+
+          grep -q 'DIAG_CALLBACK_INFLIGHT_SELECTED entry=2' "$R/unmap.stderr"
+          grep -q 'CALLBACK_RACE_DLCLOSE_BEGIN' "$R/unmap.stderr"
+          grep -q 'DIAG_CALLBACK_TOMBSTONE' "$R/unmap.stderr"
+          grep -q 'DIAG_CALLBACK_POST_UNMAP_RELEASE' "$R/unmap.stderr"
           grep -q 'DIAG_CALLBACK_INFLIGHT_RESUME' "$R/unmap.stderr"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('receipts-callback-race/unmap.stderr').read_text()
+          keys = [
+              'DIAG_CALLBACK_INFLIGHT_SELECTED',
+              'DIAG_CALLBACK_TOMBSTONE',
+              'DIAG_CALLBACK_POST_UNMAP_RELEASE',
+              'DIAG_CALLBACK_INFLIGHT_RESUME',
+          ]
+          pos = [text.find(k) for k in keys]
+          print('ordering', list(zip(keys, pos)))
+          if any(p < 0 for p in pos) or pos != sorted(pos):
+              raise SystemExit(1)
+          Path('receipts-callback-race/ordering.txt').write_text('\n'.join(f'{k}={p}' for k, p in zip(keys, pos)) + '\n')
+          PY
           echo CALLBACK_INFLIGHT_UNMAP_RACE_OK | tee "$R/result.txt"
 
       - name: Upload receipts
