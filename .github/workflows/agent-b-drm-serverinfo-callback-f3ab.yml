@@ -1,4 +1,4 @@
-name: Agent B DRM server-info callback bridge diagnostic
+name: Agent B DRM retained callback moved-reload lifetime
 
 on:
   push:
@@ -23,14 +23,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 5
+          fetch-depth: 7
 
       - name: Dependencies and provenance
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$R" "$HOST"
-          git log --oneline -5 | tee "$R/lineage.txt"
+          git log --oneline -7 | tee "$R/lineage.txt"
           git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
           test ! -s "$R/pre-patch-product-source-diff.txt"
           sudo apt-get update
@@ -38,7 +38,7 @@ jobs:
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libdrm-dev libgl-dev
 
-      - name: Native persistent-callback control
+      - name: Native retained-callback precondition
         shell: bash
         run: |
           set -uxo pipefail
@@ -55,7 +55,7 @@ jobs:
           else
             test "$rc" = 0
             grep -q 'DRM_SERVER_CALLBACK count=1' "$R/native.stderr"
-            grep -q 'MARK open-return' "$R/native.stderr"
+            grep -q 'MARK open-return fd=-1 callbacks=1' "$R/native.stderr"
             echo 'supported=yes' >> "$GITHUB_ENV"
           fi
 
@@ -69,7 +69,7 @@ jobs:
           git diff -- ThunkLibs/libdrm/libdrm_interface.cpp ThunkLibs/libdrm/Guest.cpp ThunkLibs/libdrm/Host.cpp | tee "$R/drm-serverinfo-bridge.diff"
           test "$(git diff --name-only -- ThunkLibs FEXCore Source | sort | tr '\n' ' ')" = 'ThunkLibs/libdrm/Guest.cpp ThunkLibs/libdrm/Host.cpp ThunkLibs/libdrm/libdrm_interface.cpp '
 
-      - name: Build candidate FEX and DRM thunks
+      - name: Build converted unloadable DRM wrapper
         if: env.supported == 'yes'
         shell: bash
         run: |
@@ -88,8 +88,10 @@ jobs:
             -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
             -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
           cmake --build guest-build --target drm-guest -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1 || { tail -n 200 "$R/build-guest.log"; exit 1; }
+          readelf -d guest-build/libdrm-guest.so | tee "$R/guest-dynamic.txt"
+          ! grep -q NODELETE "$R/guest-dynamic.txt"
 
-      - name: Prepare amd64 rootfs
+      - name: Prepare amd64 rootfs and moved-reload probe
         if: env.supported == 'yes'
         shell: bash
         run: |
@@ -106,36 +108,52 @@ jobs:
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
-            LinuxFieldwork/drm_serverinfo_callback_probe.c -ldl -o "$ROOTFS/opt/fex-ci/drm-server-probe"
+            LinuxFieldwork/drm_serverinfo_moved_reload_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/drm-server-moved-probe"
 
-      - name: Execute candidate persistent callback
+      - name: Execute retained callback after forced moved wrapper reload
         if: env.supported == 'yes'
         shell: bash
         run: |
           set -uxo pipefail
           set +e
           FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
-            "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/drm-server-probe \
-            > "$R/candidate.stdout" 2> "$R/candidate.stderr"
-          candidate_rc=$?
+            "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/drm-server-moved-probe \
+            > "$R/moved.stdout" 2> "$R/moved.stderr"
+          moved_rc=$?
           set -e
-          echo "$candidate_rc" > "$R/candidate.exit"
-          printf 'native=%s\npristine_reference=132\ncandidate=%s\n' "$(cat "$R/native.exit")" "$candidate_rc" | tee "$R/final-matrix.txt"
-          cat "$R/candidate.stderr"
-          test "$candidate_rc" = 0
-          grep -q 'DRM_SERVER_CALLBACK count=1' "$R/candidate.stderr"
-          grep -q 'MARK set-info-return count=0' "$R/candidate.stderr"
-          grep -q 'MARK open-return fd=-1 callbacks=1' "$R/candidate.stderr"
+          echo "$moved_rc" > "$R/moved.exit"
+          printf 'native_precondition=%s\nconverted_loaded_reference=0\nmoved_reload=%s\n' "$(cat "$R/native.exit")" "$moved_rc" | tee "$R/final-matrix.txt"
+          cat "$R/moved.stderr"
+
+          # This lane is evidentiary even when the stale unpacker crashes. Require the
+          # lifecycle fixture itself to have completed: physical unload and moved gen2.
+          grep -q 'MARK close1-return old_set_mapped=0' "$R/moved.stderr"
+          grep -q 'GEN2 .* moved=1' "$R/moved.stderr"
+          grep -q 'MARK open2-enter retained-registration-only' "$R/moved.stderr"
+
+          # Passing all the way through would falsify the expected wrapper-owned-unpacker hazard.
+          if [ "$moved_rc" -eq 0 ]; then
+            grep -q 'DRM_SERVER_CALLBACK count=1' "$R/moved.stderr"
+            grep -q 'MARK open2-return fd=-1 callbacks=1' "$R/moved.stderr"
+            echo 'OUTCOME=retained_callback_survived_physical_moved_reload' | tee -a "$R/final-matrix.txt"
+          else
+            test "$moved_rc" -ne 77
+            test "$moved_rc" -ne 78
+            ! grep -q 'DRM_SERVER_CALLBACK count=1' "$R/moved.stderr"
+            ! grep -q 'MARK open2-return' "$R/moved.stderr"
+            echo 'OUTCOME=retained_callback_failed_after_physical_moved_reload' | tee -a "$R/final-matrix.txt"
+          fi
 
       - name: Record unavailable control
         if: env.supported != 'yes'
         shell: bash
-        run: echo 'Hosted runner has DRM available; persistent load_module path not deterministic in this lane.' | tee "$R/final-matrix.txt"
+        run: echo 'Hosted runner has DRM available; retained load_module path not deterministic in this lane.' | tee "$R/final-matrix.txt"
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-b-drm-serverinfo-bridge-${{ github.run_id }}
+          name: agent-b-drm-serverinfo-moved-reload-${{ github.run_id }}
           path: receipts
           retention-days: 30
