@@ -46,7 +46,7 @@ jobs:
         run: |
           set -euxo pipefail
           cc -O2 -Wall -Wextra -Werror -IExternal/Vulkan-Headers/include \
-            LinuxFieldwork/device_memory_report_probe.c -ldl -lvulkan -o "$R/native-probe"
+            LinuxFieldwork/device_memory_report_probe.c -ldl -o "$R/native-probe"
           ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
           set +e
           VK_DRIVER_FILES="$ICD" "$R/native-probe" --support > "$R/support.stdout" 2> "$R/support.stderr"
@@ -102,7 +102,7 @@ jobs:
           x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 \
             /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
           x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -IExternal/Vulkan-Headers/include \
-            LinuxFieldwork/device_memory_report_probe.c -ldl -lvulkan -o "$ROOTFS/opt/fex-ci/mem-report-probe"
+            LinuxFieldwork/device_memory_report_probe.c -ldl -o "$ROOTFS/opt/fex-ci/mem-report-probe"
 
       - name: Execute native and FEX callback path
         if: steps.support.outputs.supported == 'yes'
