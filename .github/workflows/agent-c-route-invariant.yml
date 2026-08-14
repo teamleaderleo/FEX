@@ -1,0 +1,74 @@
+name: Agent C Vulkan custom route inventory
+
+on:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths:
+      - .github/workflows/agent-c-route-invariant.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: 71afe476751deac24adabd1adb575fd2337b6e0a
+          path: baseline
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: test/vulkan-custom-route-invariant
+          path: candidate
+          fetch-depth: 1
+
+      - name: Baseline must expose the routing drift
+        shell: bash
+        run: |
+          set -euxo pipefail
+          set +e
+          python3 candidate/unittests/ThunkLibs/vulkan_custom_route_inventory.py baseline \
+            >baseline-inventory.txt 2>&1
+          rc=$?
+          set -e
+          cat baseline-inventory.txt
+          test "$rc" = 1
+          grep -F 'vkCreateDebugReportCallbackEXT' baseline-inventory.txt
+          grep -F 'vkDestroyDebugReportCallbackEXT' baseline-inventory.txt
+          grep -F 'vkCreateDebugUtilsMessengerEXT' baseline-inventory.txt
+
+      - name: Clean candidate must satisfy both ABI inventories
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 candidate/unittests/ThunkLibs/vulkan_custom_route_inventory.py candidate \
+            | tee candidate-inventory.txt
+          grep -F 'x86_64: custom_host_impl=12 lookup=12' candidate-inventory.txt
+          grep -F 'x86_32: custom_host_impl=21 lookup=21' candidate-inventory.txt
+          test "$(grep -c 'missing: (none)' candidate-inventory.txt)" = 2
+          test "$(grep -c 'lookup-only: (none)' candidate-inventory.txt)" = 2
+
+      - name: Receipt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          {
+            echo 'baseline=71afe476751deac24adabd1adb575fd2337b6e0a'
+            echo "test_branch=$(git -C candidate rev-parse HEAD)"
+            echo 'baseline_expected_exit=1'
+            echo 'candidate_expected_exit=0'
+          } | tee inventory-receipt.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-route-invariant-${{ github.run_id }}
+          path: |
+            baseline-inventory.txt
+            candidate-inventory.txt
+            inventory-receipt.txt
+          retention-days: 30
