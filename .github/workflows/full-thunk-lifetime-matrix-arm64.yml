@@ -1,4 +1,4 @@
-name: Thunk exact all-cache rebind diagnostic ARM64
+name: Thunk cache-indexed rebind candidate ARM64
 
 on:
   push:
@@ -16,7 +16,7 @@ jobs:
       FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
       FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
       ROOTFS: ${{ github.workspace }}/rootfs-amd64
-      R: ${{ github.workspace }}/receipts-rebind
+      R: ${{ github.workspace }}/receipts-cache-index
       FEX_PORTABLE: 1
       DEBIAN_FRONTEND: noninteractive
 
@@ -45,163 +45,93 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
             gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'fex=%s\nfieldwork=%s\ncarrier=%s\n' \
+            "$(git -C src rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" "$GITHUB_SHA" > "$R/identity.txt"
           base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
           echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
           mkdir /tmp/repro
           tar xf /tmp/repro.tar.gz -C /tmp/repro
 
-      - name: Apply exact all-cache invalidation diagnostic
+      - name: Apply cache-indexed rebind candidate
         shell: bash
         run: |
           set -euxo pipefail
           python3 - <<'PY'
           from pathlib import Path
 
-          def repl(path, old, new, label):
-              p=Path(path); s=p.read_text()
-              if old not in s: raise SystemExit(f'{label} missing')
-              p.write_text(s.replace(old,new,1))
+          p = Path('src/FEXCore/Source/Interface/Core/LookupCache.h')
+          s = p.read_text()
+          old = '''    return BlockList.insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, CodePages}).first->second;
+          }'''
+          new = '''    auto& Entry = BlockList.insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, CodePages}).first->second;
+            // Custom-IR blocks have no decoded guest CodePages, but still need a
+            // cache-retirement index for RemoveCustomIREntrypoint's range invalidation.
+            if (CodePages.empty()) {
+              this->CodePages[Address >> 12].push_back(Address);
+            }
+            return Entry;
+          }'''
+          if old not in s:
+              raise SystemExit('shared AddBlockMapping site missing')
+          s = s.replace(old, new, 1)
 
-          lc='src/FEXCore/Source/Interface/Core/LookupCache.h'
-          repl(lc,
-               '  void InvalidateRange(uint64_t Start, uint64_t Length) {\n    auto lk = AcquireWriteLock();',
-               '''  bool InvalidateExactEntry(uint64_t Address) {
-                 auto lk = AcquireWriteLock();
-                 return Erase(Address, lk);
-               }
+          old = '''    for (const auto& CodePage : Entry.CodePages) {
+              CachedCodePages[CodePage >> 12].insert(Address);
+            }
 
-               void InvalidateRange(uint64_t Start, uint64_t Length) {
-                 auto lk = AcquireWriteLock();''',
-               'shared exact')
-          repl(lc,
-               '  // Invalidates all L1/L2 entries for all guest block that intersect the given range\n  bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {',
-               '''  void InvalidateExactEntry(uint64_t Address) {
-                 auto lk = Shared->AcquireWriteLock();
-                 InvalidateCache(Address, lk);
-               }
+            // Do L1'''
+          new = '''    if (Entry.CodePages.empty()) {
+              CachedCodePages[Address >> 12].insert(Address);
+            } else {
+              for (const auto& CodePage : Entry.CodePages) {
+                CachedCodePages[CodePage >> 12].insert(Address);
+              }
+            }
 
-               // Invalidates all L1/L2 entries for all guest block that intersect the given range
-               bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {''',
-               'local exact')
+            // Do L1'''
+          if old not in s:
+              raise SystemExit('local CacheBlockMapping site missing')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
 
-          pub='src/FEXCore/include/FEXCore/Core/Context.h'
-          repl(pub,
-               '  FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;',
-               '''  FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
-               FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeEntry(uint64_t Address) = 0;''',
-               'public shared exact decl')
-          repl(pub,
-               'InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;',
-               '''InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
-               FEX_DEFAULT_VISIBILITY virtual void
-               InvalidateThreadCachedCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) = 0;''',
-               'public local exact decl')
+          core = Path('src/FEXCore/Source/Interface/Core/Core.cpp')
+          s = core.read_text()
+          old = '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  HasCustomIRHandlers = true;'
+          new = '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  fprintf(stderr, "DIAG_CUSTOM_ADD H=%#lx inserted=%d data=%p\\n", Entrypoint, InsertedIterator.second ? 1 : 0, Data);\n  HasCustomIRHandlers = true;'
+          if old not in s:
+              raise SystemExit('custom add trace site missing')
+          s = s.replace(old, new, 1)
 
-          impl='src/FEXCore/Source/Interface/Context/Context.h'
-          repl(impl,
-               '  void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;',
-               '''  void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
-               void InvalidateCodeBuffersCodeEntry(uint64_t Address) override;''',
-               'impl shared exact decl')
-          repl(impl,
-               '  void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;',
-               '''  void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
-               void InvalidateThreadCachedCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override;''',
-               'impl local exact decl')
+          old = '  CustomIRHandlers.erase(Entrypoint);\n  HasCustomIRHandlers = !CustomIRHandlers.empty();\n  SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);'
+          new = '  auto Erased = CustomIRHandlers.erase(Entrypoint);\n  HasCustomIRHandlers = !CustomIRHandlers.empty();\n  SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);\n  fprintf(stderr, "DIAG_CUSTOM_REMOVE_RANGE H=%#lx handler=%zu\\n", Entrypoint, Erased);'
+          if old not in s:
+              raise SystemExit('custom remove trace site missing')
+          s = s.replace(old, new, 1)
 
-          core='src/FEXCore/Source/Interface/Core/Core.cpp'
-          repl(core,
-               'void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {',
-               '''void ContextImpl::InvalidateCodeBuffersCodeEntry(uint64_t Address) {
-                 LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
-                 std::scoped_lock lk {CodeBufferListLock};
-                 size_t Erased = 0;
-                 for (auto it = CodeBufferList.begin(); it != CodeBufferList.end();) {
-                   if (auto Strong = it->lock()) {
-                     Erased += Strong->LookupCache->InvalidateExactEntry(Address) ? 1 : 0;
-                     ++it;
-                   } else {
-                     it = CodeBufferList.erase(it);
-                   }
-                 }
-                 fprintf(stderr, "DIAG_EXACT_SHARED H=%#lx erased=%zu\\n", Address, Erased);
-               }
-
-               void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {''',
-               'core shared exact')
-          repl(core,
-               'void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {',
-               '''void ContextImpl::InvalidateThreadCachedCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
-                 LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
-                 Thread->LookupCache->InvalidateExactEntry(Address);
-                 fprintf(stderr, "DIAG_EXACT_LOCAL H=%#lx thread=%p\\n", Address, Thread);
-               }
-
-               void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {''',
-               'core local exact')
-
-          sh='src/FEXCore/include/FEXCore/HLE/SyscallHandler.h'
-          repl(sh,
-               '  virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}',
-               '''  virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
-               virtual void InvalidateGuestCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {}''',
-               'syscall exact virtual')
-
-          tm='src/Source/Tools/LinuxEmulation/LinuxSyscalls/ThreadManager.h'
-          repl(tm,
-               '  void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {\n    std::lock_guard lk(ThreadCreationMutex);',
-               '''  void InvalidateGuestCodeEntry(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Address) {
-                 std::lock_guard lk(ThreadCreationMutex);
-                 auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), CallingThread);
-                 CTX->InvalidateCodeBuffersCodeEntry(Address);
-                 for (auto& Thread : Threads) {
-                   CTX->InvalidateThreadCachedCodeEntry(Thread->Thread, Address);
-                 }
-               }
-
-               void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
-                 std::lock_guard lk(ThreadCreationMutex);''',
-               'threadmanager exact')
-
-          sys='src/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.h'
-          repl(sys,
-               '  uint64_t GuestMprotect(FEXCore::Core::InternalThreadState*, void* addr, size_t len, int prot);',
-               '''  uint64_t GuestMprotect(FEXCore::Core::InternalThreadState*, void* addr, size_t len, int prot);
-               void InvalidateGuestCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
-                 TM.InvalidateGuestCodeEntry(Thread, Address);
-               }''',
-               'linux exact override')
-
-          repl(core,
-               '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  HasCustomIRHandlers = true;',
-               '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  fprintf(stderr, "DIAG_CUSTOM_ADD H=%#lx inserted=%d data=%p\\n", Entrypoint, InsertedIterator.second ? 1 : 0, Data);\n  HasCustomIRHandlers = true;',
-               'custom add trace')
-          repl(core,
-               '  CustomIRHandlers.erase(Entrypoint);\n  HasCustomIRHandlers = !CustomIRHandlers.empty();\n  SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);',
-               '  auto Erased = CustomIRHandlers.erase(Entrypoint);\n  HasCustomIRHandlers = !CustomIRHandlers.empty();\n  SyscallHandler->InvalidateGuestCodeEntry(Thread, Entrypoint);\n  fprintf(stderr, "DIAG_CUSTOM_REMOVE H=%#lx handler=%zu\\n", Entrypoint, Erased);',
-               'custom exact retire')
-
-          p=Path(core); s=p.read_text()
-          fn=s.find('void ContextImpl::AddThunkTrampolineIRHandler')
-          if fn < 0: raise SystemExit('thunk handler function missing')
-          start=s.find('    if (Result->Data != (void*)GuestThunkEntrypoint) {', fn)
-          if start < 0: raise SystemExit('duplicate block start missing')
-          tail='\n    }\n  }\n}\n\nvoid ContextImpl::AddForceTSOInformation'
-          close=s.find(tail, start)
-          if close < 0: raise SystemExit('duplicate block end missing')
-          end=close + len('\n    }')
-          new='''    if (Result->Data != (void*)GuestThunkEntrypoint) {
+          fn = s.find('void ContextImpl::AddThunkTrampolineIRHandler')
+          if fn < 0:
+              raise SystemExit('thunk handler function missing')
+          start = s.find('    if (Result->Data != (void*)GuestThunkEntrypoint) {', fn)
+          if start < 0:
+              raise SystemExit('duplicate block start missing')
+          tail = '\n    }\n  }\n}\n\nvoid ContextImpl::AddForceTSOInformation'
+          close = s.find(tail, start)
+          if close < 0:
+              raise SystemExit('duplicate block end missing')
+          end = close + len('\n    }')
+          new = '''    if (Result->Data != (void*)GuestThunkEntrypoint) {
               fprintf(stderr, "DIAG_DUP H=%#lx OLD=%p NEW=%#lx\\n", Entrypoint, Result->Data, GuestThunkEntrypoint);
               RemoveCustomIREntrypoint(nullptr, Entrypoint);
               AddThunkTrampolineIRHandler(Entrypoint, GuestThunkEntrypoint);
               return;
             }'''
-          p.write_text(s[:start] + new + s[end:])
+          core.write_text(s[:start] + new + s[end:])
           PY
           git -C src diff --check
-          git -C src diff > "$R/exact-all-cache.diff"
+          git -C src diff -- FEXCore/Source/Interface/Core/LookupCache.h FEXCore/Source/Interface/Core/Core.cpp > "$R/cache-index.diff"
+          cat "$R/cache-index.diff"
 
-      - name: Build diagnostic FEX and full thunk pair
+      - name: Build candidate FEX and full thunk pair
         shell: bash
         run: |
           set -euxo pipefail
@@ -211,9 +141,8 @@ jobs:
             -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
             -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
           cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
-          cd /tmp/repro/fex-full-thunk-pair
-          make clean
-          make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/build-full-pair.log" 2>&1
+          make -C /tmp/repro/fex-full-thunk-pair clean
+          make -C /tmp/repro/fex-full-thunk-pair HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/build-full-pair.log" 2>&1
 
       - name: Prepare rootfs
         shell: bash
@@ -243,7 +172,7 @@ jobs:
           rc=$?
           set -e
           echo "$rc" > "$R/rebind.exit"
-          grep -E 'DIAG_|generation|reload|re-register|retained|fresh|callback|native host stable' "$R/rebind.stdout" "$R/rebind.stderr" > "$R/key-lines.txt" || true
+          grep -E 'DIAG_|generation|reload|re-register|retained|fresh|callback|native host stable|signal=|exit=' "$R/rebind.stdout" "$R/rebind.stderr" > "$R/key-lines.txt" || true
           cat "$R/key-lines.txt"
           exit 0
 
@@ -251,6 +180,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: thunk-exact-all-cache-rebind-${{ github.run_id }}
-          path: receipts-rebind
+          name: thunk-cache-index-rebind-${{ github.run_id }}
+          path: receipts-cache-index
           retention-days: 30
