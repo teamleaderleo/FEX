@@ -1,0 +1,66 @@
+name: Thunkgen const pointee unit
+
+on:
+  push:
+    branches: [ci/thunkgen-const-pointee-unit-20260814]
+    paths:
+      - .github/workflows/thunkgen-const-pointee-unit.yml
+      - ThunkLibs/Generator/gen.cpp
+      - unittests/ThunkLibs/generator.cpp
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  thunkgen-const-pointee:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      R: ${{ github.workspace }}/receipts-const-pointee
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Checkout exact carrier
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Dependencies and identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          printf 'head=%s\nparent=%s\n' "$(git rev-parse HEAD)" "$(git rev-parse HEAD^)" | tee "$R/identity.txt"
+          test "$(git rev-parse HEAD^)" = "715ff36bff2fd9f2353ab31613dc41ae106f3938"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev nasm pkg-config libcap-dev
+
+      - name: Configure thunkgen tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DX86_DEV_ROOTFS=/ \
+            2>&1 | tee "$R/cmake.log"
+
+      - name: Run generic thunkgen regression
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake --build build --target thunkgen_tests -- -j2 2>&1 | tee "$R/thunkgen-tests.log"
+          grep -E 'StructRepacking|100% tests passed|tests passed' "$R/thunkgen-tests.log" > "$R/key-lines.txt" || true
+          git diff HEAD^..HEAD -- ThunkLibs/Generator/gen.cpp unittests/ThunkLibs/generator.cpp > "$R/candidate.diff"
+          printf 'THUNKGEN_CONST_POINTEE_UNIT_OK\n' | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunkgen-const-pointee-unit-${{ github.run_id }}
+          path: receipts-const-pointee
+          retention-days: 30
