@@ -1,0 +1,62 @@
+name: Agent C Vulkan route invariant CTest
+
+on:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths:
+      - .github/workflows/agent-c-route-invariant-ctest.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ctest-registration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: test/vulkan-custom-route-invariant-v2
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Configure test tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang lld libclang-dev llvm-dev pkg-config \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev
+          CC=clang CXX=clang++ cmake -S src -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DUSE_LINKER=lld \
+            -DENABLE_LTO=OFF \
+            -DBUILD_TESTING=ON \
+            -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF \
+            -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none \
+            -DX86_DEV_ROOTFS=/
+
+      - name: Require inventory test registration and pass
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ctest --test-dir build -N -R '^VulkanCustomRouteInventory\.ThunkGen$' | tee ctest-list.txt
+          grep -F 'VulkanCustomRouteInventory.ThunkGen' ctest-list.txt
+          ctest --test-dir build --output-on-failure -V -R '^VulkanCustomRouteInventory\.ThunkGen$' | tee ctest-run.txt
+          grep -F '100% tests passed' ctest-run.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-route-invariant-ctest-${{ github.run_id }}
+          path: |
+            ctest-list.txt
+            ctest-run.txt
+          retention-days: 30
