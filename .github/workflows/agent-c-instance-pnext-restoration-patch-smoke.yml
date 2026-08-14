@@ -1,0 +1,70 @@
+name: Agent C instance pNext restoration patch smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-instance-pnext-restoration-patch-smoke.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          fetch-depth: 1
+      - name: Apply and verify restoration patch shape
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/ThunkLibs/libvulkan/Host.cpp')
+          s=p.read_text()
+          fn=s.index('FEXFN_IMPL(vkCreateInstance)')
+          start=s.index('  const VkInstanceCreateInfo* vk_struct_base = a_0;',fn)
+          end=s.index('\n\n  VkInstance out;',start)
+          new='''  struct PNextRestore {
+            VkBaseInStructure* Structure;
+            const VkBaseInStructure* PNext;
+          };
+
+          std::vector<PNextRestore> pnext_restore;
+          const VkInstanceCreateInfo* vk_struct_base = a_0;
+          for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(vk_struct_base); vk_struct->pNext;) {
+            const auto next_type = vk_struct->pNext->sType;
+            if (next_type == VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT ||
+                next_type == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT) {
+              auto* mutable_struct = const_cast<VkBaseInStructure*>(vk_struct);
+              pnext_restore.push_back({mutable_struct, mutable_struct->pNext});
+              mutable_struct->pNext = mutable_struct->pNext->pNext;
+              continue;
+            }
+            vk_struct = vk_struct->pNext;
+          }'''
+          s=s[:start]+new+s[end:]
+          needle='auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);'
+          call=s.index(needle,fn)
+          insert_at=call+len(needle)
+          restoration='''
+          
+          for (auto it = pnext_restore.rbegin(); it != pnext_restore.rend(); ++it) {
+            it->Structure->pNext = it->PNext;
+          }'''
+          s=s[:insert_at]+restoration+s[insert_at:]
+          p.write_text(s)
+          PY
+          git -C src diff --check
+          git -C src diff -- ThunkLibs/libvulkan/Host.cpp | tee /tmp/candidate.diff
+          grep -q 'DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT' /tmp/candidate.diff
+          grep -q 'pnext_restore.rbegin' /tmp/candidate.diff
+          grep -q 'get_pointer() = to_guest' /tmp/candidate.diff
