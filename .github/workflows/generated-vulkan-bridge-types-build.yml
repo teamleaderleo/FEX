@@ -1,0 +1,65 @@
+name: Generated Vulkan bridge explicit types build
+
+on:
+  push:
+    branches: [diagnostic/generated-vulkan-split-bridge-types]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-types:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev binutils
+
+      - name: Build thunkgen and explicit-type bridge
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/
+          cmake --build build --target thunkgen -- -j"$(nproc)"
+          test -x build/Bin/thunkgen
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/
+          cmake --build guest --target vulkan_bridge-guest vulkan-guest -- -j"$(nproc)" -v \
+            2>&1 | tee bridge-types-build.log
+
+          test -f guest/libfex-vulkan-bridge.so
+          test -f guest/libvulkan-guest.so
+          readelf -d guest/libfex-vulkan-bridge.so | tee bridge.dynamic
+          readelf -d guest/libvulkan-guest.so | tee vulkan.dynamic
+          grep -q 'FLAGS_1.*NODELETE' bridge.dynamic
+          ! grep -q 'FLAGS_1.*NODELETE' vulkan.dynamic
+          grep -q 'NEEDED.*libfex-vulkan-bridge.so' vulkan.dynamic
+
+          grep -q 'FEXBridgeEnumerateInstanceVersion' guest/gen/thunkgen_guest_libvulkan_bridge.inl && exit 41 || true
+          grep -q 'FEXBridgeXlibPresentationSupport' guest/gen/thunkgen_guest_libvulkan_bridge.inl && exit 42 || true
+          grep -q 'MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libvulkan_bridge.inl
+          echo EXPLICIT_TYPE_BRIDGE_BUILD_OK
