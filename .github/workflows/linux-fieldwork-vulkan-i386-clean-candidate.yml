@@ -49,22 +49,22 @@ jobs:
           i686-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$P/procaddr_semantics_probe.c" -ldl -o /tmp/procaddr32
           i686-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -Wl,-soname,libX11.so.6 "$P/x11_symbol_fixture.c" -o /tmp/libX11.so.6
           file /tmp/callback32 /tmp/procaddr32 /tmp/libX11.so.6
-      - name: Build minimal i386 rootfs
+          readelf -l /tmp/callback32 | grep 'Requesting program interpreter'
+      - name: Build minimal i386 rootfs from cross sysroot
         run: |
           set -euxo pipefail
-          sudo systemctl start docker || true
-          sudo docker pull --platform linux/386 i386/ubuntu:24.04
-          cid=$(sudo docker create --platform linux/386 i386/ubuntu:24.04)
-          mkdir rootfs32
-          sudo docker export "$cid" | sudo tar -C rootfs32 -xf -
-          sudo docker rm "$cid"
-          sudo mkdir -p rootfs32/tmp rootfs32/usr/lib/i386-linux-gnu
-          sudo cp /tmp/callback32 /tmp/procaddr32 rootfs32/tmp/
-          sudo cp /tmp/libX11.so.6 rootfs32/usr/lib/i386-linux-gnu/libX11.so.6
+          test -d /usr/i686-linux-gnu/lib
+          mkdir -p rootfs32/tmp rootfs32/lib/i386-linux-gnu rootfs32/usr/lib/i386-linux-gnu
+          cp -aL /usr/i686-linux-gnu/lib/. rootfs32/lib/i386-linux-gnu/
+          cp -aL /usr/i686-linux-gnu/lib/. rootfs32/usr/lib/i386-linux-gnu/
+          cp -L /usr/i686-linux-gnu/lib/ld-linux.so.2 rootfs32/lib/ld-linux.so.2
+          cp /tmp/callback32 /tmp/procaddr32 rootfs32/tmp/
+          cp /tmp/libX11.so.6 rootfs32/usr/lib/i386-linux-gnu/libX11.so.6
           GUEST32=$(find product/install -type f -path '*GuestThunks_32*' -name 'libvulkan-guest.so' -print -quit)
           test -n "$GUEST32"
-          sudo cp "$GUEST32" rootfs32/usr/lib/i386-linux-gnu/libvulkan.so.1
-          file rootfs32/usr/lib/i386-linux-gnu/libvulkan.so.1
+          cp "$GUEST32" rootfs32/usr/lib/i386-linux-gnu/libvulkan.so.1
+          file rootfs32/lib/ld-linux.so.2 rootfs32/usr/lib/i386-linux-gnu/libvulkan.so.1
+          find rootfs32 -maxdepth 3 -type f | sort | head -80
       - name: Run i386 callback and procaddr matrix
         run: |
           set -euxo pipefail
