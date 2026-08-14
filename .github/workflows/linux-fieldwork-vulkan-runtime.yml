@@ -69,6 +69,7 @@ jobs:
           P=fieldwork/investigations/fex-vulkan-thunk-lifecycle
           x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$P/fex_vulkan_callback_probe.c" -ldl -o /tmp/callback-x86_64
           x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$P/procaddr_semantics_probe.c" -ldl -o /tmp/procaddr-x86_64
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$P/procaddr_repeat_probe.c" -ldl -o /tmp/procaddr-repeat-x86_64
           x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$P/debug_utils_pnext_probe.c" -ldl -o /tmp/pnext-x86_64
           cc -std=c11 -O2 -Wall -Wextra -Werror "$P/debug_utils_pnext_probe.c" -ldl -o /tmp/pnext-arm64
           x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC \
@@ -93,6 +94,7 @@ jobs:
           sudo mkdir -p rootfs/tmp rootfs/usr/lib/x86_64-linux-gnu
           sudo cp /tmp/callback-x86_64 rootfs/tmp/callback-x86_64
           sudo cp /tmp/procaddr-x86_64 rootfs/tmp/procaddr-x86_64
+          sudo cp /tmp/procaddr-repeat-x86_64 rootfs/tmp/procaddr-repeat-x86_64
           sudo cp /tmp/pnext-x86_64 rootfs/tmp/pnext-x86_64
           sudo cp /tmp/libX11.so.6 rootfs/usr/lib/x86_64-linux-gnu/libX11.so.6
           sudo cp install/share/fex-emu/GuestThunks/libvulkan-guest.so rootfs/usr/lib/x86_64-linux-gnu/libvulkan.so.1
@@ -128,6 +130,7 @@ jobs:
           run_case dynamic-report /tmp/callback-x86_64 report gipa 0
           run_case dynamic-utils /tmp/callback-x86_64 utils gipa 0
           run_case procaddr /tmp/procaddr-x86_64
+          run_case procaddr-repeat /tmp/procaddr-repeat-x86_64
           run_case debug-utils-pnext /tmp/pnext-x86_64
           for f in evidence/*.status; do echo "$(basename "$f" .status)=$(cat "$f")"; done | sort | tee evidence/status-matrix.txt
 
@@ -137,9 +140,11 @@ jobs:
             test "$(cat evidence/dynamic-report.status)" = 0
             test "$(cat evidence/dynamic-utils.status)" = 0
             test "$(cat evidence/procaddr.status)" = 0
+            test "$(cat evidence/procaddr-repeat.status)" = 0
           else
             test "$(cat evidence/dynamic-report.status)" != 0
             test "$(cat evidence/procaddr.status)" != 0
+            test "$(cat evidence/procaddr-repeat.status)" != 0
           fi
 
       - name: Upload evidence
