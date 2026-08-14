@@ -5,7 +5,6 @@ on:
     branches: [ci/thunkgen-const-pointee-unit-20260814]
     paths:
       - .github/workflows/thunkgen-const-pointee-unit.yml
-      - .github/fieldwork/fix_const_pointee_unit_marker.py
       - ThunkLibs/Generator/gen.cpp
       - unittests/ThunkLibs/generator.cpp
   workflow_dispatch:
@@ -41,14 +40,6 @@ jobs:
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev nasm pkg-config libcap-dev \
             libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libvulkan-dev
 
-      - name: Apply unit-only host implementation marker
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python3 .github/fieldwork/fix_const_pointee_unit_marker.py
-          git diff -- unittests/ThunkLibs/generator.cpp | tee "$R/unit-marker.diff"
-          grep -q 'custom_host_impl' "$R/unit-marker.diff"
-
       - name: Configure thunkgen tests
         shell: bash
         run: |
@@ -62,12 +53,23 @@ jobs:
             -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DX86_DEV_ROOTFS=/ \
             2>&1 | tee "$R/cmake.log"
 
-      - name: Run generic thunkgen regression
+      - name: Build thunkgentest binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake --build build --target thunkgentest -- -j2 2>&1 | tee "$R/thunkgentest-build.log"
+
+      - name: Run StructRepacking regression case
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ./build/unittests/ThunkLibs/thunkgentest 'StructRepacking' -s 2>&1 | tee "$R/struct-repacking.log"
+
+      - name: Run complete thunkgen suite
         shell: bash
         run: |
           set -euxo pipefail
           cmake --build build --target thunkgen_tests -- -j2 2>&1 | tee "$R/thunkgen-tests.log"
-          grep -E 'StructRepacking|100% tests passed|tests passed' "$R/thunkgen-tests.log" > "$R/key-lines.txt" || true
           git diff "$CANDIDATE"^.."$CANDIDATE" -- ThunkLibs/Generator/gen.cpp unittests/ThunkLibs/generator.cpp > "$R/candidate.diff"
           printf 'THUNKGEN_CONST_POINTEE_UNIT_OK\n' | tee "$R/result.txt"
 
