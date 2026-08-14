@@ -35,7 +35,7 @@ jobs:
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
-            libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers vulkan-tools xvfb binutils
+            libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers vulkan-tools xvfb x11-utils binutils
           LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
           test -n "$LVP"
           echo "$LVP" > "$R/lvp.txt"
