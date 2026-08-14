@@ -1,8 +1,8 @@
-name: Agent B DRM server-info callback current main
+name: Agent B DRM server-info callback bridge diagnostic
 
 on:
   push:
-    branches: [ci/agent-b-drm-serverinfo-callback-f3ab-20260814]
+    branches: [ci/agent-b-drm-serverinfo-bridge-20260814]
   workflow_dispatch:
 
 permissions:
@@ -23,16 +23,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 3
+          fetch-depth: 5
 
       - name: Dependencies and provenance
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$R" "$HOST"
-          git log --oneline -3 | tee "$R/lineage.txt"
-          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/product-source-diff.txt"
-          test ! -s "$R/product-source-diff.txt"
+          git log --oneline -5 | tee "$R/lineage.txt"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
@@ -59,7 +59,17 @@ jobs:
             echo 'supported=yes' >> "$GITHUB_ENV"
           fi
 
-      - name: Build exact current-main FEX and DRM thunks
+      - name: Apply persistent load_module bridge diagnostic
+        if: env.supported == 'yes'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_drm_serverinfo_callback_bridge.py
+          git diff --check
+          git diff -- ThunkLibs/libdrm/libdrm_interface.cpp ThunkLibs/libdrm/Guest.cpp ThunkLibs/libdrm/Host.cpp | tee "$R/drm-serverinfo-bridge.diff"
+          test "$(git diff --name-only -- ThunkLibs FEXCore Source | sort | tr '\n' ' ')" = 'ThunkLibs/libdrm/Guest.cpp ThunkLibs/libdrm/Host.cpp ThunkLibs/libdrm/libdrm_interface.cpp '
+
+      - name: Build candidate FEX and DRM thunks
         if: env.supported == 'yes'
         shell: bash
         run: |
@@ -70,14 +80,14 @@ jobs:
             -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
             -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
             -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
-          cmake --build build --target FEX FEXServer drm-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1
+          cmake --build build --target FEX FEXServer drm-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1 || { tail -n 200 "$R/build-host.log"; exit 1; }
           cp build/HostLibs_64/libdrm-host.so "$HOST/libdrm-host.so"
           cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
             -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
             -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
             -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
-          cmake --build guest-build --target drm-guest -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1
+          cmake --build guest-build --target drm-guest -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1 || { tail -n 200 "$R/build-guest.log"; exit 1; }
 
       - name: Prepare amd64 rootfs
         if: env.supported == 'yes'
@@ -98,7 +108,7 @@ jobs:
           x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
             LinuxFieldwork/drm_serverinfo_callback_probe.c -ldl -o "$ROOTFS/opt/fex-ci/drm-server-probe"
 
-      - name: Execute pristine FEX persistent callback
+      - name: Execute candidate persistent callback
         if: env.supported == 'yes'
         shell: bash
         run: |
@@ -106,12 +116,16 @@ jobs:
           set +e
           FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
             "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/drm-server-probe \
-            > "$R/fex.stdout" 2> "$R/fex.stderr"
-          fex_rc=$?
+            > "$R/candidate.stdout" 2> "$R/candidate.stderr"
+          candidate_rc=$?
           set -e
-          echo "$fex_rc" > "$R/fex.exit"
-          printf 'native=%s\nfex=%s\n' "$(cat "$R/native.exit")" "$fex_rc" | tee "$R/final-matrix.txt"
-          cat "$R/fex.stderr"
+          echo "$candidate_rc" > "$R/candidate.exit"
+          printf 'native=%s\npristine_reference=132\ncandidate=%s\n' "$(cat "$R/native.exit")" "$candidate_rc" | tee "$R/final-matrix.txt"
+          cat "$R/candidate.stderr"
+          test "$candidate_rc" = 0
+          grep -q 'DRM_SERVER_CALLBACK count=1' "$R/candidate.stderr"
+          grep -q 'MARK set-info-return count=0' "$R/candidate.stderr"
+          grep -q 'MARK open-return fd=-1 callbacks=1' "$R/candidate.stderr"
 
       - name: Record unavailable control
         if: env.supported != 'yes'
@@ -122,6 +136,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-b-drm-serverinfo-callback-${{ github.run_id }}
+          name: agent-b-drm-serverinfo-bridge-${{ github.run_id }}
           path: receipts
           retention-days: 30
