@@ -27,6 +27,12 @@ template<>
 struct fex_gen_type<VkAllocationCallbacks> : fexgen::opaque_type {};'''
 allocator_new = '''// Linux Fieldwork experiment: make VkAllocationCallbacks repackable and
 // mediate all callback-bearing members with host-to-guest trampolines.
+// The callback signatures use these enums, so register them for host callback
+// argument packing as well.
+template<>
+struct fex_gen_type<VkSystemAllocationScope> {};
+template<>
+struct fex_gen_type<VkInternalAllocationType> {};
 template<>
 struct fex_gen_type<VkAllocationCallbacks> {};
 template<>
