@@ -1,0 +1,104 @@
+name: GL direct helper bridge build
+
+on:
+  push:
+    branches: [diagnostic/gl-direct-helper-f3ab-20260814]
+    paths:
+      - LinuxFieldwork/apply_per_library_guest_bridge_helper.py
+      - LinuxFieldwork/apply_gl_helper_direct_bridge.py
+      - .github/fieldwork/apply_thunkgen_guest_bridge_output.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles_compat.py
+      - .github/workflows/gl-direct-helper-build.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gl-build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      R: ${{ github.workspace }}/gl-helper-build-receipts
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Dependencies and exact-product provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev binutils
+      - name: Apply helper-backed direct GL bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_per_library_guest_bridge_helper.py
+          python3 .github/fieldwork/apply_thunkgen_guest_bridge_output.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles_compat.py .
+          python3 LinuxFieldwork/apply_gl_helper_direct_bridge.py | tee "$R/transform.txt"
+          git diff --check
+          git diff -- ThunkLibs FEXCore Source > "$R/product.diff"
+          grep -q 'add_guest_bridge(GL_bridge "libfex-GL-bridge.so"' ThunkLibs/GuestLibs/CMakeLists.txt
+      - name: Build thunkgen and GL pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" -v > "$R/build-thunkgen.log" 2>&1 \
+            || { tail -n 320 "$R/build-thunkgen.log"; exit 1; }
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target GL-guest GL_bridge-guest -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1 \
+            || { tail -n 360 "$R/build-guest.log"; exit 1; }
+      - name: Verify direct role and ELF boundary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f guest/gen/thunkgen_bridge_libGL.inl
+          test -f guest/gen/thunkgen_bridge_accessors_libGL.inl
+          test -f guest/libGL-guest.so
+          test -f guest/libfex-GL-bridge.so
+          cp guest/gen/thunkgen_bridge_libGL.inl "$R/gl-bridge.inl"
+          cp guest/gen/thunkgen_bridge_accessors_libGL.inl "$R/gl-accessors.inl"
+          grep -q 'FEX_BRIDGE_ROLE' "$R/gl-bridge.inl"
+          test "$(grep -c 'caller=1 unpacker=0' "$R/gl-bridge.inl")" -eq 736
+          ! grep -q 'unpacker=1' "$R/gl-bridge.inl"
+          readelf -d guest/libGL-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest/libfex-GL-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-GL-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'RUNPATH.*\$ORIGIN' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          nm -D guest/libfex-GL-bridge.so | tee "$R/bridge.symbols"
+          grep -q 'FEXGLBridgeMalloc' "$R/bridge.symbols"
+          grep -q 'fex_gl_bridge_xsync_unpacker' "$R/bridge.symbols"
+          grep -q 'fex_gl_bridge_xgetvisualinfo_unpacker' "$R/bridge.symbols"
+          grep -q 'fex_gl_bridge_xdisplaystring_unpacker' "$R/bridge.symbols"
+          size guest/libGL-guest.so guest/libfex-GL-bridge.so | tee "$R/size.txt"
+          echo GL_DIRECT_HELPER_BUILD_OK
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-direct-helper-build-${{ github.run_id }}
+          path: gl-helper-build-receipts
+          retention-days: 30
