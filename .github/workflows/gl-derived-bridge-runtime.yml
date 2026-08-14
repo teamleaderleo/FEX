@@ -5,6 +5,9 @@ on:
     branches: [diagnostic/gl-derived-bridge-output]
     paths:
       - .github/workflows/gl-derived-bridge-runtime.yml
+      - ThunkLibs/Generator/extract_guest_bridge.py
+      - ThunkLibs/libGL/**
+      - ThunkLibs/libGL_bridge/**
   workflow_dispatch:
 
 permissions:
