@@ -1,0 +1,222 @@
+name: Gate FEX-2608 callback mapping transactions v2
+
+on:
+  push:
+    branches: [ci/fex2608-staged-lifetime-integration-20260814]
+    paths:
+      - .github/workflows/fex2608-callback-mapping-transaction-candidate-v2.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 100
+    env:
+      PRODUCT_REF: candidate/fex2608-combined-thunk-lifetime-minimal
+      VM_BRANCH: candidate/fex2608-combined-thunk-lifetime-vm
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-mapmut-candidate-v2
+      H: ${{ github.workspace }}/host-vulkan
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PRODUCT_REF }}
+          path: product
+          fetch-depth: 2
+          submodules: recursive
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-callback-transactional-retire-20260814
+          path: transaction-helper
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-combined-repair
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan1 libvulkan-dev mesa-vulkan-drivers binutils
+
+      - name: Build deterministic fixtures and Vulkan probes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 transaction-helper/.github/fieldwork/patch_callback_inflight_fixture.py /tmp/repro/fex-full-thunk-pair
+          python3 transaction-helper/.github/fieldwork/patch_callback_transaction_wait_fixture.py /tmp/repro/fex-full-thunk-pair
+          python3 .github/fieldwork/patch_callback_mapping_mutation_fixture.py /tmp/repro/fex-full-thunk-pair
+          sed -i '1{/^#define _GNU_SOURCE$/d;}' /tmp/repro/fex-full-thunk-pair/guest/callback_mapping_mutation.cpp
+          (cd /tmp/repro/fex-full-thunk-pair && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) > "$R/build-fixtures.log" 2>&1
+
+          PROBE_DIR=fieldwork/investigations/fex-vulkan-thunk-lifecycle
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$PROBE_DIR/fex_vulkan_combined_probe.c" -ldl -o /tmp/fex_vulkan_combined_probe
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$PROBE_DIR/fex_vulkan_pfn_unload_probe.c" -ldl -o /tmp/fex_vulkan_pfn_unload_probe
+
+      - name: Apply VM lifetime transaction extension
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/apply_callback_mapping_transactions.py "$GITHUB_WORKSPACE/product"
+          git -C product diff --check
+          git -C product diff --stat | tee "$R/mapping-transaction.stat"
+          git -C product diff > "$R/mapping-transaction.diff"
+
+      - name: Build transformed candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S product -B product/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build product/build --target FEX FEXServer vulkan-host-64 thunkgen -- -j"$(nproc)" > "$R/build-host.log" 2>&1
+          cp product/build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+
+          cmake -S product/ThunkLibs/GuestLibs -B product/guest-vm -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/product/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/product" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/product/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build product/guest-vm --target vulkan-guest vulkan-bridge-guest -- -j"$(nproc)" > "$R/build-guest.log" 2>&1
+          readelf -d product/guest-vm/libvulkan-guest.so > "$R/wrapper.dynamic"
+          readelf -d product/guest-vm/libfex-vulkan-bridge.so > "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp product/guest-vm/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp product/guest-vm/libfex-vulkan-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-vulkan-bridge.so"
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libX11.so.6 fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_x11_stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/"
+          cp /tmp/fex_vulkan_combined_probe "$ROOTFS/opt/fex-ci/combined_probe"
+          cp /tmp/fex_vulkan_pfn_unload_probe "$ROOTFS/opt/fex-ci/pfn_unload_probe"
+
+      - name: Gate mapping mutation lifetime matrix
+        shell: bash
+        run: |
+          set -uo pipefail
+          FIXTURE_HOST=/tmp/repro/fex-full-thunk-pair/host
+          BIN="$GITHUB_WORKSPACE/product/build/Bin/FEX"
+          MODES=(map-fixed map-fixed-fail map-noreplace mremap-move mremap-dest mremap-shrink-tail mremap-shrink-prefix mremap-fail mremap-dontunmap shmdt shm-remap)
+          : > "$R/results.tsv"
+          for mode in "${MODES[@]}"; do
+            set +e
+            (cd "$ROOTFS/opt/fex-ci" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 20s "$BIN" /opt/fex-ci/guest/callback_mapping_mutation "$mode") > "$R/$mode.out" 2> "$R/$mode.err"
+            rc=$?
+            set -e
+            printf '%s\t%s\n' "$mode" "$rc" | tee -a "$R/results.tsv"
+            cat "$R/$mode.err"
+          done
+
+          for mode in map-fixed map-fixed-fail map-noreplace mremap-move mremap-shrink-tail mremap-shrink-prefix mremap-fail mremap-dontunmap shmdt shm-remap; do
+            grep -qx "$mode"$'\t0' "$R/results.tsv"
+          done
+
+          # Lifetime is correct here: the escaped destination-generation trampoline is revoked.
+          # FEX-2608 separately retains translated code for the replaced destination address, so
+          # the fresh current callback returns 70423 instead of the moved source's 70433.
+          grep -qx $'mremap-dest\t11' "$R/results.tsv"
+          grep -q 'MAPMUT mremap-dest stale-exit=113' "$R/mremap-dest.err"
+          grep -Eq 'MAPMUT mremap-dest fresh=(70423|70433)' "$R/mremap-dest.err"
+
+      - name: Gate original callback transaction behavior
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FIXTURE_HOST=/tmp/repro/fex-full-thunk-pair/host
+          (cd "$ROOTFS/opt/fex-ci" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 30s "$GITHUB_WORKSPACE/product/build/Bin/FEX" /opt/fex-ci/guest/callback_inflight) > "$R/callback-inflight.out" 2> "$R/callback-inflight.err"
+          grep -q 'INFLIGHT close-done-before-release=0' "$R/callback-inflight.err"
+          grep -q 'INFLIGHT worker-returned rv=70053' "$R/callback-inflight.err"
+          grep -q 'INFLIGHT dlclose-returned rc=0' "$R/callback-inflight.err"
+          grep -q 'INFLIGHT child stale-first-callback exit=113' "$R/callback-inflight.err"
+          grep -q 'INFLIGHT DRAIN_PASS' "$R/callback-inflight.err"
+
+          (cd "$ROOTFS/opt/fex-ci" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 30s "$GITHUB_WORKSPACE/product/build/Bin/FEX" /opt/fex-ci/guest/callback_transaction_wait) > "$R/callback-transaction-wait.out" 2> "$R/callback-transaction-wait.err"
+          grep -q 'TXWAIT munmap-returned rc=-1 errno=22' "$R/callback-transaction-wait.err"
+          grep -q 'TXWAIT A-returned rv=70053' "$R/callback-transaction-wait.err"
+          grep -q 'TXWAIT B-returned rv=70063' "$R/callback-transaction-wait.err"
+          grep -q 'TXWAIT stale-after-close-exit=113' "$R/callback-transaction-wait.err"
+          grep -q 'TXWAIT PASS' "$R/callback-transaction-wait.err"
+
+      - name: Gate Vulkan bridge and debug-report behavior
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          VK_ICD_FILENAMES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 30s "$GITHUB_WORKSPACE/product/build/Bin/FEX" /opt/fex-ci/pfn_unload_probe close > "$R/pfn-close.out" 2> "$R/pfn-close.err"
+          grep -q 'PROBE return where=after-real-close result=0' "$R/pfn-close.err"
+          grep -q 'PROBE saved-dynamic-pfn-returned-after-close' "$R/pfn-close.err"
+
+          VK_ICD_FILENAMES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 30s "$GITHUB_WORKSPACE/product/build/Bin/FEX" /opt/fex-ci/combined_probe > "$R/combined-probe.out" 2> "$R/combined-probe.err"
+          grep -q 'COMBINED debug-report-created result=0' "$R/combined-probe.err"
+          grep -q 'COMBINED debug-report-destroyed' "$R/combined-probe.err"
+          grep -q 'COMBINED after-app-close wrapper-mapped=0' "$R/combined-probe.err"
+          grep -q 'COMBINED post-close-dynamic-version result=0' "$R/combined-probe.err"
+          grep -q 'COMBINED PASS' "$R/combined-probe.err"
+
+      - name: Publish VM-lifetime candidate after all gates
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git -C product config user.name 'Leo'
+          git -C product config user.email 'cheerleaderleo@outlook.com'
+          git -C product add Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp \
+                             Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsVMATracking.cpp \
+                             Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsVMATracking.h
+          git -C product diff --cached --check
+          git -C product commit -m 'thunks: retire callbacks across mapping replacement'
+          git -C product push --force-with-lease origin "HEAD:refs/heads/$VM_BRANCH"
+          git -C product rev-parse HEAD | tee "$R/PASS.vm-candidate-sha.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex2608-callback-mapmut-candidate-v2-${{ github.run_id }}
+          path: receipts-mapmut-candidate-v2
+          retention-days: 30
