@@ -1,0 +1,109 @@
+name: Agent U selective NODELETE policy
+
+on:
+  push:
+    branches: [ci/agent-u-selective-nodelete-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selective:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    env:
+      R: ${{ github.workspace }}/receipts
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with: {submodules: recursive, fetch-depth: 1}
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev libssl-dev pkg-config libcap-dev binutils \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu gcc-13-multilib-x86-64-linux-gnu g++-13-multilib-x86-64-linux-gnu libc6-dev-i386-cross \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libwayland-dev libdrm-dev libasound2-dev libgl-dev libegl-dev
+      - name: Apply selective policy
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s=p.read_text()
+          s=s.replace('function(add_guest_lib NAME SONAME)\n', 'function(add_guest_lib NAME SONAME)\n  cmake_parse_arguments(PARSE_ARGV 2 ARG "NODELETE" "" "")\n', 1)
+          needle='  target_link_libraries(${NAME}-guest PRIVATE lib${NAME}-guest-deps)\n'
+          s=s.replace(needle, needle+'  if (ARG_NODELETE AND TARGET_TYPE STREQUAL "SHARED")\n    target_link_options(${NAME}-guest PRIVATE "LINKER:-z,nodelete")\n  endif()\n',1)
+          replacements={
+            'add_guest_lib(vulkan "libvulkan.so.1")':'add_guest_lib(vulkan "libvulkan.so.1" NODELETE)',
+            'add_guest_lib(wayland-client "libwayland-client.so.0.20.0")':'add_guest_lib(wayland-client "libwayland-client.so.0.20.0" NODELETE)',
+            'add_guest_lib(GL "libGL.so.1")':'add_guest_lib(GL "libGL.so.1" NODELETE)',
+            'add_guest_lib(cuda "libcuda.so.1")':'add_guest_lib(cuda "libcuda.so.1" NODELETE)',
+          }
+          for old,new in replacements.items():
+            if old not in s: raise SystemExit(f'missing {old}')
+            s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff -- ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/selective.diff"
+      - name: Build generator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/main-cmake.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" -v > "$R/thunkgen-build.log" 2>&1
+          find build -type f -name thunkgen -perm -111 | head -n1 | xargs realpath | tee "$R/thunkgen-path.txt"
+      - name: Build all 64-bit and verify selective flags
+        shell: bash
+        run: |
+          set -euxo pipefail
+          THUNKGEN="$(cat "$R/thunkgen-path.txt")"
+          cmake -S ThunkLibs/GuestLibs -B guest64 -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_CLANG_THUNKS=OFF \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$THUNKGEN" -DX86_DEV_ROOTFS=/ > "$R/guest64-cmake.log" 2>&1
+          cmake --build guest64 --target asound-guest vulkan-guest drm-guest wayland-client-guest VDSO-guest GL-guest EGL-guest cuda-guest -- -j"$(nproc)" -v > "$R/guest64-build.log" 2>&1
+          python3 - <<'PY' | tee "$R/flags64.txt"
+          import pathlib,subprocess
+          expected={'vulkan':True,'GL':True,'cuda':True,'wayland-client':True,'asound':False,'drm':False,'VDSO':False,'EGL':False}
+          for name,want in expected.items():
+            p=next(pathlib.Path('guest64').rglob(f'lib{name}-guest.so'))
+            out=subprocess.check_output(['readelf','-d',str(p)],text=True)
+            got='NODELETE' in out
+            print(name, 'NODELETE' if got else 'normal')
+            if got != want: raise SystemExit(f'{name}: got NODELETE={got}, want {want}')
+          print('SELECTIVE_64_OK')
+          PY
+      - name: Build 32-bit Wayland and verify NODELETE
+        shell: bash
+        run: |
+          set -euxo pipefail
+          THUNKGEN="$(cat "$R/thunkgen-path.txt")"
+          cmake -S ThunkLibs/GuestLibs -B guest32 -G Ninja \
+            -DBITNESS=32 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_CLANG_THUNKS=OFF \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_32.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$THUNKGEN" -DX86_DEV_ROOTFS=/ > "$R/guest32-cmake.log" 2>&1
+          cmake --build guest32 --target wayland-client-guest -- -j"$(nproc)" -v > "$R/guest32-build.log" 2>&1
+          p="$(find guest32 -name 'libwayland-client-guest.so' | head -n1)"
+          file "$p" | tee "$R/wayland32.file"
+          readelf -d "$p" | tee "$R/wayland32.dynamic"
+          grep -q 'ELF 32-bit.*Intel 80386' "$R/wayland32.file"
+          grep -q 'FLAGS_1.*NODELETE' "$R/wayland32.dynamic"
+          echo SELECTIVE_32_OK
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-u-selective-nodelete-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
