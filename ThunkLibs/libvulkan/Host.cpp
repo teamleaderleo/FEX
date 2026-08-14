@@ -136,23 +136,34 @@ DummyVkDebugReportCallback(VkDebugReportFlagsEXT, VkDebugReportObjectTypeEXT, ui
 }
 
 static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, const VkAllocationCallbacks* a_1, guest_layout<VkInstance*> a_2) {
-  const VkInstanceCreateInfo* vk_struct_base = a_0;
-  for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(vk_struct_base); vk_struct->pNext;
-       vk_struct = vk_struct->pNext) {
-    // Override guest callbacks used for VK_EXT_debug_report
-    if (reinterpret_cast<const VkBaseInStructure*>(vk_struct->pNext)->sType == VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT) {
-      // Overwrite the pNext pointer, ignoring its const-qualifier
-      const_cast<VkBaseInStructure*>(vk_struct)->pNext = vk_struct->pNext->pNext;
+  struct PNextRestore {
+    VkBaseInStructure* Structure;
+    const VkBaseInStructure* PNext;
+  };
 
-      // If we copied over a nullptr for pNext then early exit
-      if (!vk_struct->pNext) {
-        break;
-      }
+  std::vector<PNextRestore> pnext_restore;
+  const VkInstanceCreateInfo* vk_struct_base = a_0;
+  for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(vk_struct_base); vk_struct->pNext;) {
+    const auto next_type = vk_struct->pNext->sType;
+    // Ignore guest callbacks installed for temporary debug callbacks during instance creation.
+    if (next_type == VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT ||
+        next_type == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT) {
+      // Temporarily splice the callback-bearing node out. Re-check the same predecessor
+      // so consecutive callback nodes are all removed.
+      auto* mutable_struct = const_cast<VkBaseInStructure*>(vk_struct);
+      pnext_restore.push_back({mutable_struct, mutable_struct->pNext});
+      mutable_struct->pNext = mutable_struct->pNext->pNext;
+      continue;
     }
+    vk_struct = vk_struct->pNext;
   }
 
   VkInstance out;
   auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
+
+  for (auto it = pnext_restore.rbegin(); it != pnext_restore.rend(); ++it) {
+    it->Structure->pNext = it->PNext;
+  }
   *a_2.get_pointer() = to_guest(to_host_layout(out));
   return ret;
 }
