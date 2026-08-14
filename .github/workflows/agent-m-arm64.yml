@@ -30,8 +30,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev libssl-dev pkg-config libcap-dev binutils \
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
-            gcc-13-multilib-x86-64-linux-gnu g++-13-multilib-x86-64-linux-gnu \
-            libc6-dev-i386-cross
+            gcc-13-multilib-x86-64-linux-gnu g++-13-multilib-x86-64-linux-gnu libc6-dev-i386-cross \
+            libx11-dev libxcb1-dev libxrandr-dev libxrender-dev libwayland-dev libdrm-dev libasound2-dev libgl-dev libegl-dev
 
       - name: Apply generic guest lifetime policy
         shell: bash
@@ -77,7 +77,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_32.cmake" \
             -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
             -DGENERATOR_EXE="$THUNKGEN" \
-            -DX86_DEV_ROOTFS=/ > "$R/guest32-cmake.log" 2>&1
+            -DX86_DEV_ROOTFS=/ > "$R/guest32-cmake.log" 2>&1 || { cat "$R/guest32-cmake.log"; exit 1; }
           cmake --build guest-build-32 --target vulkan-guest -- -j"$(nproc)" -v > "$R/vulkan32-build.log" 2>&1 || { tail -n 280 "$R/vulkan32-build.log"; exit 1; }
           path="$(find guest-build-32 -type f -name 'libvulkan-guest.so*' | head -n1)"
           test -n "$path"
