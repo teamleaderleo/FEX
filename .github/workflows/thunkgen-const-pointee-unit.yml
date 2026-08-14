@@ -19,20 +19,22 @@ jobs:
     env:
       R: ${{ github.workspace }}/receipts-const-pointee
       DEBIAN_FRONTEND: noninteractive
+      CANDIDATE: 715ff36bff2fd9f2353ab31613dc41ae106f3938
     steps:
       - name: Checkout exact carrier
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Dependencies and identity
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$R"
-          printf 'head=%s\nparent=%s\n' "$(git rev-parse HEAD)" "$(git rev-parse HEAD^)" | tee "$R/identity.txt"
-          test "$(git rev-parse HEAD^)" = "715ff36bff2fd9f2353ab31613dc41ae106f3938"
+          printf 'head=%s\ncandidate=%s\n' "$(git rev-parse HEAD)" "$CANDIDATE" | tee "$R/identity.txt"
+          git merge-base --is-ancestor "$CANDIDATE" HEAD
+          git diff --exit-code "$CANDIDATE"..HEAD -- ThunkLibs/Generator/gen.cpp unittests/ThunkLibs/generator.cpp
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev nasm pkg-config libcap-dev
@@ -55,7 +57,7 @@ jobs:
           set -euxo pipefail
           cmake --build build --target thunkgen_tests -- -j2 2>&1 | tee "$R/thunkgen-tests.log"
           grep -E 'StructRepacking|100% tests passed|tests passed' "$R/thunkgen-tests.log" > "$R/key-lines.txt" || true
-          git diff HEAD^..HEAD -- ThunkLibs/Generator/gen.cpp unittests/ThunkLibs/generator.cpp > "$R/candidate.diff"
+          git diff "$CANDIDATE"^.."$CANDIDATE" -- ThunkLibs/Generator/gen.cpp unittests/ThunkLibs/generator.cpp > "$R/candidate.diff"
           printf 'THUNKGEN_CONST_POINTEE_UNIT_OK\n' | tee "$R/result.txt"
 
       - name: Upload receipts
