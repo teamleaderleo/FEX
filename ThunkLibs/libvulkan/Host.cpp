@@ -75,6 +75,56 @@ static void fexfn_impl_libvulkan_Vulkan_SetGuestXDisplayString(uintptr_t GuestTa
   MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &x11_manager.GuestXDisplayString);
 }
 
+
+struct AllocatorGuestUnpackers {
+  uintptr_t Allocation {};
+  uintptr_t Reallocation {};
+  uintptr_t Free {};
+  uintptr_t InternalAllocation {};
+  uintptr_t InternalFree {};
+};
+static AllocatorGuestUnpackers allocator_guest_unpackers;
+
+static void fexfn_impl_libvulkan_Vulkan_SetGuestAllocatorUnpackers(uintptr_t Allocation, uintptr_t Reallocation, uintptr_t Free,
+                                                                   uintptr_t InternalAllocation, uintptr_t InternalFree) {
+  allocator_guest_unpackers = {Allocation, Reallocation, Free, InternalAllocation, InternalFree};
+}
+
+void fex_custom_repack_entry(host_layout<VkAllocationCallbacks>& into, const guest_layout<VkAllocationCallbacks>& from) {
+  into.data.pUserData = const_cast<void*>(from.data.pUserData.force_get_host_pointer());
+
+  if (from.data.pfnAllocation.data) {
+    MakeHostTrampolineForGuestFunctionAt(from.data.pfnAllocation.data, allocator_guest_unpackers.Allocation, &into.data.pfnAllocation);
+  } else {
+    into.data.pfnAllocation = nullptr;
+  }
+  if (from.data.pfnReallocation.data) {
+    MakeHostTrampolineForGuestFunctionAt(from.data.pfnReallocation.data, allocator_guest_unpackers.Reallocation, &into.data.pfnReallocation);
+  } else {
+    into.data.pfnReallocation = nullptr;
+  }
+  if (from.data.pfnFree.data) {
+    MakeHostTrampolineForGuestFunctionAt(from.data.pfnFree.data, allocator_guest_unpackers.Free, &into.data.pfnFree);
+  } else {
+    into.data.pfnFree = nullptr;
+  }
+  if (from.data.pfnInternalAllocation.data) {
+    MakeHostTrampolineForGuestFunctionAt(from.data.pfnInternalAllocation.data, allocator_guest_unpackers.InternalAllocation,
+                                         &into.data.pfnInternalAllocation);
+  } else {
+    into.data.pfnInternalAllocation = nullptr;
+  }
+  if (from.data.pfnInternalFree.data) {
+    MakeHostTrampolineForGuestFunctionAt(from.data.pfnInternalFree.data, allocator_guest_unpackers.InternalFree, &into.data.pfnInternalFree);
+  } else {
+    into.data.pfnInternalFree = nullptr;
+  }
+}
+
+bool fex_custom_repack_exit(guest_layout<VkAllocationCallbacks>&, const host_layout<VkAllocationCallbacks>&) {
+  return false;
+}
+
 void fex_custom_repack_entry(host_layout<VkXcbSurfaceCreateInfoKHR>& to, const guest_layout<VkXcbSurfaceCreateInfoKHR>& from) {
   // TODO: xcb_aux_sync?
   to.data.connection = x11_manager.GuestToHostConnection(const_cast<xcb_connection_t*>(from.data.connection.force_get_host_pointer()));
@@ -127,7 +177,7 @@ static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportK
 static VkResult
 FEXFN_IMPL(vkCreateShaderModule)(VkDevice a_0, const VkShaderModuleCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkShaderModule* a_3) {
   (void*&)LDR_PTR(vkCreateShaderModule) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateShaderModule");
-  return LDR_PTR(vkCreateShaderModule)(a_0, a_1, nullptr, a_3);
+  return LDR_PTR(vkCreateShaderModule)(a_0, a_1, a_2, a_3);
 }
 
 static VkBool32
@@ -152,7 +202,7 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
   }
 
   VkInstance out;
-  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
+  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, a_1, &out);
   *a_2.get_pointer() = to_guest(to_host_layout(out));
   return ret;
 }
@@ -160,7 +210,7 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
 static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                            guest_layout<VkDevice*> a_3) {
   VkDevice out;
-  auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, nullptr, &out);
+  auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, a_2, &out);
   *a_3.get_pointer() = to_guest(to_host_layout(out));
 
   // Reload device-specific function pointers used in custom implementations.
@@ -182,12 +232,12 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
 
 static VkResult FEXFN_IMPL(vkAllocateMemory)(VkDevice a_0, const VkMemoryAllocateInfo* a_1, const VkAllocationCallbacks* a_2, VkDeviceMemory* a_3) {
   (void*&)LDR_PTR(vkAllocateMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkAllocateMemory");
-  return LDR_PTR(vkAllocateMemory)(a_0, a_1, nullptr, a_3);
+  return LDR_PTR(vkAllocateMemory)(a_0, a_1, a_2, a_3);
 }
 
 static void FEXFN_IMPL(vkFreeMemory)(VkDevice a_0, VkDeviceMemory a_1, const VkAllocationCallbacks* a_2) {
   (void*&)LDR_PTR(vkFreeMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkFreeMemory");
-  LDR_PTR(vkFreeMemory)(a_0, a_1, nullptr);
+  LDR_PTR(vkFreeMemory)(a_0, a_1, a_2);
 }
 
 static VkResult FEXFN_IMPL(vkCreateDebugReportCallbackEXT)(VkInstance a_0, guest_layout<const VkDebugReportCallbackCreateInfoEXT*> a_1,

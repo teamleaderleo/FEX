@@ -90,6 +90,12 @@ void OnInit() {
   fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
   fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
   fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+  fexfn_pack_Vulkan_SetGuestAllocatorUnpackers(
+    (uintptr_t)CallbackUnpack<PFN_vkAllocationFunction>::Unpack,
+    (uintptr_t)CallbackUnpack<PFN_vkReallocationFunction>::Unpack,
+    (uintptr_t)CallbackUnpack<PFN_vkFreeFunction>::Unpack,
+    (uintptr_t)CallbackUnpack<PFN_vkInternalAllocationNotification>::Unpack,
+    (uintptr_t)CallbackUnpack<PFN_vkInternalFreeNotification>::Unpack);
 }
 
 LOAD_LIB_INIT(libvulkan, OnInit)

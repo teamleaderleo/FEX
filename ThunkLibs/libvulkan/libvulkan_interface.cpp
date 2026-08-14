@@ -32,12 +32,15 @@ struct fex_gen_type {};
 void Vulkan_SetGuestXSync(uintptr_t, uintptr_t);
 void Vulkan_SetGuestXGetVisualInfo(uintptr_t, uintptr_t);
 void Vulkan_SetGuestXDisplayString(uintptr_t, uintptr_t);
+void Vulkan_SetGuestAllocatorUnpackers(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 template<>
 struct fex_gen_config<Vulkan_SetGuestXSync> : fexgen::custom_guest_entrypoint, fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<Vulkan_SetGuestXGetVisualInfo> : fexgen::custom_guest_entrypoint, fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<Vulkan_SetGuestXDisplayString> : fexgen::custom_guest_entrypoint, fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<Vulkan_SetGuestAllocatorUnpackers> : fexgen::custom_guest_entrypoint, fexgen::custom_host_impl {};
 
 // So-called "dispatchable" handles are represented as opaque pointers.
 // In addition to marking them as such, API functions that create these objects
@@ -2307,9 +2310,28 @@ struct fex_gen_type<VkBaseOutStructure> : fexgen::assume_compatible_data_layout 
 #endif
 
 
-// TODO: Should not be opaque, but it's usually NULL anyway. Supporting the contained function pointers will need more work.
+// Linux Fieldwork experiment: make VkAllocationCallbacks repackable and
+// mediate all callback-bearing members with host-to-guest trampolines.
+// The callback signatures use these enums, so register them for host callback
+// argument packing as well.
 template<>
-struct fex_gen_type<VkAllocationCallbacks> : fexgen::opaque_type {};
+struct fex_gen_type<VkSystemAllocationScope> {};
+template<>
+struct fex_gen_type<VkInternalAllocationType> {};
+template<>
+struct fex_gen_type<VkAllocationCallbacks> {};
+template<>
+struct fex_gen_config<&VkAllocationCallbacks::pUserData> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAllocationCallbacks::pfnAllocation> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAllocationCallbacks::pfnReallocation> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAllocationCallbacks::pfnFree> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAllocationCallbacks::pfnInternalAllocation> : fexgen::custom_repack {};
+template<>
+struct fex_gen_config<&VkAllocationCallbacks::pfnInternalFree> : fexgen::custom_repack {};
 
 // X11 interop
 template<>
