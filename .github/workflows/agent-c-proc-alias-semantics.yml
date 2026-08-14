@@ -1,0 +1,358 @@
+name: Agent C Vulkan proc alias semantics
+
+on:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths:
+      - .github/workflows/agent-c-proc-alias-semantics.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  semantics:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+      DEBIAN_FRONTEND: noninteractive
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      HOST: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Identity and dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          {
+            echo "fex_sha=$(git -C src rev-parse HEAD)"
+            uname -a
+            uname -m
+          } | tee "$R/identity.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools debootstrap
+
+      - name: Build native and x86 semantic probes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/proc-semantics.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #define VK_NO_PROTOTYPES
+          #include <vulkan/vulkan.h>
+
+          static void emit(const char *scope, const char *name, PFN_vkVoidFunction p) {
+            printf("%s|%s|%d\n", scope, name, p != NULL);
+          }
+
+          static void probe_gipa(PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
+                                 const char *scope, const char *const *names, size_t count) {
+            for (size_t i = 0; i < count; ++i) emit(scope, names[i], gipa(instance, names[i]));
+          }
+
+          static void probe_gdpa(PFN_vkGetDeviceProcAddr gdpa, VkDevice device,
+                                 const char *scope, const char *const *names, size_t count) {
+            for (size_t i = 0; i < count; ++i) emit(scope, names[i], gdpa(device, names[i]));
+          }
+
+          int main(void) {
+            void *vk = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!vk) { fprintf(stderr, "DLOPEN=%s\n", dlerror()); return 10; }
+
+            PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(vk, "vkGetInstanceProcAddr");
+            PFN_vkGetDeviceProcAddr gdpa_direct = (PFN_vkGetDeviceProcAddr)dlsym(vk, "vkGetDeviceProcAddr");
+            PFN_vkCreateInstance create_instance = (PFN_vkCreateInstance)dlsym(vk, "vkCreateInstance");
+            PFN_vkEnumerateInstanceVersion enum_version = (PFN_vkEnumerateInstanceVersion)dlsym(vk, "vkEnumerateInstanceVersion");
+            if (!gipa || !gdpa_direct || !create_instance) return 11;
+
+            const char *const global_names[] = {
+              "vkCreateInstance",
+              "vkEnumerateInstanceExtensionProperties",
+              "vkEnumerateInstanceLayerProperties",
+              "vkEnumerateInstanceVersion",
+              "vkGetInstanceProcAddr",
+              "vkGetDeviceProcAddr",
+              "vkDestroyInstance",
+              "vkCreateDevice",
+              "vkCreateShaderModule",
+              "vkGetPhysicalDeviceProperties2",
+              "vkGetPhysicalDeviceProperties2KHR",
+              "vkEnumeratePhysicalDeviceGroups",
+              "vkEnumeratePhysicalDeviceGroupsKHR",
+              "vkGetPhysicalDeviceExternalBufferProperties",
+              "vkGetPhysicalDeviceExternalBufferPropertiesKHR",
+              "vkCreateDebugReportCallbackEXT",
+              "vkCreateDebugUtilsMessengerEXT",
+            };
+            probe_gipa(gipa, VK_NULL_HANDLE, "GIPA_NULL", global_names,
+                       sizeof(global_names) / sizeof(global_names[0]));
+
+            uint32_t supported = VK_API_VERSION_1_0;
+            if (enum_version) (void)enum_version(&supported);
+            uint32_t requested = supported;
+            if (VK_API_VERSION_MAJOR(requested) > 1 ||
+                (VK_API_VERSION_MAJOR(requested) == 1 && VK_API_VERSION_MINOR(requested) > 3)) {
+              requested = VK_API_VERSION_1_3;
+            }
+            fprintf(stderr, "SUPPORTED_API=%u.%u.%u REQUESTED_API=%u.%u.%u\n",
+                    VK_API_VERSION_MAJOR(supported), VK_API_VERSION_MINOR(supported), VK_API_VERSION_PATCH(supported),
+                    VK_API_VERSION_MAJOR(requested), VK_API_VERSION_MINOR(requested), VK_API_VERSION_PATCH(requested));
+
+            VkApplicationInfo app = {
+              .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+              .pApplicationName = "fex-proc-alias-semantics",
+              .apiVersion = requested,
+            };
+            VkInstanceCreateInfo ici = {
+              .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+              .pApplicationInfo = &app,
+            };
+            VkInstance instance = VK_NULL_HANDLE;
+            VkResult r = create_instance(&ici, NULL, &instance);
+            if (r != VK_SUCCESS || instance == VK_NULL_HANDLE) {
+              fprintf(stderr, "CREATE_INSTANCE=%d\n", r);
+              return 12;
+            }
+
+            const char *const instance_names[] = {
+              "vkDestroyInstance",
+              "vkCreateDevice",
+              "vkGetDeviceProcAddr",
+              "vkCreateShaderModule",
+              "vkCmdDispatch",
+              "vkGetPhysicalDeviceProperties2",
+              "vkGetPhysicalDeviceProperties2KHR",
+              "vkGetPhysicalDeviceFeatures2",
+              "vkGetPhysicalDeviceFeatures2KHR",
+              "vkGetPhysicalDeviceMemoryProperties2",
+              "vkGetPhysicalDeviceMemoryProperties2KHR",
+              "vkGetPhysicalDeviceQueueFamilyProperties2",
+              "vkGetPhysicalDeviceQueueFamilyProperties2KHR",
+              "vkEnumeratePhysicalDeviceGroups",
+              "vkEnumeratePhysicalDeviceGroupsKHR",
+              "vkGetPhysicalDeviceExternalBufferProperties",
+              "vkGetPhysicalDeviceExternalBufferPropertiesKHR",
+              "vkCreateDebugReportCallbackEXT",
+              "vkCreateDebugUtilsMessengerEXT",
+            };
+            probe_gipa(gipa, instance, "GIPA_INSTANCE", instance_names,
+                       sizeof(instance_names) / sizeof(instance_names[0]));
+
+            PFN_vkEnumeratePhysicalDevices enum_pd =
+              (PFN_vkEnumeratePhysicalDevices)gipa(instance, "vkEnumeratePhysicalDevices");
+            PFN_vkGetPhysicalDeviceQueueFamilyProperties get_qprops =
+              (PFN_vkGetPhysicalDeviceQueueFamilyProperties)gipa(instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+            PFN_vkCreateDevice create_device = (PFN_vkCreateDevice)gipa(instance, "vkCreateDevice");
+            PFN_vkDestroyInstance destroy_instance = (PFN_vkDestroyInstance)gipa(instance, "vkDestroyInstance");
+            if (!enum_pd || !get_qprops || !create_device || !destroy_instance) return 13;
+
+            uint32_t pd_count = 0;
+            if (enum_pd(instance, &pd_count, NULL) != VK_SUCCESS || pd_count == 0) return 14;
+            VkPhysicalDevice *pds = calloc(pd_count, sizeof(*pds));
+            if (!pds) return 15;
+            if (enum_pd(instance, &pd_count, pds) != VK_SUCCESS) { free(pds); return 16; }
+            VkPhysicalDevice pd = pds[0];
+            free(pds);
+
+            uint32_t q_count = 0;
+            get_qprops(pd, &q_count, NULL);
+            if (q_count == 0) return 17;
+            VkQueueFamilyProperties *qprops = calloc(q_count, sizeof(*qprops));
+            if (!qprops) return 18;
+            get_qprops(pd, &q_count, qprops);
+            uint32_t qfam = UINT32_MAX;
+            for (uint32_t i = 0; i < q_count; ++i) {
+              if (qprops[i].queueCount != 0) { qfam = i; break; }
+            }
+            free(qprops);
+            if (qfam == UINT32_MAX) return 19;
+
+            float priority = 1.0f;
+            VkDeviceQueueCreateInfo qci = {
+              .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+              .queueFamilyIndex = qfam,
+              .queueCount = 1,
+              .pQueuePriorities = &priority,
+            };
+            VkDeviceCreateInfo dci = {
+              .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+              .queueCreateInfoCount = 1,
+              .pQueueCreateInfos = &qci,
+            };
+            VkDevice device = VK_NULL_HANDLE;
+            r = create_device(pd, &dci, NULL, &device);
+            if (r != VK_SUCCESS || device == VK_NULL_HANDLE) {
+              fprintf(stderr, "CREATE_DEVICE=%d\n", r);
+              return 20;
+            }
+
+            PFN_vkGetDeviceProcAddr gdpa =
+              (PFN_vkGetDeviceProcAddr)gipa(instance, "vkGetDeviceProcAddr");
+            if (!gdpa) gdpa = gdpa_direct;
+
+            const char *const device_names[] = {
+              "vkGetDeviceProcAddr",
+              "vkDestroyDevice",
+              "vkCreateShaderModule",
+              "vkCmdDispatch",
+              "vkGetDeviceQueue2",
+              "vkBindBufferMemory2",
+              "vkBindBufferMemory2KHR",
+              "vkGetBufferMemoryRequirements2",
+              "vkGetBufferMemoryRequirements2KHR",
+              "vkGetImageMemoryRequirements2",
+              "vkGetImageMemoryRequirements2KHR",
+              "vkCreateDescriptorUpdateTemplate",
+              "vkCreateDescriptorUpdateTemplateKHR",
+              "vkTrimCommandPool",
+              "vkTrimCommandPoolKHR",
+              "vkCmdDispatchBase",
+              "vkCmdDispatchBaseKHR",
+              "vkDestroyInstance",
+              "vkCreateDevice",
+              "vkGetPhysicalDeviceProperties2",
+              "vkGetPhysicalDeviceProperties2KHR",
+            };
+            probe_gdpa(gdpa, device, "GDPA_DEVICE", device_names,
+                       sizeof(device_names) / sizeof(device_names[0]));
+
+            PFN_vkDestroyDevice destroy_device = (PFN_vkDestroyDevice)gdpa(device, "vkDestroyDevice");
+            if (!destroy_device) return 21;
+            destroy_device(device, NULL);
+            destroy_instance(instance, NULL);
+            if (dlclose(vk) != 0) return 22;
+            return 0;
+          }
+          EOF
+
+          cc -O2 -g -Wall -Wextra -Werror \
+            -I"$GITHUB_WORKSPACE/src/External/Vulkan-Headers/include" \
+            /tmp/proc-semantics.c -ldl -o /tmp/proc-semantics-arm64
+          x86_64-linux-gnu-gcc -O2 -g -Wall -Wextra -Werror \
+            -I"$GITHUB_WORKSPACE/src/External/Vulkan-Headers/include" \
+            /tmp/proc-semantics.c -ldl -o /tmp/proc-semantics-x86_64
+          file /tmp/proc-semantics-arm64 /tmp/proc-semantics-x86_64 | tee "$R/probe.file.txt"
+
+      - name: Native ARM64 semantic oracle
+        shell: bash
+        run: |
+          set -euxo pipefail
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" > "$R/lvp-icd.txt"
+          VK_DRIVER_FILES="$LVP_ICD" /tmp/proc-semantics-arm64 \
+            >"$R/native.txt" 2>"$R/native.err"
+          cat "$R/native.txt"
+          cat "$R/native.err"
+
+      - name: Build exact candidate and focused Vulkan thunk pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF \
+            -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v >"$R/build-host.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
+
+      - name: Build package-resolved amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo debootstrap \
+            --arch=amd64 --foreign --variant=minbase --components=main,universe \
+            --include=libvulkan1,libx11-6 \
+            noble "$ROOTFS" http://archive.ubuntu.com/ubuntu \
+            >"$R/debootstrap.log" 2>&1
+          sudo find "$ROOTFS" -type f -name '*.deb' -print | sort | tee "$R/rootfs-debs.txt"
+          sed -n 's/^I: Extracting \([^ ]*\)\.\.\.$/\1/p' "$R/debootstrap.log" \
+            | sort -u | tee "$R/rootfs-already-extracted.txt"
+          : > "$R/rootfs-deferred-extracted.txt"
+          while IFS= read -r deb; do
+            pkg="$(dpkg-deb -f "$deb" Package)"
+            if grep -Fxq "$pkg" "$R/rootfs-already-extracted.txt"; then
+              continue
+            fi
+            echo "$pkg" | tee -a "$R/rootfs-deferred-extracted.txt"
+            sudo dpkg-deb -x "$deb" "$ROOTFS"
+          done < "$R/rootfs-debs.txt"
+
+          sudo cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
+          sudo mkdir -p "$ROOTFS/usr/local/bin"
+          sudo install -m755 /tmp/proc-semantics-x86_64 "$ROOTFS/usr/local/bin/proc-semantics"
+
+          X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          test -e "$X11"
+          for sym in XSync XGetVisualInfo XDisplayString; do
+            x86_64-linux-gnu-readelf -Ws "$X11" | grep -E " ${sym}(@|$)" | head -1
+          done
+
+      - name: FEX semantic matrix and native diff
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          set +e
+          timeout 90s env \
+            VK_DRIVER_FILES="$LVP_ICD" \
+            FEX_ROOTFS="$ROOTFS" \
+            FEX_THUNKHOSTLIBS="$HOST" \
+            "$FEX" /usr/local/bin/proc-semantics \
+            >"$R/fex.txt" 2>"$R/fex.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/fex.exit"
+          cat "$R/fex.txt"
+          cat "$R/fex.err"
+          test "$rc" -eq 0
+
+          diff -u "$R/native.txt" "$R/fex.txt" > "$R/native-vs-fex.diff" || true
+          if test -s "$R/native-vs-fex.diff"; then
+            echo 'NATIVE_FEX_MISMATCH=1' | tee "$R/summary.txt"
+            cat "$R/native-vs-fex.diff"
+          else
+            echo 'NATIVE_FEX_MISMATCH=0' | tee "$R/summary.txt"
+          fi
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-proc-alias-semantics-${{ github.run_id }}
+          path: receipts
+          if-no-files-found: warn
+          retention-days: 30
