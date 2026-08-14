@@ -105,25 +105,8 @@ jobs:
           grep -q 'callback_transaction_wait:.*ELF 64-bit.*x86-64' "$R/callback-fixtures.file"
 
           PROBE_DIR=fieldwork/investigations/fex-vulkan-thunk-lifecycle
-          cp "$PROBE_DIR/fex_vulkan_combined_probe.c" /tmp/fex_vulkan_combined_split_probe.c
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('/tmp/fex_vulkan_combined_split_probe.c')
-          s = p.read_text()
-          old = '''  PFN_vkEnumerateInstanceVersion enumerate_version = (PFN_vkEnumerateInstanceVersion)dlsym(lib, "vkEnumerateInstanceVersion");\n  Require(gipa && create_instance && destroy_instance && enumerate_version, "resolve Vulkan entrypoints");\n'''
-          new = '''  PFN_vkEnumerateInstanceVersion enumerate_version = (PFN_vkEnumerateInstanceVersion)dlsym(lib, "vkEnumerateInstanceVersion");\n  Require(gipa && create_instance && destroy_instance && enumerate_version, "resolve Vulkan entrypoints");\n  PFN_vkEnumerateInstanceVersion dynamic_enumerate_version =\n    (PFN_vkEnumerateInstanceVersion)gipa(NULL, "vkEnumerateInstanceVersion");\n  Require(dynamic_enumerate_version != NULL, "resolve dynamic version PFN");\n'''
-          if s.count(old) != 1:
-              raise SystemExit('combined probe dynamic-PFN anchor missing')
-          s = s.replace(old, new, 1)
-          old = '''  int retained = AddressMapped((const void *)gipa);\n  fprintf(stderr, "COMBINED after-app-close retained=%d gipa=%p\\n", retained, (void *)gipa);\n  Require(retained, "guest Vulkan wrapper retained after application close");\n\n  version = 0;\n  vr = enumerate_version(&version);\n  fprintf(stderr, "COMBINED post-close-version result=%d version=0x%x\\n", vr, version);\n  Require(vr == VK_SUCCESS, "saved Vulkan entrypoint after close");\n'''
-          new = '''  int retained = AddressMapped((const void *)gipa);\n  fprintf(stderr, "COMBINED after-app-close wrapper-mapped=%d gipa=%p dynamic-version=%p\\n",\n          retained, (void *)gipa, (void *)dynamic_enumerate_version);\n  Require(retained == 0, "guest Vulkan wrapper unload after application close");\n\n  version = 0;\n  vr = dynamic_enumerate_version(&version);\n  fprintf(stderr, "COMBINED post-close-dynamic-version result=%d version=0x%x\\n", vr, version);\n  Require(vr == VK_SUCCESS, "saved dynamic Vulkan PFN after wrapper unload");\n'''
-          if s.count(old) != 1:
-              raise SystemExit('combined probe lifetime assertion anchor missing')
-          p.write_text(s.replace(old, new, 1))
-          PY
-
           x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
-            /tmp/fex_vulkan_combined_split_probe.c -ldl -o /tmp/fex_vulkan_combined_split_probe
+            "$PROBE_DIR/fex_vulkan_combined_probe.c" -ldl -o /tmp/fex_vulkan_combined_split_probe
           x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
             "$PROBE_DIR/fex_vulkan_pfn_unload_probe.c" -ldl -o /tmp/fex_vulkan_pfn_unload_probe
           file /tmp/fex_vulkan_combined_split_probe /tmp/fex_vulkan_pfn_unload_probe \
@@ -257,6 +240,7 @@ jobs:
           cat "$R/pfn-close.err"
           grep -q 'PROBE after-close' "$R/pfn-close.err"
           grep -q 'PROBE return where=after-real-close result=0' "$R/pfn-close.err"
+          grep -q 'PROBE saved-dynamic-pfn-returned-after-close' "$R/pfn-close.err"
 
       - name: Gate 4 - combined debug-report routing plus split lifetime
         shell: bash
