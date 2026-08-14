@@ -1,0 +1,337 @@
+name: CUDA resident callback lifetime v1
+
+on:
+  push:
+    branches: [diagnostic/cuda-resident-runtime-v1]
+    paths:
+      - .github/workflows/cuda-resident-callback-runtime-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-callback-runtime:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 80
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs-cuda-callback-v1
+      R: ${{ github.workspace }}/receipts-cuda-callback-v1
+      H: ${{ github.workspace }}/host-cuda-callback-v1
+      M: ${{ github.workspace }}/mock-cuda-callback-v1
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and committed-source checks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H" "$M"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+          git diff --check
+          grep -q 'generate(libcuda .* RESIDENT_BRIDGE)' ThunkLibs/GuestLibs/CMakeLists.txt
+          grep -q 'FEXGetResidentCallerForHostFunction(name)' ThunkLibs/libcuda/libcuda_Guest.cpp
+          grep -q 'FEXAllocateResidentHostTrampolineForGuestFunction' ThunkLibs/libcuda/libcuda_Guest.cpp
+          test -f ThunkLibs/libcuda_bridge/Guest.cpp
+          test ! -e .github/workflows/materialize-cuda-resident-source-v1.yml
+
+      - name: Build FEX and CUDA host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1 \
+            || { tail -n 260 "$R/cmake-host.log"; exit 1; }
+          cmake --build build --target FEX FEXServer cuda-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 520 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libcuda-host.so "$H/libcuda-host.so"
+
+      - name: Build stock CUDA guest callback baseline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cmake = Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s = cmake.read_text()
+          old = '''generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp RESIDENT_BRIDGE)\n\nadd_library(libcuda_bridge-guest-deps INTERFACE)\ntarget_link_libraries(libcuda_bridge-guest-deps INTERFACE libcuda-guest-deps)\nset(GEN_libcuda_bridge "${GEN_libcuda_BRIDGE}")\nadd_guest_lib(cuda_bridge "libfex-cuda-bridge.so")\nset_target_properties(cuda_bridge-guest PROPERTIES OUTPUT_NAME "fex-cuda-bridge")\ntarget_link_options(cuda_bridge-guest PRIVATE "LINKER:-z,nodelete")\n\nadd_guest_lib(cuda "libcuda.so.1")\ntarget_link_libraries(cuda-guest PRIVATE cuda_bridge-guest)'''
+          new = '''generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp)\nadd_guest_lib(cuda "libcuda.so.1")'''
+          if s.count(old) != 1:
+              raise SystemExit('committed CUDA resident CMake block missing')
+          cmake.write_text(s.replace(old, new, 1))
+
+          guest = Path('ThunkLibs/libcuda/libcuda_Guest.cpp')
+          s = guest.read_text()
+          old = '''#include "common/Guest.h"\n#include "cuda_defines.h"\n#include "thunkgen_guest_libcuda_bridge_accessors.inl"\n\n#define AllocateHostTrampolineForGuestFunction FEXAllocateResidentHostTrampolineForGuestFunction\n#include "thunkgen_guest_libcuda.inl"\n#undef AllocateHostTrampolineForGuestFunction'''
+          new = '''#include "common/Guest.h"\n#include "cuda_defines.h"\n\n#include "thunkgen_guest_libcuda.inl"'''
+          if s.count(old) != 1:
+              raise SystemExit('committed CUDA resident guest include block missing')
+          s = s.replace(old, new, 1)
+          if s.count('FEXGetResidentCallerForHostFunction(name)') != 1:
+              raise SystemExit('committed resident invoker anchor missing')
+          guest.write_text(s.replace('FEXGetResidentCallerForHostFunction(name)', 'GetCallerForHostFunction(name)', 1))
+          PY
+          git diff --check
+          cmake -S ThunkLibs/GuestLibs -B guest-base -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest-base.log" 2>&1 \
+            || { tail -n 280 "$R/cmake-guest-base.log"; exit 1; }
+          cmake --build guest-base --target cuda-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest-base.log" 2>&1 || { tail -n 520 "$R/build-guest-base.log"; exit 1; }
+          cp guest-base/libcuda-guest.so "$R/libcuda-baseline.so"
+          git checkout -- ThunkLibs/GuestLibs/CMakeLists.txt ThunkLibs/libcuda/libcuda_Guest.cpp
+          git diff --quiet
+
+      - name: Build committed resident CUDA guest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest-resident -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest-resident.log" 2>&1 \
+            || { tail -n 280 "$R/cmake-guest-resident.log"; exit 1; }
+          cmake --build guest-resident --target cuda-guest cuda_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest-resident.log" 2>&1 || { tail -n 620 "$R/build-guest-resident.log"; exit 1; }
+          test -f guest-resident/libcuda-guest.so
+          test -f guest-resident/libfex-cuda-bridge.so
+
+          awk '/^extern "C" uintptr_t fex_bridge_libcuda_unpacker_/{n++} END{print n+0}' \
+            guest-resident/gen/thunkgen_guest_libcuda_bridge.inl | tee "$R/resident-unpacker-count.txt"
+          awk '/^template<> struct FEXResidentBridgeUnpacker</{n++} END{print n+0}' \
+            guest-resident/gen/thunkgen_guest_libcuda_bridge_accessors.inl | tee "$R/accessor-unpacker-count.txt"
+          test "$(cat "$R/resident-unpacker-count.txt")" = 1
+          test "$(cat "$R/accessor-unpacker-count.txt")" = 1
+          grep -q 'NEEDED.*libfex-cuda-bridge.so' <(readelf -d guest-resident/libcuda-guest.so)
+          grep -q 'FLAGS_1.*NODELETE' <(readelf -d guest-resident/libfex-cuda-bridge.so)
+          sha256sum guest-resident/libcuda-guest.so guest-resident/libfex-cuda-bridge.so \
+            | tee "$R/resident-elf-sha256.txt"
+
+      - name: Build fake native driver and callback probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/mockcuda_callback.c <<'EOF'
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+
+          typedef int CUresult;
+          typedef void (*CUhostFn)(void *);
+          static CUhostFn saved_callback;
+          static void *saved_data;
+
+          __attribute__((visibility("default")))
+          CUresult cuLaunchHostFunc(void *stream, CUhostFn fn, void *userData) {
+            fprintf(stderr, "HOST_CULAUNCH callback=%p data=%p stream=%p\n", (void *)fn, userData, stream);
+            saved_callback = fn;
+            saved_data = userData;
+            return 0;
+          }
+
+          __attribute__((visibility("default")))
+          CUresult cuCtxSynchronize(void) {
+            fprintf(stderr, "HOST_CUSYNC saved_callback=%p data=%p\n", (void *)saved_callback, saved_data);
+            if (saved_callback) {
+              CUhostFn cb = saved_callback;
+              void *data = saved_data;
+              saved_callback = 0;
+              saved_data = 0;
+              cb(data);
+            }
+            return 0;
+          }
+          EOF
+          clang-18 -shared -fPIC -O2 -Wall -Wextra -Werror /tmp/mockcuda_callback.c \
+            -Wl,-soname,libcuda.so.1 -o "$M/libcuda.so.1"
+
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat > /tmp/cuda_callback_probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mman.h>
+
+          typedef int (*CULAUNCH)(void *, void (*)(void *), void *);
+          typedef int (*CUSYNC)(void);
+          struct span { uintptr_t a, b; };
+          static struct span old_ranges[24];
+          static unsigned old_count;
+          static int callback_count;
+
+          static void guest_callback(void *opaque) {
+            int value = (int)(intptr_t)opaque;
+            ++callback_count;
+            fprintf(stderr, "GUEST_CUHOSTFN value=%d count=%d\n", value, callback_count);
+          }
+
+          static int map_has(void *p, const char *needle, int verbose) {
+            FILE *f = fopen("/proc/self/maps", "r");
+            char line[1024];
+            uintptr_t x = (uintptr_t)p;
+            if (!f) return -1;
+            while (fgets(line, sizeof(line), f)) {
+              unsigned long a, b;
+              if (sscanf(line, "%lx-%lx", &a, &b) == 2 && x >= a && x < b) {
+                if (verbose) fprintf(stderr, "MAP %p %s", p, line);
+                int ok = strstr(line, needle) != NULL;
+                fclose(f);
+                return ok;
+              }
+            }
+            fclose(f);
+            if (verbose) fprintf(stderr, "UNMAPPED %p\n", p);
+            return 0;
+          }
+
+          static void capture_wrapper(void) {
+            FILE *f = fopen("/proc/self/maps", "r");
+            char line[1024];
+            old_count = 0;
+            if (!f) exit(70);
+            while (fgets(line, sizeof(line), f)) {
+              unsigned long a, b;
+              if (strstr(line, "/usr/lib/x86_64-linux-gnu/libcuda.so.1") &&
+                  sscanf(line, "%lx-%lx", &a, &b) == 2 && old_count < 24) {
+                old_ranges[old_count++] = (struct span){a, b};
+                fprintf(stderr, "OLD_CUDA_RANGE %lx-%lx\n", a, b);
+              }
+            }
+            fclose(f);
+            if (!old_count) exit(71);
+          }
+
+          static void reserve_old(void) {
+            for (unsigned i = 0; i < old_count; ++i) {
+              size_t n = old_ranges[i].b - old_ranges[i].a;
+              void *r = mmap((void *)old_ranges[i].a, n, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+              if (r == MAP_FAILED) {
+                fprintf(stderr, "RESERVE_FAIL %lx-%lx errno=%d %s\n",
+                        old_ranges[i].a, old_ranges[i].b, errno, strerror(errno));
+                exit(72);
+              }
+            }
+          }
+
+          int main(int argc, char **argv) {
+            int resident = argc > 1 && strcmp(argv[1], "resident") == 0;
+            void *h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!h) { fprintf(stderr, "DLOPEN_FAIL %s\n", dlerror()); return 1; }
+            CULAUNCH launch0 = (CULAUNCH)dlsym(h, "cuLaunchHostFunc");
+            if (!launch0) { fprintf(stderr, "LAUNCH_DLSYM_FAIL %s\n", dlerror()); return 2; }
+            if (launch0(NULL, guest_callback, (void *)(intptr_t)77) != 0) return 3;
+            if (callback_count != 0) return 4;
+            fprintf(stderr, "CALLBACK_REGISTERED launch=%p guest_target=%p resident=%d\n",
+                    (void *)launch0, (void *)guest_callback, resident);
+            capture_wrapper();
+            if (dlclose(h)) return 5;
+            if (map_has((void *)launch0, "/usr/lib/x86_64-linux-gnu/libcuda.so.1", 1) != 0) return 6;
+            reserve_old();
+
+            void *h2 = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!h2) { fprintf(stderr, "RELOAD_FAIL %s\n", dlerror()); return 7; }
+            CUSYNC sync1 = (CUSYNC)dlsym(h2, "cuCtxSynchronize");
+            CULAUNCH launch1 = (CULAUNCH)dlsym(h2, "cuLaunchHostFunc");
+            if (!sync1 || !launch1) return 8;
+            fprintf(stderr, "CALLBACK_TRIGGER_BEGIN old_launch=%p new_launch=%p moved=%d\n",
+                    (void *)launch0, (void *)launch1, launch0 != launch1);
+            int rc = sync1();
+            fprintf(stderr, "CALLBACK_TRIGGER_RETURN rc=%d count=%d\n", rc, callback_count);
+            if (!resident) {
+              fprintf(stderr, "BASELINE_UNEXPECTED_CALLBACK_RETURN\n");
+              return 90;
+            }
+            if (rc != 0 || callback_count != 1 || launch0 == launch1) return 9;
+            if (dlclose(h2)) return 10;
+            fprintf(stderr, "CUDA_RESIDENT_CALLBACK_AFTER_UNLOAD_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/cuda_callback_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/cuda_callback_probe"
+
+      - name: Prove stock generated CUDA callback unpacker dies after wrapper unload
+        shell: bash
+        run: |
+          set -uxo pipefail
+          cp "$R/libcuda-baseline.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libcuda.so.1"
+          rm -f "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-cuda-bridge.so"
+          set +e
+          LD_LIBRARY_PATH="$M" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 25s \
+            build/Bin/FEX /opt/fex-ci/cuda_callback_probe baseline > "$R/baseline.out" 2> "$R/baseline.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/baseline.exit"
+          cat "$R/baseline.err"
+          test "$rc" -ne 0
+          grep -q 'CALLBACK_REGISTERED' "$R/baseline.err"
+          grep -q 'UNMAPPED ' "$R/baseline.err"
+          grep -q 'CALLBACK_TRIGGER_BEGIN' "$R/baseline.err"
+          grep -q 'HOST_CUSYNC saved_callback=' "$R/baseline.err"
+          ! grep -q 'GUEST_CUHOSTFN' "$R/baseline.err"
+          ! grep -q 'CALLBACK_TRIGGER_RETURN' "$R/baseline.err"
+          ! grep -q 'BASELINE_UNEXPECTED_CALLBACK_RETURN' "$R/baseline.err"
+          echo CUDA_BASELINE_CALLBACK_UNPACKER_FAILURE_PROVEN | tee "$R/baseline-result.txt"
+
+      - name: Prove committed resident CUDA callback unpacker survives unload and moved reload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp guest-resident/libcuda-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libcuda.so.1"
+          cp guest-resident/libfex-cuda-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-cuda-bridge.so"
+          LD_LIBRARY_PATH="$M" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 35s \
+            build/Bin/FEX /opt/fex-ci/cuda_callback_probe resident > "$R/resident.out" 2> "$R/resident.err"
+          cat "$R/resident.err"
+          grep -q 'CALLBACK_REGISTERED' "$R/resident.err"
+          grep -q 'UNMAPPED ' "$R/resident.err"
+          grep -q 'CALLBACK_TRIGGER_BEGIN' "$R/resident.err"
+          grep -q 'moved=1' "$R/resident.err"
+          grep -q 'HOST_CUSYNC saved_callback=' "$R/resident.err"
+          grep -q 'GUEST_CUHOSTFN value=77 count=1' "$R/resident.err"
+          grep -q 'CALLBACK_TRIGGER_RETURN rc=0 count=1' "$R/resident.err"
+          grep -q 'CUDA_RESIDENT_CALLBACK_AFTER_UNLOAD_OK' "$R/resident.err"
+          echo CUDA_RESIDENT_CALLBACK_RUNTIME_OK | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-resident-callback-v1-${{ github.run_id }}
+          path: receipts-cuda-callback-v1
+          retention-days: 30
