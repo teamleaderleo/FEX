@@ -1,0 +1,46 @@
+name: Vulkan generated custom registry experiment
+on:
+  workflow_dispatch:
+  push:
+    branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
+    paths:
+      - LINUX_FIELDWORK_GENERATED_CUSTOM_REGISTRY.py
+      - .github/workflows/linux-fieldwork-vulkan-generated-registry.yml
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang lld clang-tools libclang-dev llvm-dev pkg-config ccache gcc-x86-64-linux-gnu g++-x86-64-linux-gnu gcc-i686-linux-gnu g++-i686-linux-gnu libcap-dev libglfw3-dev libepoxy-dev python3-dev libsdl2-dev libasound2-dev libdrm-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libgl-dev libegl-dev libvulkan-dev
+      - name: Apply routing and generator candidates
+        run: |
+          set -euxo pipefail
+          git apply --check LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
+          git apply LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
+          python3 LINUX_FIELDWORK_GENERATED_CUSTOM_REGISTRY.py
+          git diff --check
+      - name: Build FEX
+        run: |
+          set -euxo pipefail
+          C=$(dirname "$(find /usr/lib/llvm-18 -name ClangConfig.cmake -print -quit)")
+          L=$(dirname "$(find /usr/lib/llvm-18 -name LLVMConfig.cmake -print -quit)")
+          CC=clang CXX=clang++ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX="$PWD/install" -DUSE_LINKER=lld -DENABLE_LTO=False -DENABLE_ASSERTIONS=True -DBUILD_TESTING=False -DBUILD_THUNKS=True -DBUILD_FEXCONFIG=False -DENABLE_CLANG_THUNKS=True -DRANGES_NATIVE=OFF -DClang_DIR="$C" -DLLVM_DIR="$L"
+          cmake --build build -j"$(nproc)"
+      - name: Verify generated registry
+        run: |
+          set -euxo pipefail
+          files=$(grep -RIl '#define FOREACH_internal_CUSTOM_HOST_SYMBOL' build)
+          test -n "$files"
+          printf '%s\n' "$files"
+          for symbol in vkCreateDebugReportCallbackEXT vkDestroyDebugReportCallbackEXT vkCreateDebugUtilsMessengerEXT vkCreateInstance vkCreateDevice; do
+            grep -R -q "EXPAND($symbol," build
+          done
+          grep -R -A 30 '#define FOREACH_internal_CUSTOM_HOST_SYMBOL' build | tee /tmp/generated-custom-registry.txt
