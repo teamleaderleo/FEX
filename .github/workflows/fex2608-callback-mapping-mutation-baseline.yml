@@ -1,0 +1,163 @@
+name: FEX-2608 callback mapping-mutation baseline
+
+on:
+  push:
+    branches: [ci/fex2608-staged-lifetime-integration-20260814]
+    paths:
+      - .github/workflows/fex2608-callback-mapping-mutation-baseline.yml
+      - .github/fieldwork/patch_callback_mapping_mutation_fixture.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      PRODUCT_REF: candidate/fex2608-combined-thunk-lifetime-minimal
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-mapmut-baseline
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout fixture carrier
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout minimal candidate
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PRODUCT_REF }}
+          path: product
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Checkout retained synthetic source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-combined-repair
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Install build and cross dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev binutils
+
+      - name: Build mapping-mutation fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 .github/fieldwork/patch_callback_mapping_mutation_fixture.py /tmp/repro/fex-full-thunk-pair
+          (cd /tmp/repro/fex-full-thunk-pair && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) > "$R/build-fixture.log" 2>&1
+          file /tmp/repro/fex-full-thunk-pair/guest/callback_mapping_mutation | tee "$R/fixture.file"
+          grep -q 'ELF 64-bit.*x86-64' "$R/fixture.file"
+
+      - name: Build minimal FEX candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S product -B product/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build product/build --target FEX -- -j"$(nproc)" > "$R/build-fex.log" 2>&1
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Run mapping mutation matrix
+        shell: bash
+        run: |
+          set -uo pipefail
+          FIXTURE_HOST=/tmp/repro/fex-full-thunk-pair/host
+          BIN="$GITHUB_WORKSPACE/product/build/Bin/FEX"
+          MODES=(
+            map-fixed
+            map-fixed-fail
+            map-noreplace
+            mremap-move
+            mremap-dest
+            mremap-shrink-tail
+            mremap-shrink-prefix
+            mremap-fail
+            mremap-dontunmap
+            shmdt
+            shm-remap
+          )
+          : > "$R/results.tsv"
+          for mode in "${MODES[@]}"; do
+            set +e
+            (cd "$ROOTFS/opt/fex-ci" && \
+              FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 20s \
+                "$BIN" /opt/fex-ci/guest/callback_mapping_mutation "$mode") \
+              > "$R/$mode.out" 2> "$R/$mode.err"
+            rc=$?
+            set -e
+            printf '%s\t%s\n' "$mode" "$rc" | tee -a "$R/results.tsv"
+            cat "$R/$mode.err"
+          done
+
+          # Existing munmap-only descriptor retirement should preserve non-destructive/error cases.
+          grep -qx $'map-fixed-fail\t0' "$R/results.tsv"
+          grep -qx $'map-noreplace\t0' "$R/results.tsv"
+          grep -qx $'mremap-shrink-prefix\t0' "$R/results.tsv"
+          grep -qx $'mremap-fail\t0' "$R/results.tsv"
+
+          # These operations destroy or replace the registered callback generation without GuestMunmap.
+          # The fixture returns 20 when the escaped old host trampoline fails to reject with status 113.
+          grep -qx $'map-fixed\t20' "$R/results.tsv"
+          grep -qx $'mremap-move\t20' "$R/results.tsv"
+          grep -qx $'mremap-dest\t20' "$R/results.tsv"
+          grep -qx $'mremap-shrink-tail\t20' "$R/results.tsv"
+          grep -qx $'mremap-dontunmap\t20' "$R/results.tsv"
+          grep -qx $'shmdt\t20' "$R/results.tsv"
+          grep -qx $'shm-remap\t20' "$R/results.tsv"
+
+      - name: Baseline summary
+        shell: bash
+        run: |
+          cat "$R/results.tsv"
+          cat > "$R/BASELINE.txt" <<'EOF'
+          Exact minimal candidate proves callback lifetime coverage gaps outside GuestMunmap:
+          MAP_FIXED, mremap source/destination/shrink/DONTUNMAP, shmdt, and SHM_REMAP all allow an escaped old trampoline to outlive the guest generation.
+          Error/NOREPLACE and unaffected-prefix cases stay callable.
+          EOF
+
+      - name: Upload baseline receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex2608-callback-mapmut-baseline-${{ github.run_id }}
+          path: receipts-mapmut-baseline
+          retention-days: 30
