@@ -1,0 +1,207 @@
+name: CUDA direct role bridge retained callback
+
+on:
+  push:
+    branches: [diagnostic/cuda-direct-role-bridge-20260814]
+    paths:
+      - .github/fieldwork/apply_thunkgen_guest_bridge_output.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles_compat.py
+      - LinuxFieldwork/apply_nested_callback_member_generator.py
+      - LinuxFieldwork/apply_cuda_direct_role_bridge.py
+      - LinuxFieldwork/apply_cuda_trampoline_trace.py
+      - LinuxFieldwork/cuda_hostnode_moved_reload_probe.c
+      - LinuxFieldwork/synthetic_libcuda_retained_hostnode.c
+      - .github/workflows/cuda-direct-role-retained-callback.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  retained-callback:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [local, resident]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    env:
+      MODE: ${{ matrix.mode }}
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      R: ${{ github.workspace }}/direct-cuda-${{ matrix.mode }}
+      HOST: ${{ github.workspace }}/direct-cuda-host-${{ matrix.mode }}
+      SYNTH: ${{ github.workspace }}/direct-cuda-synth-${{ matrix.mode }}
+      ROOTFS: ${{ github.workspace }}/direct-cuda-rootfs-${{ matrix.mode }}
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and exact-product provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST" "$SYNTH"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          test ! -e LinuxFieldwork/extract_guest_bridge.py
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config python3 \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev binutils
+
+      - name: Apply callback_member and selected bridge policy
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_nested_callback_member_generator.py
+          git checkout "$PRODUCT_SHA" -- ThunkLibs/libdrm/libdrm_interface.cpp
+          if [ "$MODE" = local ]; then
+            python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/libcuda/libcuda_interface.cpp')
+          s=p.read_text()
+          old='''template<>\nstruct fex_gen_type<CUDA_HOST_NODE_PARAMS_st> : fexgen::opaque_type {};\n'''
+          new='''template<>\nstruct fex_gen_type<CUDA_HOST_NODE_PARAMS_st> {};\ntemplate<>\nstruct fex_gen_config<&CUDA_HOST_NODE_PARAMS_st::_0> : fexgen::callback_member {};\n'''
+          assert s.count(old)==1, s.count(old)
+          p.write_text(s.replace(old,new,1))
+          PY
+          else
+            python3 .github/fieldwork/apply_thunkgen_guest_bridge_output.py .
+            python3 .github/fieldwork/apply_thunkgen_bridge_roles.py .
+            python3 .github/fieldwork/apply_thunkgen_bridge_roles_compat.py .
+            python3 LinuxFieldwork/apply_cuda_direct_role_bridge.py
+          fi
+          python3 LinuxFieldwork/apply_cuda_trampoline_trace.py
+          git diff --check
+          git diff -- ThunkLibs FEXCore Source > "$R/product.diff"
+          if [ "$MODE" = resident ]; then
+            ! grep -q 'extract_guest_bridge' "$R/product.diff"
+          fi
+
+      - name: Build traced FEX host and CUDA host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer cuda-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 320 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libcuda-host.so "$HOST/libcuda-host.so"
+
+      - name: Build selected CUDA guest policy
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          if [ "$MODE" = resident ]; then
+            cmake --build guest --target cuda-guest cuda_bridge-guest -- -j"$(nproc)" -v \
+              > "$R/build-guest.log" 2>&1 || { tail -n 360 "$R/build-guest.log"; exit 1; }
+            test -f guest/gen/thunkgen_bridge_libcuda.inl
+            test -f guest/gen/thunkgen_bridge_accessors_libcuda.inl
+            test -f guest/libfex-cuda-bridge.so
+            cp guest/gen/thunkgen_bridge_libcuda.inl "$R/cuda-bridge.inl"
+            cp guest/gen/thunkgen_bridge_accessors_libcuda.inl "$R/cuda-accessors.inl"
+            grep -q 'FEX_BRIDGE_ROLE' "$R/cuda-bridge.inl"
+            grep -q 'unpacker=1' "$R/cuda-bridge.inl"
+            grep -q 'fex_bridge_unpacker_' "$R/cuda-accessors.inl"
+            readelf -d guest/libcuda-guest.so | tee "$R/wrapper.dynamic"
+            readelf -d guest/libfex-cuda-bridge.so | tee "$R/bridge.dynamic"
+            ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+            grep -q 'NEEDED.*libfex-cuda-bridge.so' "$R/wrapper.dynamic"
+            grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          else
+            cmake --build guest --target cuda-guest -- -j"$(nproc)" -v \
+              > "$R/build-guest.log" 2>&1 || { tail -n 320 "$R/build-guest.log"; exit 1; }
+            readelf -d guest/libcuda-guest.so > "$R/wrapper.dynamic"
+            ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          fi
+
+      - name: Prepare synthetic retained endpoint and amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libcuda.so.1 \
+            LinuxFieldwork/synthetic_libcuda_retained_hostnode.c -o "$SYNTH/libcuda.so.1"
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libcuda-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libcuda.so.1"
+          if [ "$MODE" = resident ]; then
+            cp guest/libfex-cuda-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-cuda-bridge.so"
+          fi
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror \
+            LinuxFieldwork/cuda_hostnode_moved_reload_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/probe"
+
+      - name: Execute retained-registration-only moved reload
+        shell: bash
+        run: |
+          set -uxo pipefail
+          set +e
+          LD_LIBRARY_PATH="$SYNTH" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            build/Bin/FEX /opt/fex-ci/probe > "$R/fex.out" 2> "$R/fex.err"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/fex.exit"
+          cat "$R/fex.err"
+          grep -q 'FEX_TRAMP_CREATE unpacker=' "$R/fex.err"
+          grep -q 'MARK launch1-return rc=0 callbacks=1' "$R/fex.err"
+          grep -q 'MARK close1-return old_add_mapped=0' "$R/fex.err"
+          grep -q 'GEN2 .* moved=1' "$R/fex.err"
+          grep -q 'MARK launch2-enter retained-registration-only' "$R/fex.err"
+          python3 - "$R/fex.err" "$R/ownership.txt" <<'PY'
+          import re,sys
+          from pathlib import Path
+          text=Path(sys.argv[1]).read_text(errors='replace')
+          ranges=[(int(a,16),int(b,16)) for a,b in re.findall(r'RESERVED (0x[0-9a-f]+)-(0x[0-9a-f]+)',text)]
+          rows=[]
+          for a,b in re.findall(r'FEX_TRAMP_CREATE unpacker=(0x[0-9a-f]+) target=(0x[0-9a-f]+)',text):
+              u=int(a,16); t=int(b,16); rows.append((u,t,any(lo<=u<hi for lo,hi in ranges)))
+          out=[f'retired_ranges={len(ranges)}',f'trampolines={len(rows)}']
+          out += [f'trampoline[{i}] unpacker={u:#x} target={t:#x} unpacker_in_retired_wrapper={int(retired)}' for i,(u,t,retired) in enumerate(rows)]
+          Path(sys.argv[2]).write_text('\n'.join(out)+'\n')
+          print('\n'.join(out))
+          assert ranges and rows
+          PY
+          if [ "$MODE" = local ]; then
+            test "$rc" -eq 139
+            grep -q 'unpacker_in_retired_wrapper=1' "$R/ownership.txt"
+            ! grep -q 'CUDA_RETAINED_CALLBACK count=2' "$R/fex.err"
+            ! grep -q 'MARK launch2-return' "$R/fex.err"
+          else
+            test "$rc" -eq 0
+            grep -q 'unpacker_in_retired_wrapper=0' "$R/ownership.txt"
+            grep -q 'CUDA_RETAINED_CALLBACK count=2 user=0x12345678' "$R/fex.err"
+            grep -q 'MARK launch2-return rc=0 callbacks=2' "$R/fex.err"
+          fi
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-direct-role-${{ matrix.mode }}-${{ github.run_id }}
+          path: direct-cuda-${{ matrix.mode }}
+          retention-days: 30
