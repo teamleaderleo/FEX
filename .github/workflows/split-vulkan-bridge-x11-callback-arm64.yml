@@ -1,0 +1,279 @@
+name: Split resident Vulkan X11 callback bridge ARM64
+
+on:
+  push:
+    branches: [ci/split-vulkan-bridge-x11-callback-20260814]
+    paths:
+      - .github/workflows/split-vulkan-bridge-x11-callback-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  split-vulkan-x11-callback:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64-split-x11
+      R: ${{ github.workspace }}/receipts-split-x11
+      HOST: ${{ github.workspace }}/host-split-x11
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-customir-retirement
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and native Vulkan control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST" bridge
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers vulkan-tools \
+            xvfb x11-utils binutils
+          LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP"
+          echo "$LVP" > "$R/lvp.txt"
+          VK_DRIVER_FILES="$LVP" vulkaninfo --summary > "$R/native-vulkaninfo.out" 2> "$R/native-vulkaninfo.err"
+
+      - name: Build pristine FEX, Vulkan host thunk, and generated guest source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" \
+            > "$R/build-host.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+
+          cmake -S src/ThunkLibs/GuestLibs -B guest-baseline -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-baseline.log" 2>&1
+          cmake --build guest-baseline --target vulkan-guest -- -j"$(nproc)" \
+            > "$R/build-baseline.log" 2>&1
+          GEN="$(find guest-baseline -name thunkgen_guest_libvulkan.inl -type f | head -n1)"
+          test -n "$GEN"
+          cp "$GEN" "$R/thunkgen_guest_libvulkan.inl"
+          GEN="$GEN" OUT="$R/xlib-support-callback.inc" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          sig = 'unsigned int (struct VkPhysicalDevice_T *, unsigned int, struct _XDisplay *, unsigned long)'
+          lines = Path(os.environ['GEN']).read_text().splitlines()
+          matches = [line for line in lines if 'MAKE_CALLBACK_THUNK' in line and sig in line]
+          if len(matches) != 1:
+              raise SystemExit(f'expected exactly one generated Xlib-support thunk, got {len(matches)}: {matches!r}')
+          Path(os.environ['OUT']).write_text(matches[0] + '\n')
+          print(matches[0])
+          PY
+
+      - name: Build process-resident bidirectional X11 bridge runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp "$R/xlib-support-callback.inc" /tmp/xlib-support-callback.inc
+          cat >/tmp/fex-vulkan-bridge.cpp <<'EOF'
+          #define VK_USE_64_BIT_PTR_DEFINES 0
+          #define VK_USE_PLATFORM_XLIB_XRANDR_EXT
+          #define VK_USE_PLATFORM_XLIB_KHR
+          #define VK_USE_PLATFORM_XCB_KHR
+          #define VK_USE_PLATFORM_WAYLAND_KHR
+          #include <vulkan/vulkan.h>
+          #include <X11/Xlib.h>
+          #include <X11/Xutil.h>
+          #include "common/Guest.h"
+          #include <cstdint>
+          #include "/tmp/xlib-support-callback.inc"
+
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXVulkanBridgeXlibSupportInvoker() {
+            return reinterpret_cast<uintptr_t>(
+              GetCallerForHostFunction((PFN_vkGetPhysicalDeviceXlibPresentationSupportKHR)nullptr));
+          }
+
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXVulkanBridgeXSyncUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XSync)>::Unpack);
+          }
+
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXVulkanBridgeXGetVisualInfoUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
+          }
+
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXVulkanBridgeXDisplayStringUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XDisplayString)>::Unpack);
+          }
+          EOF
+          x86_64-linux-gnu-g++ -std=c++20 -shared -fPIC -O2 \
+            -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" \
+            -I"$GITHUB_WORKSPACE/src/External/Vulkan-Headers/include" \
+            -Wl,-z,nodelete -Wl,-soname,libfex-vulkan-bridge.so.1 \
+            /tmp/fex-vulkan-bridge.cpp -o bridge/libfex-vulkan-bridge.so.1 \
+            > "$R/bridge.compile.out" 2> "$R/bridge.compile.err" || { cat "$R/bridge.compile.err"; exit 1; }
+          file bridge/libfex-vulkan-bridge.so.1 | tee "$R/bridge.file"
+          readelf -d bridge/libfex-vulkan-bridge.so.1 | tee "$R/bridge.dynamic"
+          nm -D bridge/libfex-vulkan-bridge.so.1 | tee "$R/bridge.nm"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          grep -q FEXVulkanBridgeXlibSupportInvoker "$R/bridge.nm"
+          grep -q FEXVulkanBridgeXSyncUnpacker "$R/bridge.nm"
+          grep -q FEXVulkanBridgeXGetVisualInfoUnpacker "$R/bridge.nm"
+          grep -q FEXVulkanBridgeXDisplayStringUnpacker "$R/bridge.nm"
+
+      - name: Route Xlib PFN and host-to-guest callback unpackers through resident bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/ThunkLibs/libvulkan/Guest.cpp')
+          s = p.read_text()
+
+          anchor = 'extern "C" {\n\n// Maps Vulkan API function names'
+          replacement = '''extern "C" {\n\nstatic uintptr_t SplitBridgeXlibSupportInvoker;\nstatic uintptr_t SplitBridgeXSyncUnpacker;\nstatic uintptr_t SplitBridgeXGetVisualInfoUnpacker;\nstatic uintptr_t SplitBridgeXDisplayStringUnpacker;\n\n// Maps Vulkan API function names'''
+          if anchor not in s:
+              raise SystemExit('variable anchor missing')
+          s = s.replace(anchor, replacement, 1)
+
+          anchor = 'static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {\n  auto It = HostPtrInvokers.find(name);\n'
+          replacement = '''static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {\n  if (std::string_view {name} == "vkGetPhysicalDeviceXlibPresentationSupportKHR" && SplitBridgeXlibSupportInvoker) {\n    fprintf(stderr, "SPLIT_X11_PFN_LINK H=%p T=%#zx\\n", func, SplitBridgeXlibSupportInvoker);\n    LinkAddressToFunction((uintptr_t)func, SplitBridgeXlibSupportInvoker);\n    return func;\n  }\n  auto It = HostPtrInvokers.find(name);\n'''
+          if anchor not in s:
+              raise SystemExit('MakeGuestCallable anchor missing')
+          s = s.replace(anchor, replacement, 1)
+
+          old = '''void OnInit() {\n  // TODO: Load libX11 on-demand instead\n  void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);\n  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);\n  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);\n  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);\n}\n'''
+          new = '''void OnInit() {\n  void* bridge = dlopen("libfex-vulkan-bridge.so.1", RTLD_NOW | RTLD_LOCAL);\n  if (!bridge) {\n    fprintf(stderr, "SPLIT_X11_BRIDGE_DLOPEN_FAILED: %s\\n", dlerror());\n    __builtin_trap();\n  }\n  using GetAddressFn = uintptr_t (*)();\n  auto Resolve = [&](const char* symbol) -> uintptr_t {\n    auto fn = reinterpret_cast<GetAddressFn>(dlsym(bridge, symbol));\n    if (!fn) {\n      fprintf(stderr, "SPLIT_X11_BRIDGE_DLSYM_FAILED symbol=%s error=%s\\n", symbol, dlerror());\n      __builtin_trap();\n    }\n    return fn();\n  };\n  SplitBridgeXlibSupportInvoker = Resolve("FEXVulkanBridgeXlibSupportInvoker");\n  SplitBridgeXSyncUnpacker = Resolve("FEXVulkanBridgeXSyncUnpacker");\n  SplitBridgeXGetVisualInfoUnpacker = Resolve("FEXVulkanBridgeXGetVisualInfoUnpacker");\n  SplitBridgeXDisplayStringUnpacker = Resolve("FEXVulkanBridgeXDisplayStringUnpacker");\n  fprintf(stderr, "SPLIT_X11_BRIDGE_READY pfn=%#zx xsync=%#zx xgetvisual=%#zx xdisplay=%#zx\\n",\n          SplitBridgeXlibSupportInvoker, SplitBridgeXSyncUnpacker,\n          SplitBridgeXGetVisualInfoUnpacker, SplitBridgeXDisplayStringUnpacker);\n  dlclose(bridge);\n\n  // TODO: Load libX11 on-demand instead\n  void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);\n  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), SplitBridgeXSyncUnpacker);\n  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), SplitBridgeXGetVisualInfoUnpacker);\n  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), SplitBridgeXDisplayStringUnpacker);\n}\n'''
+          if old not in s:
+              raise SystemExit('OnInit anchor missing')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git -C src diff --check
+          git -C src diff -- ThunkLibs/libvulkan/Guest.cpp | tee "$R/wrapper.diff"
+
+      - name: Build ordinary unloadable Vulkan wrapper using split bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S src/ThunkLibs/GuestLibs -B guest-split -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-split.log" 2>&1
+          cmake --build guest-split --target vulkan-guest -- -j"$(nproc)" \
+            > "$R/build-split.log" 2>&1 || { tail -n 240 "$R/build-split.log"; exit 1; }
+          readelf -d guest-split/libvulkan-guest.so | tee "$R/wrapper.dynamic"
+          if grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"; then
+            echo 'wrapper unexpectedly NODELETE' >&2
+            exit 1
+          fi
+          echo SPLIT_X11_WRAPPER_REMAINS_UNLOADABLE
+
+      - name: Prepare rootfs, X11 guest callbacks, and probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-split/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp bridge/libfex-vulkan-bridge.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-vulkan-bridge.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          #include <stdio.h>
+          int XSync(void *display, int discard) {
+            fprintf(stderr, "GUEST_XSYNC display=%p discard=%d\n", display, discard);
+            return 0;
+          }
+          void *XGetVisualInfo(void *display, long mask, void *templ, int *count) {
+            fprintf(stderr, "GUEST_XGETVISUALINFO display=%p mask=%ld\n", display, mask);
+            (void)templ;
+            if (count) *count = 0;
+            return 0;
+          }
+          char *XDisplayString(void *display) {
+            fprintf(stderr, "GUEST_XDISPLAYSTRING display=%p\n", display);
+            return ":99";
+          }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_split_x11_callback_probe.c \
+            -ldl -o "$ROOTFS/opt/fex-ci/split-x11-probe"
+          file "$ROOTFS/opt/fex-ci/split-x11-probe" \
+               "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1" \
+               "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-vulkan-bridge.so.1" \
+               > "$R/x86-files.txt"
+
+      - name: Run real retained X11 callback after physical Vulkan wrapper unload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          Xvfb :99 -screen 0 640x480x24 > "$R/xvfb.log" 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 50); do
+            if DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then break; fi
+            sleep 0.1
+          done
+          DISPLAY=:99 xdpyinfo >/dev/null
+
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP="$(cat "$R/lvp.txt")"
+          set +e
+          DISPLAY=:99 VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+            timeout 30s "$FEX" /opt/fex-ci/split-x11-probe \
+            > "$R/probe.out" 2> "$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          test "$rc" -eq 0
+          grep -q 'PROBE after-dlclose vulkan-maps=0 bridge-maps=' "$R/probe.err"
+          grep -q 'PROBE AFTER_DLCLOSE_BEGIN_CALLBACK_TEST' "$R/probe.err"
+          after_line="$(grep -n 'PROBE AFTER_DLCLOSE_BEGIN_CALLBACK_TEST' "$R/probe.err" | head -n1 | cut -d: -f1)"
+          tail -n "+$after_line" "$R/probe.err" > "$R/after-close-callbacks.txt"
+          grep -q 'GUEST_XSYNC display=0x12346000' "$R/after-close-callbacks.txt"
+          grep -q 'GUEST_XDISPLAYSTRING display=0x12346000' "$R/after-close-callbacks.txt"
+          grep -q 'SPLIT_VULKAN_X11_CALLBACK_PASS' "$R/after-close-callbacks.txt"
+          echo SPLIT_VULKAN_X11_CALLBACK_PHYSICAL_UNLOAD_OK
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: split-vulkan-x11-callback-${{ github.run_id }}
+          path: receipts-split-x11
+          retention-days: 30
