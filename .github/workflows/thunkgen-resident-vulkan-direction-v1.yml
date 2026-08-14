@@ -106,7 +106,7 @@ jobs:
           awk '/^template<> struct FEXResidentBridgeUnpacker</{n++} END{print n+0}' \
             guest/gen/thunkgen_guest_libvulkan_bridge_accessors.inl | tee "$R/accessor-unpacker-count.txt"
           test "$(cat "$R/resident-unpacker-count.txt")" = "$(cat "$R/accessor-unpacker-count.txt")"
-          test "$(cat "$R/resident-unpacker-count.txt")" -gt 0
+          test "$(cat "$R/resident-unpacker-count.txt")" = 0
           ! grep -q 'FEXResidentBridgeCanUnpack' guest/gen/thunkgen_guest_libvulkan_bridge.inl
           ! grep -q 'FEXResidentBridgeCanUnpack' guest/gen/thunkgen_guest_libvulkan_bridge_accessors.inl
 
