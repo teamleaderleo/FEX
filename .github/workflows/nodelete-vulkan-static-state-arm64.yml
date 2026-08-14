@@ -1,0 +1,154 @@
+name: NODELETE Vulkan static state after dlclose
+
+on:
+  push:
+    branches: [ci/nodelete-vulkan-static-state-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vulkan-static-state:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and native Vulkan control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools binutils
+          LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP"
+          echo "$LVP" > "$R/lvp.txt"
+          VK_DRIVER_FILES="$LVP" vulkaninfo --summary > "$R/native-vulkaninfo.out" 2> "$R/native-vulkaninfo.err"
+
+      - name: Build FEX runtime and Vulkan thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1
+          readelf -d guest/libvulkan-guest.so | tee "$R/guest-dynamic.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/guest-dynamic.txt"
+
+      - name: Create amd64 rootfs and static-state probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat > /tmp/x11stub.c <<'EOF'
+          int XSync(void *display, int discard) { (void)display; (void)discard; return 0; }
+          void *XGetVisualInfo(void *display, long mask, void *templ, int *count) {
+            (void)display; (void)mask; (void)templ; if (count) *count = 0; return 0;
+          }
+          char *XDisplayString(void *display) { (void)display; return ":0"; }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          cat > /tmp/state.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          typedef int32_t VkResult;
+          typedef void (*PFN_vkVoidFunction)(void);
+          typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(void *, const char *);
+          typedef VkResult (*PFN_vkEnumerateInstanceVersion)(uint32_t *);
+          int main(void) {
+            void *h = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!h) { fprintf(stderr, "DLERROR %s\n", dlerror()); return 2; }
+            PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
+            if (!gipa) return 3;
+            PFN_vkEnumerateInstanceVersion p1 = (PFN_vkEnumerateInstanceVersion)gipa(0, "vkEnumerateInstanceVersion");
+            if (!p1) return 4;
+            uint32_t v1 = 0, v2 = 0, v3 = 0;
+            if (p1(&v1) != 0) return 5;
+            fprintf(stderr, "BEFORE_CLOSE gipa=%p pfn=%p version=%u\n", (void*)gipa, (void*)p1, v1);
+            if (dlclose(h) != 0) return 6;
+            fprintf(stderr, "AFTER_DLCLOSE_QUERY_BEGIN\n");
+            PFN_vkEnumerateInstanceVersion p2 = (PFN_vkEnumerateInstanceVersion)gipa(0, "vkEnumerateInstanceVersion");
+            fprintf(stderr, "AFTER_DLCLOSE_QUERY gipa=%p pfn_old=%p pfn_new=%p\n", (void*)gipa, (void*)p1, (void*)p2);
+            if (!p2) return 7;
+            if (p2(&v2) != 0 || v2 != v1) return 8;
+            void *h2 = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!h2) return 9;
+            PFN_vkGetInstanceProcAddr gipa2 = (PFN_vkGetInstanceProcAddr)dlsym(h2, "vkGetInstanceProcAddr");
+            if (!gipa2) return 10;
+            PFN_vkEnumerateInstanceVersion p3 = (PFN_vkEnumerateInstanceVersion)gipa2(0, "vkEnumerateInstanceVersion");
+            fprintf(stderr, "AFTER_REOPEN_QUERY gipa_old=%p gipa_new=%p pfn=%p\n", (void*)gipa, (void*)gipa2, (void*)p3);
+            if (!p3) return 11;
+            if (p3(&v3) != 0 || v3 != v1) return 12;
+            fprintf(stderr, "VERSIONS %u %u %u\n", v1, v2, v3);
+            dlclose(h2);
+            fprintf(stderr, "REAL_NODELETE_VULKAN_STATIC_STATE_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/state.c -ldl -o "$ROOTFS/opt/fex-ci/state"
+
+      - name: Run post-dlclose static-state probe
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          LVP="$(cat "$R/lvp.txt")"
+          set +e
+          VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" \
+            "$FEX" /opt/fex-ci/state > "$R/state.out" 2> "$R/state.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/state.exit"
+          cat "$R/state.err"
+          test "$rc" -eq 0
+          grep -q 'AFTER_DLCLOSE_QUERY' "$R/state.err"
+          grep -q 'AFTER_REOPEN_QUERY' "$R/state.err"
+          grep -q 'REAL_NODELETE_VULKAN_STATIC_STATE_OK' "$R/state.err"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodelete-vulkan-static-state-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
