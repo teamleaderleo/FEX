@@ -1,4 +1,4 @@
-name: Agent M real 32-bit guest NODELETE build
+name: Agent M full 64-bit guest NODELETE build
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  real-guest-thunk-32:
+  all-guest-thunks-64:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     env:
@@ -30,7 +30,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev libssl-dev pkg-config libcap-dev binutils \
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
-            gcc-13-multilib-x86-64-linux-gnu g++-13-multilib-x86-64-linux-gnu libc6-dev-i386-cross \
             libx11-dev libxcb1-dev libxrandr-dev libxrender-dev libwayland-dev libdrm-dev libasound2-dev libgl-dev libegl-dev
 
       - name: Apply generic guest lifetime policy
@@ -64,34 +63,48 @@ jobs:
           test -n "$THUNKGEN"
           realpath "$THUNKGEN" | tee "$R/thunkgen-path.txt"
 
-      - name: Build real 32-bit Wayland guest thunk
+      - name: Build all real 64-bit guest thunks
         shell: bash
         run: |
           set -euxo pipefail
           THUNKGEN="$(cat "$R/thunkgen-path.txt")"
-          x86_64-linux-gnu-g++ -m32 -v 2>&1 | tail -n 20 | tee "$R/cross32-toolchain.txt"
-          cmake -S ThunkLibs/GuestLibs -B guest-build-32 -G Ninja \
-            -DBITNESS=32 \
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DENABLE_CLANG_THUNKS=OFF \
-            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_32.cmake" \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
             -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
             -DGENERATOR_EXE="$THUNKGEN" \
-            -DX86_DEV_ROOTFS=/ > "$R/guest32-cmake.log" 2>&1 || { cat "$R/guest32-cmake.log"; exit 1; }
-          cmake --build guest-build-32 --target wayland-client-guest -- -j"$(nproc)" -v > "$R/wayland32-build.log" 2>&1 || { tail -n 280 "$R/wayland32-build.log"; exit 1; }
-          path="$(find guest-build-32 -type f -name 'libwayland-client-guest.so*' | head -n1)"
-          test -n "$path"
-          file "$path" | tee "$R/wayland32-file.txt"
-          readelf -d "$path" | tee "$R/wayland32-dynamic.txt"
-          grep -q 'ELF 32-bit.*Intel 80386' "$R/wayland32-file.txt"
-          grep -q 'FLAGS_1.*NODELETE' "$R/wayland32-dynamic.txt"
-          grep -Fq 'SONAME)             Library soname: [libwayland-client.so.0.20.0]' "$R/wayland32-dynamic.txt"
-          echo REAL_wayland_client_32_NODELETE_OK
+            -DX86_DEV_ROOTFS=/ > "$R/guest-cmake.log" 2>&1 || { cat "$R/guest-cmake.log"; exit 1; }
+          cmake --build guest-build --target \
+            asound-guest vulkan-guest drm-guest wayland-client-guest VDSO-guest GL-guest EGL-guest cuda-guest \
+            -- -j"$(nproc)" -v > "$R/all64-build.log" 2>&1 || { tail -n 360 "$R/all64-build.log"; exit 1; }
+
+          check_so() {
+            label="$1"; pattern="$2"; soname="$3"
+            path="$(find guest-build -type f -name "$pattern" | head -n1)"
+            test -n "$path"
+            file "$path" | tee "$R/${label}-file.txt"
+            readelf -d "$path" | tee "$R/${label}-dynamic.txt"
+            grep -q 'FLAGS_1.*NODELETE' "$R/${label}-dynamic.txt"
+            grep -Fq "SONAME)             Library soname: [$soname]" "$R/${label}-dynamic.txt"
+            echo "ALL64_${label}_NODELETE_OK"
+          }
+
+          check_so asound 'libasound-guest.so*' 'libasound.so.2'
+          check_so vulkan 'libvulkan-guest.so*' 'libvulkan.so.1'
+          check_so drm 'libdrm-guest.so*' 'libdrm.so.2'
+          check_so wayland_client 'libwayland-client-guest.so*' 'libwayland-client.so.0.20.0'
+          check_so VDSO 'libVDSO-guest.so*' 'linux-vdso.so.1'
+          check_so GL 'libGL-guest.so*' 'libGL.so.1'
+          check_so EGL 'libEGL-guest.so*' 'libEGL.so.1'
+          check_so cuda 'libcuda-guest.so*' 'libcuda.so.1'
+          echo ALL_64_SHARED_GUEST_THUNKS_NODELETE_OK
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-m-real-nodelete-32-${{ github.run_id }}
+          name: agent-m-all64-nodelete-${{ github.run_id }}
           path: receipts
           retention-days: 30
