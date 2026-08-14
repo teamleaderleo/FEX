@@ -1,8 +1,8 @@
-name: Thunk lifetime integrated diagnostic ARM64
+name: Thunk lifetime integrated FEX-2608 ARM64
 
 on:
   push:
-    branches: [ci/thunk-lifetime-integration-20260814]
+    branches: [ci/thunk-lifetime-integration-fex2608-20260814]
     paths:
       - .github/fieldwork/merge_callback_tombstone.py
       - .github/fieldwork/fix_retirement_lock_order.py
@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
-      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FEX_SHA: e869aa644a16e4332cdc15c1ea0b4d13d482385d
       FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
       ROOTFS: ${{ github.workspace }}/rootfs-amd64
       R: ${{ github.workspace }}/receipts
@@ -30,7 +30,7 @@ jobs:
       - name: Checkout carrier
         uses: actions/checkout@v4
 
-      - name: Checkout exact FEX source
+      - name: Checkout exact FEX-2608 source
         uses: actions/checkout@v4
         with:
           repository: teamleaderleo/FEX
@@ -84,7 +84,7 @@ jobs:
           git -C src diff > "$R/integrated-fex.diff"
           grep -R -n -E 'DIAG_MT|DIAG_MULTI|DIAG_INTEGRATED|DIAG_LOCKED' src/FEXCore src/Source/Tools/LinuxEmulation | head -200 > "$R/instrumentation-sites.txt" || true
 
-      - name: Build integrated FEX and all fixture variants
+      - name: Build integrated FEX-2608 and all fixture variants
         shell: bash
         run: |
           set -euxo pipefail
@@ -96,7 +96,7 @@ jobs:
             > "$R/cmake.log" 2>&1
           cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
           for c in force aba thread multi; do
-            (cd "/tmp/$c/fex-full-thunk-pair" && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu=g++) \
+            (cd "/tmp/$c/fex-full-thunk-pair" && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) \
               > "$R/build-$c.log" 2>&1
           done
 
@@ -118,7 +118,7 @@ jobs:
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
 
-      - name: Execute integrated regression matrix
+      - name: Execute integrated FEX-2608 regression matrix
         shell: bash
         run: |
           set -uxo pipefail
@@ -162,6 +162,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: thunk-lifetime-integration-${{ github.run_id }}
+          name: thunk-lifetime-integration-fex2608-${{ github.run_id }}
           path: receipts
           retention-days: 30
