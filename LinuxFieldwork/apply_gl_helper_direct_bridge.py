@@ -52,8 +52,18 @@ guest.write_text(s)
 bridge = Path('ThunkLibs/libGL_bridge')
 bridge.mkdir(exist_ok=True)
 (bridge / 'Guest.cpp').write_text(r'''// SPDX-License-Identifier: MIT
+#define GL_GLEXT_PROTOTYPES 1
+#define GLX_GLXEXT_PROTOTYPES 1
+
+#include <GL/glx.h>
+#include <GL/glxext.h>
+#include <GL/gl.h>
+#include <GL/glext.h>
+
+#undef GL_ARB_viewport_array
+#include "glcorearb.h"
+
 #include <cstdlib>
-#include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include "common/Guest.h"
 #include "thunkgen_bridge_libGL.inl"
