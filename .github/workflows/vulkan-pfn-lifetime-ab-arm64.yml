@@ -82,8 +82,9 @@ jobs:
             > "$R/cmake-stock-guest.log" 2>&1
           cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" \
             > "$R/build-stock-guest.log" 2>&1
-          cp src/build/Bin/FEX /tmp/FEX-stock
-          cp src/build/Bin/FEXServer /tmp/FEXServer-stock
+          mkdir -p /tmp/fex-stock
+          cp src/build/Bin/FEX /tmp/fex-stock/FEX
+          cp src/build/Bin/FEXServer /tmp/fex-stock/FEXServer
           sha256sum guest-build/libvulkan-guest.so src/build/HostLibs_64/libvulkan-host.so \
             > "$R/thunk-sha256-before.txt"
 
@@ -123,7 +124,7 @@ jobs:
             phase="$1"; mode="$2"
             set +e
             FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
-              /tmp/FEX-stock /opt/fex-ci/vulkan-pfn-probe "$mode" \
+              /tmp/fex-stock/FEX /opt/fex-ci/vulkan-pfn-probe "$mode" \
               > "$R/${phase}-${mode}.stdout" 2> "$R/${phase}-${mode}.stderr"
             rc=$?
             set -e
