@@ -102,10 +102,10 @@ def write_accessors(path: Path, callbacks, prefix: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("prefix")
     parser.add_argument("guest_inl", type=Path)
     parser.add_argument("bridge_inl", type=Path)
     parser.add_argument("accessors_inl", type=Path)
+    parser.add_argument("--prefix", default="libvulkan")
     args = parser.parse_args()
 
     prefix = clean_prefix(args.prefix)
