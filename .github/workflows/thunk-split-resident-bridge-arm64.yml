@@ -1,0 +1,124 @@
+name: FEX split resident bridge ARM64
+
+on:
+  push:
+    branches: [ci/thunk-callback-descriptor-20260814]
+    paths:
+      - .github/fieldwork/patch_split_resident_bridge_fixture.py
+      - .github/workflows/thunk-split-resident-bridge-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  split-bridge:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+      - name: Checkout exact FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - name: Checkout retained fixture
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: investigation/fex-vulkan-thunk-lifecycle
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and patch fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" /tmp/fixture
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          tar xf /tmp/repro.tar.gz -C /tmp/fixture
+          python3 .github/fieldwork/patch_split_resident_bridge_fixture.py /tmp/fixture
+          grep -R -n 'lifetime_bridge_callhost\|lifetime_bridge_guest_unpacker\|lifetime_wrapper_generation' /tmp/fixture/fex-full-thunk-pair/guest > "$R/split-sites.txt"
+          ! grep -q 'd\.target\|newer\.target\|direct_host_call' /tmp/fixture/fex-full-thunk-pair/guest/main.cpp
+
+      - name: Build stock FEX and split fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-fex.log" 2>&1
+          (cd /tmp/fixture/fex-full-thunk-pair && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) \
+            > "$R/build-fixture.log" 2>&1
+          readelf -d /tmp/fixture/fex-full-thunk-pair/guest/liblifetime-bridge.so > "$R/bridge.dynamic.txt"
+          grep -q 'NODELETE' "$R/bridge.dynamic.txt"
+          readelf -d /tmp/fixture/fex-full-thunk-pair/guest/liblifetime-guest.so > "$R/wrapper.dynamic.txt"
+          nm -D /tmp/fixture/fex-full-thunk-pair/guest/liblifetime-bridge.so | grep -E 'lifetime_bridge_callhost_[ab]|lifetime_bridge_guest_unpacker' > "$R/bridge.symbols.txt"
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci"
+          cp -a /tmp/fixture/fex-full-thunk-pair "$ROOTFS/opt/fex-ci/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute stock-FEX split bridge runtime
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          HOST="/tmp/fixture/fex-full-thunk-pair/host"
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/fex-full-thunk-pair" && \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            "$FEX" ./guest/fex_full_lifetime --force-different --alias --cycles 5) \
+            > "$R/run.stdout" 2> "$R/run.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/run.exit"
+          grep -E 'generation|resident bridge maps|wrapper generation|old invoker|old unpacker|proof: wrapper|split retained|reload invoker|native host stable|reloaded wrapper|Link after re-register|callback' "$R/run.stdout" > "$R/key.stdout" || true
+          cat "$R/key.stdout"
+          cat "$R/run.stderr"
+          test "$rc" = 0
+          grep -q 'proof: wrapper unmapped while bridge dependencies remain executable' "$R/run.stdout"
+          grep -q 'split retained Link after close   rv=29 want=29' "$R/run.stdout"
+          grep -q 'split retained callback after close rv=70073 want=70073' "$R/run.stdout"
+          grep -q 'reload invoker.*SAME' "$R/run.stdout"
+          grep -q 'resident bridge maps' "$R/run.stdout"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex-split-resident-bridge-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
