@@ -1,0 +1,237 @@
+name: Agent C full Vulkan proc availability differential
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-vulkan-proc-corpus-differential.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+  FIELDWORK_SHA: a206f8a904af29576f70ab9a5b873acea961bdfd
+  DEBIAN_FRONTEND: noninteractive
+  ROOTFS: ${{ github.workspace }}/rootfs-amd64
+  HOST: ${{ github.workspace }}/host
+  R: ${{ github.workspace }}/receipts
+  FEX_PORTABLE: 1
+
+jobs:
+  differential:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and exact identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          test "$(git -C fieldwork rev-parse HEAD)" = "$FIELDWORK_SHA"
+          printf 'fex_sha=%s\nfieldwork_sha=%s\n' \
+            "$(git -C src rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" | tee "$R/identity.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools debootstrap
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" | tee "$R/lvp-icd.txt"
+          VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
+
+      - name: Generate exact regular Vulkan command corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import collections
+          import json
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse('src/External/Vulkan-Headers/registry/vk.xml').getroot()
+          aliases = {}
+          canonical_names = set()
+          for command in root.findall('./commands/command'):
+            if command.get('alias'):
+              aliases[command.get('name')] = command.get('alias')
+              continue
+            proto = command.find('proto')
+            if proto is not None and proto.findtext('name'):
+              canonical_names.add(proto.findtext('name'))
+
+          regular = set()
+          providers = collections.defaultdict(set)
+          for feature in root.findall('./feature'):
+            if 'vulkan' not in set((feature.get('api') or '').split(',')):
+              continue
+            label = 'CORE_' + (feature.get('number') or feature.get('name') or '?')
+            for require in feature.findall('./require'):
+              req_apis = set((require.get('api') or 'vulkan').split(','))
+              if 'vulkan' not in req_apis:
+                continue
+              for command in require.findall('command'):
+                name = command.get('name')
+                if name:
+                  regular.add(name)
+                  providers[name].add(label)
+
+          for extension in root.findall('./extensions/extension'):
+            supported = set((extension.get('supported') or '').split(','))
+            if 'vulkan' not in supported:
+              continue
+            label = extension.get('name') or 'UNKNOWN_EXTENSION'
+            for require in extension.findall('./require'):
+              req_api = require.get('api')
+              if req_api and 'vulkan' not in set(req_api.split(',')):
+                continue
+              for command in require.findall('command'):
+                name = command.get('name')
+                if name:
+                  regular.add(name)
+                  providers[name].add(label)
+
+          names = sorted(regular)
+          alias_count = sum(name in aliases for name in names)
+          def canon(name):
+            seen = set()
+            while name in aliases and name not in seen:
+              seen.add(name)
+              name = aliases[name]
+            return name
+          canonical_count = len({canon(name) for name in names})
+          summary = {
+            'regular_command_spellings': len(names),
+            'alias_spellings': alias_count,
+            'canonical_commands': canonical_count,
+          }
+          pathlib.Path('receipts/commands.txt').write_text(''.join(name + '\n' for name in names))
+          pathlib.Path('receipts/corpus.json').write_text(json.dumps({
+            'summary': summary,
+            'commands': [
+              {'name': name, 'canonical': canon(name), 'providers': sorted(providers[name])}
+              for name in names
+            ],
+          }, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          if summary != {
+            'regular_command_spellings': 773,
+            'alias_spellings': 105,
+            'canonical_commands': 668,
+          }:
+            raise SystemExit(f'unexpected corpus summary: {summary}')
+          PY
+          wc -l "$R/commands.txt"
+
+      - name: Build and run native ARM64 corpus probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cc -O2 -g -std=gnu11 -Wall -Wextra -Werror \
+            -Isrc/External/Vulkan-Headers/include \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/vulkan_proc_availability_probe.c \
+            -ldl -o /tmp/vulkan-proc-probe-native
+          file /tmp/vulkan-proc-probe-native | tee "$R/native-probe.file.txt"
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          VK_DRIVER_FILES="$LVP_ICD" /tmp/vulkan-proc-probe-native "$R/commands.txt" \
+            >"$R/native.tsv" 2>"$R/native.err"
+          test "$(($(wc -l < "$R/native.tsv") - 1))" -eq 773
+          cat "$R/native.err"
+
+      - name: Build x86-64 corpus probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          x86_64-linux-gnu-gcc -O2 -g -std=gnu11 -Wall -Wextra -Werror \
+            -Isrc/External/Vulkan-Headers/include \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/vulkan_proc_availability_probe.c \
+            -ldl -o /tmp/vulkan-proc-probe-x86_64
+          file /tmp/vulkan-proc-probe-x86_64 | tee "$R/x86-probe.file.txt"
+
+      - name: Build focused FEX Vulkan pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON \
+            -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v \
+            >"$R/build-host.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v \
+            >"$R/build-guest.log" 2>&1
+
+      - name: Build amd64 rootfs and run FEX corpus probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo debootstrap --arch=amd64 --foreign --variant=minbase --components=main,universe \
+            --include=libvulkan1,libx11-6 noble "$ROOTFS" http://archive.ubuntu.com/ubuntu \
+            >"$R/debootstrap.log" 2>&1
+          sudo find "$ROOTFS" -type f -name '*.deb' -print | sort > "$R/rootfs-debs.txt"
+          sed -n 's/^I: Extracting \([^ ]*\)\.\.\.$/\1/p' "$R/debootstrap.log" | sort -u \
+            > "$R/rootfs-already-extracted.txt"
+          while IFS= read -r deb; do
+            pkg="$(dpkg-deb -f "$deb" Package)"
+            grep -Fxq "$pkg" "$R/rootfs-already-extracted.txt" && continue
+            sudo dpkg-deb -x "$deb" "$ROOTFS"
+          done < "$R/rootfs-debs.txt"
+          sudo cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
+          sudo mkdir -p "$ROOTFS/usr/local/bin" "$ROOTFS/usr/local/share"
+          sudo install -m755 /tmp/vulkan-proc-probe-x86_64 "$ROOTFS/usr/local/bin/vulkan-proc-probe"
+          sudo install -m644 "$R/commands.txt" "$ROOTFS/usr/local/share/vulkan-commands.txt"
+          X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          for sym in XSync XGetVisualInfo XDisplayString; do
+            x86_64-linux-gnu-readelf -Ws "$X11" | grep -E " ${sym}(@|$)" | head -1
+          done
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          timeout 120s env VK_DRIVER_FILES="$LVP_ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+            "$FEX" /usr/local/bin/vulkan-proc-probe /usr/local/share/vulkan-commands.txt \
+            >"$R/fex.tsv" 2>"$R/fex.err"
+          echo 0 | tee "$R/fex.exit"
+          test "$(($(wc -l < "$R/fex.tsv") - 1))" -eq 773
+          cat "$R/fex.err"
+
+      - name: Compare native and FEX availability
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 fieldwork/investigations/fex-vulkan-thunk-lifecycle/compare_vulkan_proc_availability.py \
+            "$R/native.tsv" "$R/fex.tsv" --json "$R/diff.json" --text "$R/summary.txt"
+          cat "$R/summary.txt"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-c-vulkan-proc-corpus-differential-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
