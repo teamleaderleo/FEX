@@ -64,7 +64,7 @@ jobs:
           test -n "$THUNKGEN"
           realpath "$THUNKGEN" | tee "$R/thunkgen-path.txt"
 
-      - name: Build real 32-bit Vulkan guest thunk
+      - name: Build real 32-bit Wayland guest thunk
         shell: bash
         run: |
           set -euxo pipefail
@@ -78,15 +78,15 @@ jobs:
             -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
             -DGENERATOR_EXE="$THUNKGEN" \
             -DX86_DEV_ROOTFS=/ > "$R/guest32-cmake.log" 2>&1 || { cat "$R/guest32-cmake.log"; exit 1; }
-          cmake --build guest-build-32 --target vulkan-guest -- -j"$(nproc)" -v > "$R/vulkan32-build.log" 2>&1 || { tail -n 280 "$R/vulkan32-build.log"; exit 1; }
-          path="$(find guest-build-32 -type f -name 'libvulkan-guest.so*' | head -n1)"
+          cmake --build guest-build-32 --target wayland-client-guest -- -j"$(nproc)" -v > "$R/wayland32-build.log" 2>&1 || { tail -n 280 "$R/wayland32-build.log"; exit 1; }
+          path="$(find guest-build-32 -type f -name 'libwayland-client-guest.so*' | head -n1)"
           test -n "$path"
-          file "$path" | tee "$R/vulkan32-file.txt"
-          readelf -d "$path" | tee "$R/vulkan32-dynamic.txt"
-          grep -q 'ELF 32-bit.*Intel 80386' "$R/vulkan32-file.txt"
-          grep -q 'FLAGS_1.*NODELETE' "$R/vulkan32-dynamic.txt"
-          grep -Fq 'SONAME)             Library soname: [libvulkan.so.1]' "$R/vulkan32-dynamic.txt"
-          echo REAL_vulkan_32_NODELETE_OK
+          file "$path" | tee "$R/wayland32-file.txt"
+          readelf -d "$path" | tee "$R/wayland32-dynamic.txt"
+          grep -q 'ELF 32-bit.*Intel 80386' "$R/wayland32-file.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/wayland32-dynamic.txt"
+          grep -Fq 'SONAME)             Library soname: [libwayland-client.so.0.20.0]' "$R/wayland32-dynamic.txt"
+          echo REAL_wayland_client_32_NODELETE_OK
 
       - name: Upload receipts
         if: always()
