@@ -12,8 +12,8 @@ permissions:
 
 jobs:
   ctest-registration:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,10 +29,13 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build clang lld libclang-dev llvm-dev pkg-config \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxrandr-dev libxrender-dev
-          CC=clang CXX=clang++ cmake -S src -B build -G Ninja \
+          CC=clang-18 CXX=clang++-18 cmake -S src -B build -G Ninja \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DUSE_LINKER=lld \
             -DENABLE_LTO=OFF \
