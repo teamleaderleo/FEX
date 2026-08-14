@@ -1,0 +1,200 @@
+name: Agent J ARM64 stable thunk target cell
+
+on:
+  push:
+    branches: [ci/agent-j-arm64-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stable-cell:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'fex=%s\nfieldwork=%s\ncarrier=%s\n' \
+            "$(git rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" "$GITHUB_SHA" > "$R/identity.txt"
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+
+      - name: Apply stable target-cell diagnostic
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('FEXCore/Source/Interface/Core/Core.cpp')
+          s=p.read_text()
+          if '#include <unordered_map>' not in s:
+              s=s.replace('#include <shared_mutex>\n', '#include <shared_mutex>\n#include <unordered_map>\n', 1)
+          start=s.index('void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) {')
+          end=s.index('\nvoid ContextImpl::AddForceTSOInformation', start)
+          replacement=r'''namespace {
+          struct DiagnosticThunkTargetSlot {
+            std::atomic<uintptr_t> Target {};
+            std::atomic<uint64_t> Active {};
+          };
+          std::mutex DiagnosticThunkTargetSlotsMutex;
+          std::unordered_map<uintptr_t, DiagnosticThunkTargetSlot*> DiagnosticThunkTargetSlots;
+          }
+
+          void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) {
+            LOGMAN_THROW_A_FMT(Entrypoint, "Tried to link null pointer address to guest function");
+            LOGMAN_THROW_A_FMT(GuestThunkEntrypoint, "Tried to link address to null pointer guest function");
+            if (!Config.Is64BitMode) {
+              LOGMAN_THROW_A_FMT((Entrypoint >> 32) == 0, "Tried to link 64-bit address in 32-bit mode");
+              LOGMAN_THROW_A_FMT((GuestThunkEntrypoint >> 32) == 0, "Tried to link 64-bit address in 32-bit mode");
+            }
+
+            DiagnosticThunkTargetSlot* Slot {};
+            bool Inserted {};
+            {
+              std::lock_guard lk(DiagnosticThunkTargetSlotsMutex);
+              auto It = DiagnosticThunkTargetSlots.find(Entrypoint);
+              if (It == DiagnosticThunkTargetSlots.end()) {
+                Slot = new DiagnosticThunkTargetSlot {};
+                Slot->Target.store(GuestThunkEntrypoint, std::memory_order_release);
+                DiagnosticThunkTargetSlots.emplace(Entrypoint, Slot);
+                Inserted = true;
+                fprintf(stderr, "DIAG_CELL_NEW H=%#lx T=%#lx slot=%p\\n", Entrypoint, GuestThunkEntrypoint, Slot);
+              } else {
+                Slot = It->second;
+                auto OldTarget = Slot->Target.exchange(GuestThunkEntrypoint, std::memory_order_acq_rel);
+                fprintf(stderr, "DIAG_CELL_REBIND H=%#lx oldT=%#lx newT=%#lx slot=%p active=%lu\\n", Entrypoint, OldTarget,
+                        GuestThunkEntrypoint, Slot, Slot->Active.load(std::memory_order_acquire));
+              }
+            }
+
+            if (!Inserted) {
+              return;
+            }
+
+            LogMan::Msg::DFmt("Thunks: Adding stable guest trampoline from address {:#x} through slot {}", Entrypoint, fmt::ptr(Slot));
+
+            auto Result = AddCustomIREntrypoint(
+              Entrypoint,
+              [this, Slot](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
+                auto IRHeader = emit->_IRHeader(emit->Invalid(), Entrypoint, 0, 0, 0, 0);
+                auto Block = emit->CreateCodeNode(true, 0);
+                auto Epilogue = emit->CreateNewCodeBlockAfter(Block);
+                IRHeader.first->Blocks = emit->WrapNode(Block);
+                emit->SetCurrentCodeBlock(Block);
+
+                const auto GPRSize = this->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit;
+                const uint64_t GuestPointerSize = this->Config.Is64BitMode ? 8 : 4;
+
+                if (GPRSize == IR::OpSize::i64Bit) {
+                  IR::Ref R = emit->_StoreRegister(emit->Constant(Entrypoint), GPRSize);
+                  R->Reg = IR::PhysicalRegister(IR::RegClass::GPRFixed, X86State::REG_R11).Raw;
+                } else {
+                  emit->_StoreContextFPR(GPRSize, emit->_VCastFromGPR(IR::OpSize::i64Bit, IR::OpSize::i64Bit, emit->Constant(Entrypoint)),
+                                         offsetof(Core::CPUState, mm[0][0]));
+                }
+
+                auto ActiveAddr = emit->Constant(reinterpret_cast<uintptr_t>(&Slot->Active));
+                emit->_AtomicFetchAdd(IR::OpSize::i64Bit, emit->Constant(1), ActiveAddr);
+
+                auto Target = emit->_LoadMemGPR(IR::OpSize::i64Bit, emit->Constant(reinterpret_cast<uintptr_t>(&Slot->Target)));
+                auto GuestRSP = emit->_LoadRegister(GPRSize, X86State::REG_RSP, IR::RegClass::GPR);
+                auto CallerRIP = emit->_LoadMemGPR(GPRSize, GuestRSP);
+                emit->_ExitFunction(IR::OpSize::i64Bit, Target, IR::BranchHint::Call, CallerRIP, Epilogue);
+
+                emit->SetCurrentCodeBlock(Epilogue);
+                emit->_AtomicFetchSub(IR::OpSize::i64Bit, emit->Constant(1), ActiveAddr);
+                auto GuestRSPAfter = emit->_LoadRegister(GPRSize, X86State::REG_RSP, IR::RegClass::GPR);
+                auto ReturnAddressLocation = emit->Sub(GPRSize, GuestRSPAfter, GuestPointerSize);
+                auto ReturnRIP = emit->_LoadMemGPR(GPRSize, ReturnAddressLocation);
+                emit->_ExitFunction(GPRSize, ReturnRIP, IR::BranchHint::None, emit->Invalid(), emit->Invalid());
+              },
+              ThunkHandler, Slot);
+
+            LOGMAN_THROW_A_FMT(!Result.has_value(), "Fresh stable thunk slot collided with existing CustomIR entrypoint");
+          }
+          '''
+          p.write_text(s[:start] + replacement + s[end:])
+          PY
+          git diff --check
+          git diff > "$R/diagnostic.diff"
+
+      - name: Build diagnostic FEX and full pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
+          cmake --build build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build.log" 2>&1
+          cd /tmp/repro/fex-full-thunk-pair
+          make clean
+          make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/fixture-build.log" 2>&1
+
+      - name: Prepare rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci/full"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/full/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute stable-cell discriminator
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          HOST="/tmp/repro/fex-full-thunk-pair/host"
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/full" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime --force-different) > "$R/run.stdout" 2> "$R/run.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/run.exit"
+          grep -E 'DIAG_CELL|generation|unmapped|reserved|reload|retained|re-register|fresh|callback|native host stable|signal=|exit=' "$R/run.stdout" "$R/run.stderr" > "$R/key-lines.txt" || true
+          cat "$R/key-lines.txt"
+          exit 0
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-j-stable-cell-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
