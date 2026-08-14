@@ -1,0 +1,96 @@
+name: Materialize clean Vulkan core allocator research product
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/vulkan-core-allocator-productize-20260814]
+    paths:
+      - .github/workflows/vulkan-core-allocator-productize.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    env:
+      CANDIDATE_SHA: 715ff36bff2fd9f2353ab31613dc41ae106f3938
+      SUPPORT_SHA: 24b1349efd1a9650b8041971049cb68315f12e50
+      PRODUCT_BRANCH: linux-fieldwork/vulkan-core-allocator-forwarding-clean
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PRODUCT_BRANCH }}
+          path: product
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.SUPPORT_SHA }}
+          path: support
+
+      - name: Prove clean parent
+        run: |
+          set -euxo pipefail
+          test "$(git -C product rev-parse HEAD)" = "$CANDIDATE_SHA"
+
+      - name: Materialize validated allocator mediation and five proven forwards
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          python3 ../support/LINUX_FIELDWORK_ALLOCATOR_TRAMPOLINE.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/libvulkan/Host.cpp')
+          s = p.read_text()
+          repls = {
+              '  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);':
+                  '  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, a_1, &out);',
+              '  return LDR_PTR(vkCreateShaderModule)(a_0, a_1, nullptr, a_3);':
+                  '  return LDR_PTR(vkCreateShaderModule)(a_0, a_1, a_2, a_3);',
+              '  auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, nullptr, &out);':
+                  '  auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, a_2, &out);',
+              '  return LDR_PTR(vkAllocateMemory)(a_0, a_1, nullptr, a_3);':
+                  '  return LDR_PTR(vkAllocateMemory)(a_0, a_1, a_2, a_3);',
+              '  LDR_PTR(vkFreeMemory)(a_0, a_1, nullptr);':
+                  '  LDR_PTR(vkFreeMemory)(a_0, a_1, a_2);',
+          }
+          for old, new in repls.items():
+              count = s.count(old)
+              assert count == 1, (old, count)
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff --name-only | sort | tee ../actual-files.txt
+          printf '%s\n' \
+            ThunkLibs/libvulkan/Guest.cpp \
+            ThunkLibs/libvulkan/Host.cpp \
+            ThunkLibs/libvulkan/libvulkan_interface.cpp \
+            | sort > ../expected-files.txt
+          diff -u ../expected-files.txt ../actual-files.txt
+          grep -n -E 'vkCreateInstance\)\(vk_struct_base, a_1, &out\)|vkCreateShaderModule\)\(a_0, a_1, a_2, a_3\)|vkCreateDevice\)\(a_0, a_1, a_2, &out\)|vkAllocateMemory\)\(a_0, a_1, a_2, a_3\)|vkFreeMemory\)\(a_0, a_1, a_2\)' ThunkLibs/libvulkan/Host.cpp | tee ../forwarded-sites.txt
+          test "$(wc -l < ../forwarded-sites.txt)" -eq 5
+
+      - name: Commit exact research product delta
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          git config user.name "Leo"
+          git config user.email "cheerleaderleo@outlook.com"
+          git add ThunkLibs/libvulkan/Guest.cpp ThunkLibs/libvulkan/Host.cpp ThunkLibs/libvulkan/libvulkan_interface.cpp
+          git commit -m "research: preserve Vulkan allocators across core custom hosts"
+          test "$(git rev-parse HEAD^)" = "$CANDIDATE_SHA"
+          git push origin "HEAD:$PRODUCT_BRANCH"
+          git rev-parse HEAD | tee ../product-head.txt
+
+      - name: Upload materialization receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-core-allocator-product-${{ github.run_id }}
+          path: |
+            actual-files.txt
+            expected-files.txt
+            forwarded-sites.txt
+            product-head.txt
+          retention-days: 30
