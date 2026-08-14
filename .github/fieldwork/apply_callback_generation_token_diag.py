@@ -23,8 +23,19 @@ replacements = [
         'static std::atomic<uint64_t> NextCallbackBridgeToken {1};\n',
     ),
     (
-        '  uintptr_t GuestUnpacker;\n  uintptr_t GuestTarget;\n};\n',
-        '  uintptr_t GuestUnpacker;\n  uintptr_t GuestTarget;\n  uintptr_t BridgeToken;\n};\n',
+        'struct TrampolineInstanceInfo {\n'
+        '  void* HostPacker;\n'
+        '  uintptr_t CallCallback;\n'
+        '  uintptr_t GuestUnpacker;\n'
+        '  uintptr_t GuestTarget;\n'
+        '};\n',
+        'struct TrampolineInstanceInfo {\n'
+        '  void* HostPacker;\n'
+        '  uintptr_t CallCallback;\n'
+        '  uintptr_t GuestUnpacker;\n'
+        '  uintptr_t GuestTarget;\n'
+        '  uintptr_t BridgeToken;\n'
+        '};\n',
     ),
     (
         '  static void CallCallback(void* callback, void* arg0, void* arg1) {\n',
@@ -63,10 +74,14 @@ host = Path("ThunkLibs/include/common/Host.h")
 s = host.read_text()
 replacements = [
     (
+        'struct GuestcallInfo {\n'
+        '  uintptr_t HostPacker;\n'
         '  void (*CallCallback)(uintptr_t GuestUnpacker, uintptr_t GuestTarget, void* argsrv);\n'
         '  uintptr_t GuestUnpacker;\n'
         '  uintptr_t GuestTarget;\n'
         '};\n',
+        'struct GuestcallInfo {\n'
+        '  uintptr_t HostPacker;\n'
         '  void (*CallCallback)(uintptr_t GuestUnpacker, uintptr_t GuestTarget, void* argsrv, uintptr_t BridgeToken);\n'
         '  uintptr_t GuestUnpacker;\n'
         '  uintptr_t GuestTarget;\n'
