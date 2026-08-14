@@ -1,0 +1,181 @@
+name: CUDA retained trampoline unpacker trace
+
+on:
+  push:
+    branches: [ci/agent-b-cuda-derived-resident-bridge-20260814]
+    paths:
+      - LinuxFieldwork/apply_cuda_trampoline_trace.py
+      - LinuxFieldwork/apply_cuda_derived_bridge.py
+      - LinuxFieldwork/apply_nested_callback_member_generator.py
+      - LinuxFieldwork/cuda_hostnode_moved_reload_probe.c
+      - LinuxFieldwork/synthetic_libcuda_retained_hostnode.c
+      - .github/workflows/cuda-trampoline-unpacker-trace.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [local, resident]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      MODE: ${{ matrix.mode }}
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      R: ${{ github.workspace }}/trace-${{ matrix.mode }}
+      HOST: ${{ github.workspace }}/trace-host-${{ matrix.mode }}
+      SYNTH: ${{ github.workspace }}/trace-synth-${{ matrix.mode }}
+      ROOTFS: ${{ github.workspace }}/trace-rootfs-${{ matrix.mode }}
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST" "$SYNTH"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config python3 \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev binutils
+
+      - name: Apply CUDA callback generation and trampoline trace
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_nested_callback_member_generator.py
+          git checkout "$PRODUCT_SHA" -- ThunkLibs/libdrm/libdrm_interface.cpp
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/libcuda/libcuda_interface.cpp')
+          s=p.read_text()
+          old='''template<>\nstruct fex_gen_type<CUDA_HOST_NODE_PARAMS_st> : fexgen::opaque_type {};\n'''
+          new='''template<>\nstruct fex_gen_type<CUDA_HOST_NODE_PARAMS_st> {};\ntemplate<>\nstruct fex_gen_config<&CUDA_HOST_NODE_PARAMS_st::_0> : fexgen::callback_member {};\n'''
+          assert s.count(old)==1, s.count(old)
+          p.write_text(s.replace(old,new,1))
+          PY
+          python3 LinuxFieldwork/apply_cuda_trampoline_trace.py
+          git diff --check
+
+      - name: Build traced FEX host
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer cuda-host-64 -- -j"$(nproc)" \
+            > "$R/build-host.log" 2>&1 || { tail -n 260 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libcuda-host.so "$HOST/libcuda-host.so"
+
+      - name: Apply resident bridge variant
+        if: matrix.mode == 'resident'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_cuda_derived_bridge.py
+          git diff --check
+
+      - name: Build selected guest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          if [ "$MODE" = resident ]; then
+            cmake --build guest --target cuda-guest cuda_bridge-guest -- -j"$(nproc)" \
+              > "$R/build-guest.log" 2>&1 || { tail -n 300 "$R/build-guest.log"; exit 1; }
+            readelf -d guest/libcuda-guest.so > "$R/wrapper.dynamic"
+            readelf -d guest/libfex-cuda-bridge.so > "$R/bridge.dynamic"
+            ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+            grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          else
+            cmake --build guest --target cuda-guest -- -j"$(nproc)" \
+              > "$R/build-guest.log" 2>&1 || { tail -n 300 "$R/build-guest.log"; exit 1; }
+          fi
+
+      - name: Prepare synthetic endpoint and rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libcuda.so.1 \
+            LinuxFieldwork/synthetic_libcuda_retained_hostnode.c -o "$SYNTH/libcuda.so.1"
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libcuda-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libcuda.so.1"
+          if [ "$MODE" = resident ]; then
+            cp guest/libfex-cuda-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-cuda-bridge.so"
+          fi
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror \
+            LinuxFieldwork/cuda_hostnode_moved_reload_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/probe"
+
+      - name: Execute and classify embedded guest unpackers
+        shell: bash
+        run: |
+          set -uxo pipefail
+          set +e
+          LD_LIBRARY_PATH="$SYNTH" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            build/Bin/FEX /opt/fex-ci/probe > "$R/fex.out" 2> "$R/fex.err"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/fex.exit"
+          cat "$R/fex.err"
+          grep -q 'FEX_TRAMP_CREATE unpacker=' "$R/fex.err"
+          grep -q 'MARK launch2-enter retained-registration-only' "$R/fex.err"
+          python3 - "$R/fex.err" "$R/trace-analysis.txt" <<'PY'
+          import re, sys
+          from pathlib import Path
+          text=Path(sys.argv[1]).read_text(errors='replace')
+          ranges=[]
+          for m in re.finditer(r'RESERVED (0x[0-9a-f]+)-(0x[0-9a-f]+)', text):
+              ranges.append((int(m.group(1),16), int(m.group(2),16)))
+          rows=[]
+          for m in re.finditer(r'FEX_TRAMP_CREATE unpacker=(0x[0-9a-f]+) target=(0x[0-9a-f]+)', text):
+              u=int(m.group(1),16); t=int(m.group(2),16)
+              retired=any(lo <= u < hi for lo,hi in ranges)
+              rows.append((u,t,retired))
+          out=[f'mode={Path(sys.argv[1]).parent.name}', f'retired_ranges={len(ranges)}', f'trampolines={len(rows)}']
+          for i,(u,t,retired) in enumerate(rows):
+              out.append(f'trampoline[{i}] unpacker={u:#x} target={t:#x} unpacker_in_retired_wrapper={int(retired)}')
+          Path(sys.argv[2]).write_text('\n'.join(out)+'\n')
+          print('\n'.join(out))
+          assert rows
+          assert ranges
+          PY
+
+      - name: Upload trace receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-trampoline-unpacker-${{ matrix.mode }}-${{ github.run_id }}
+          path: trace-${{ matrix.mode }}
+          retention-days: 30
