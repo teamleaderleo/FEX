@@ -21,19 +21,8 @@ def main() -> None:
     ir = root / "FEXCore/Source/Interface/IR/IR.h"
     repl(
         ir,
-        '''enum class BranchHint : uint8_t {
-  None = 0,
-  Call,
-  Return,
-  CheckTF,
-};''',
-        '''enum class BranchHint : uint8_t {
-  None = 0,
-  Call,
-  Return,
-  CheckTF,
-  ThunkOwnerCheck,
-};''',
+        'enum class BranchHint : uint8_t { None = 0, Call, Return, CheckTF };',
+        'enum class BranchHint : uint8_t { None = 0, Call, Return, CheckTF, ThunkOwnerCheck };',
         'branch hint',
     )
 
