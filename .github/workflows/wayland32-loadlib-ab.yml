@@ -1,0 +1,216 @@
+name: Wayland32 loadlib baseline A/B
+
+on:
+  push:
+    branches: [diagnostic/wayland32-resident-array-compat-20260814]
+    paths:
+      - .github/workflows/wayland32-loadlib-ab.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  loadlib-ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: baseline
+            source_sha: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+          - label: candidate
+            source_sha: 1e8b042e7d50335cdbf2b1b6bfd0c888296dd73a
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      R: ${{ github.workspace }}/wayland32-loadlib-${{ matrix.label }}
+      ROOTFS: ${{ github.workspace }}/rootfs-${{ matrix.label }}
+      H: ${{ github.workspace }}/host-${{ matrix.label }}
+      NATIVE: ${{ github.workspace }}/native-${{ matrix.label }}
+      DEBIAN_FRONTEND: noninteractive
+      FEX_PORTABLE: 1
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Checkout exact product source and install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$ROOTFS" "$H" "$NATIVE"
+          git checkout --detach "${{ matrix.source_sha }}"
+          git rev-parse HEAD | tee "$R/source-sha.txt"
+          test "$(git rev-parse HEAD)" = "${{ matrix.source_sha }}"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            gcc-multilib-x86-64-linux-gnu g++-multilib-x86-64-linux-gnu \
+            libcap-dev libwayland-dev libgl-dev binutils file
+
+      - name: Build FEX, Wayland32 host and guest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer wayland-client-host-32 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 420 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_32/libwayland-client-host.so "$H/libwayland-client-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest32 -G Ninja \
+            -DBITNESS=32 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_32.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest32 --target wayland-client-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 520 "$R/build-guest.log"; exit 1; }
+          file guest32/libwayland-client-guest.so | tee "$R/wrapper.file"
+          readelf -h guest32/libwayland-client-guest.so | tee "$R/wrapper.elf"
+          grep -q 'Class:.*ELF32' "$R/wrapper.elf"
+          if [ -f guest32/libfex-wayland-client-bridge.so ]; then
+            file guest32/libfex-wayland-client-bridge.so | tee "$R/bridge.file"
+          fi
+
+      - name: Build minimal arm64 native Wayland target
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat >/tmp/fake_wayland.c <<'EOF'
+          #include <wayland-client.h>
+          #define EMPTY_INTERFACE(sym) \
+            WL_EXPORT const struct wl_interface sym = { \
+              .name = #sym, .version = 1, .method_count = 0, .methods = 0, .event_count = 0, .events = 0 \
+            }
+          EMPTY_INTERFACE(wl_output_interface);
+          EMPTY_INTERFACE(wl_shm_pool_interface);
+          EMPTY_INTERFACE(wl_pointer_interface);
+          EMPTY_INTERFACE(wl_compositor_interface);
+          EMPTY_INTERFACE(wl_shm_interface);
+          EMPTY_INTERFACE(wl_registry_interface);
+          EMPTY_INTERFACE(wl_buffer_interface);
+          EMPTY_INTERFACE(wl_seat_interface);
+          EMPTY_INTERFACE(wl_surface_interface);
+          EMPTY_INTERFACE(wl_keyboard_interface);
+          EMPTY_INTERFACE(wl_callback_interface);
+          EMPTY_INTERFACE(wl_display_interface);
+          EMPTY_INTERFACE(wl_data_offer_interface);
+          EMPTY_INTERFACE(wl_data_source_interface);
+          EMPTY_INTERFACE(wl_data_device_interface);
+          EMPTY_INTERFACE(wl_data_device_manager_interface);
+          EMPTY_INTERFACE(wl_shell_interface);
+          EMPTY_INTERFACE(wl_shell_surface_interface);
+          EMPTY_INTERFACE(wl_touch_interface);
+          EMPTY_INTERFACE(wl_region_interface);
+          EMPTY_INTERFACE(wl_subcompositor_interface);
+          EMPTY_INTERFACE(wl_subsurface_interface);
+          #undef EMPTY_INTERFACE
+          EOF
+          cc -shared -fPIC -O2 -Wall -Wextra -Werror /tmp/fake_wayland.c \
+            -Wl,-soname,libwayland-client.so.0 -o "$NATIVE/libwayland-client.so.0"
+
+      - name: Assemble i386 rootfs and SIGILL-localizing probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$ROOTFS/lib" "$ROOTFS/lib32" "$ROOTFS/usr/lib32" "$ROOTFS/opt/fex-ci"
+          loader="$(x86_64-linux-gnu-gcc -m32 -print-file-name=ld-linux.so.2)"
+          libc="$(x86_64-linux-gnu-gcc -m32 -print-file-name=libc.so.6)"
+          libstdcpp="$(x86_64-linux-gnu-g++ -m32 -print-file-name=libstdc++.so.6)"
+          libgcc="$(x86_64-linux-gnu-gcc -m32 -print-file-name=libgcc_s.so.1)"
+          for f in "$loader" "$libc" "$libstdcpp" "$libgcc"; do test -e "$f"; done
+          cp -L "$loader" "$ROOTFS/lib/ld-linux.so.2"
+          cp -L "$loader" "$ROOTFS/lib32/ld-linux.so.2"
+          cp -L "$libc" "$ROOTFS/lib32/libc.so.6"
+          cp -L "$libstdcpp" "$ROOTFS/usr/lib32/libstdc++.so.6"
+          cp -L "$libgcc" "$ROOTFS/usr/lib32/libgcc_s.so.1"
+          cp guest32/libwayland-client-guest.so "$ROOTFS/usr/lib32/libwayland-client.so.0"
+          if [ -f guest32/libfex-wayland-client-bridge.so ]; then
+            cp guest32/libfex-wayland-client-bridge.so "$ROOTFS/usr/lib32/libfex-wayland-client-bridge.so"
+          fi
+
+          cat >/tmp/loadlib32.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <signal.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <ucontext.h>
+          #include <unistd.h>
+
+          static void print_map(uintptr_t ip) {
+            FILE *f = fopen("/proc/self/maps", "r");
+            char line[1024];
+            if (!f) return;
+            while (fgets(line, sizeof(line), f)) {
+              unsigned long a, b;
+              if (sscanf(line, "%lx-%lx", &a, &b) == 2 && ip >= a && ip < b) {
+                dprintf(2, "SIGILL_MAP %s", line);
+                break;
+              }
+            }
+            fclose(f);
+          }
+          static void on_sigill(int sig, siginfo_t *si, void *ctxv) {
+            ucontext_t *ctx = (ucontext_t*)ctxv;
+            uintptr_t ip = (uintptr_t)ctx->uc_mcontext.gregs[REG_EIP];
+            unsigned char *p = (unsigned char*)ip;
+            dprintf(2, "SIGILL_CAUGHT sig=%d code=%d addr=%p eip=%p bytes=", sig, si ? si->si_code : 0, si ? si->si_addr : 0, (void*)ip);
+            for (int i = 0; i < 24; ++i) dprintf(2, "%02x", p[i]);
+            dprintf(2, "\n");
+            print_map(ip);
+            _exit(111);
+          }
+          int main(void) {
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_sigaction = on_sigill;
+            sa.sa_flags = SA_SIGINFO;
+            sigemptyset(&sa.sa_mask);
+            if (sigaction(SIGILL, &sa, 0)) return 90;
+            fprintf(stderr, "LOADLIB32_BEGIN ptr=%zu\n", sizeof(void*));
+            void *h = dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_LOCAL);
+            fprintf(stderr, "LOADLIB32_AFTER handle=%p err=%s\n", h, h ? "none" : dlerror());
+            if (!h) return 3;
+            dlclose(h);
+            fprintf(stderr, "LOADLIB32_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -m32 -O2 -Wall -Wextra -Werror /tmp/loadlib32.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/loadlib32"
+          file "$ROOTFS/opt/fex-ci/loadlib32" | tee "$R/probe.file"
+          readelf -l "$ROOTFS/opt/fex-ci/loadlib32" | tee "$R/probe.phdr"
+
+      - name: Execute and localize loadlib
+        shell: bash
+        run: |
+          set +e
+          LD_LIBRARY_PATH="$NATIVE${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 30s \
+            build/Bin/FEX /opt/fex-ci/loadlib32 > "$R/probe.out" 2> "$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          if [ "$rc" -eq 0 ]; then echo LOADLIB32_PASS | tee "$R/result.txt"; fi
+          if [ "$rc" -eq 111 ]; then echo LOADLIB32_SIGILL_CAUGHT | tee "$R/result.txt"; fi
+          test "$rc" -eq 0 -o "$rc" -eq 111
+
+      - name: Upload receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayland32-loadlib-${{ matrix.label }}-${{ github.run_id }}
+          path: wayland32-loadlib-${{ matrix.label }}
+          retention-days: 30
