@@ -19,13 +19,9 @@ def main() -> None:
     ctxh = root / "FEXCore/Source/Interface/Context/Context.h"
     repl(
         ctxh,
+        '''  void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint, uint64_t OwnerID = 0) override;''',
         '''  void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint, uint64_t OwnerID = 0) override;
-
-  void AddForceTSOInformation''',
-        '''  void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint, uint64_t OwnerID = 0) override;
-  uint64_t GetThunkTrampolineOwnerID(uintptr_t Entrypoint);
-
-  void AddForceTSOInformation''',
+  uint64_t GetThunkTrampolineOwnerID(uintptr_t Entrypoint);''',
         'Context owner-token query declaration',
     )
     repl(
