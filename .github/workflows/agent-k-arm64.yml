@@ -54,17 +54,25 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           p = Path('guest/main.cpp')
-          lines = p.read_text().splitlines(keepends=True)
-          hits = [i for i, line in enumerate(lines) if 'old guest executable mapping survived dlclose' in line]
-          if len(hits) != 1:
-              raise SystemExit(f'expected one survival guard, found {len(hits)}')
-          i = hits[0]
-          lo = max(0, i - 3); hi = min(len(lines), i + 4)
-          Path('/home/runner/work/FEX/FEX/receipts/nodelete-guard-before.txt').write_text(''.join(lines[lo:hi]))
-          indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
-          lines[i] = indent + '(void)0; // NODELETE diagnostic: mapping survival is expected; continue to retained-call probes.\n'
-          p.write_text(''.join(lines))
-          Path('/home/runner/work/FEX/FEX/receipts/nodelete-guard-after.txt').write_text(''.join(lines[lo:hi]))
+          s = p.read_text()
+          old = '''    if (executable(old_invoker) || executable(old_target) || executable(old_unpacker)) {
+              std::fprintf(stderr, "FAIL: old guest executable mapping survived dlclose\\n");
+              return 14;
+            }
+            std::printf("proof: all embedded guest executable addresses lost mappings\\n");'''
+          new = '''    if (executable(old_invoker) || executable(old_target) || executable(old_unpacker)) {
+              std::printf("NODELETE proof: all embedded guest executable addresses remain mapped; continuing retained-call probes\\n");
+            } else {
+              std::fprintf(stderr, "FAIL: NODELETE guest executable mappings disappeared after dlclose\\n");
+              return 14;
+            }'''
+          if old not in s:
+              raise SystemExit('full survival guard block missing')
+          start = s.index(old)
+          Path('/home/runner/work/FEX/FEX/receipts/nodelete-guard-before.txt').write_text(s[start:start+len(old)])
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+          Path('/home/runner/work/FEX/FEX/receipts/nodelete-guard-after.txt').write_text(new)
           PY
           make HOST_CXX=g++ GUEST_CXX='x86_64-linux-gnu-g++ -Wl,-z,nodelete'
           cp -a guest /tmp/nodelete/
@@ -116,8 +124,8 @@ jobs:
           nodelete_rc=$?
           set -e
           printf 'normal=%s\nnodelete=%s\n' "$normal_rc" "$nodelete_rc" | tee "$R/exits.txt"
-          grep -E 'generation|after dlclose|mapped|unmapped|retained|stale|callback|signal=|exit=' "$R/normal.stdout" > "$R/normal.key.txt" || true
-          grep -E 'generation|after dlclose|mapped|unmapped|retained|stale|callback|signal=|exit=' "$R/nodelete.stdout" > "$R/nodelete.key.txt" || true
+          grep -E 'generation|after dlclose|mapped|unmapped|NODELETE proof|retained|stale|callback|signal=|exit=' "$R/normal.stdout" > "$R/normal.key.txt" || true
+          grep -E 'generation|after dlclose|mapped|unmapped|NODELETE proof|retained|stale|callback|signal=|exit=' "$R/nodelete.stdout" > "$R/nodelete.key.txt" || true
           echo '--- normal ---'; cat "$R/normal.key.txt"
           echo '--- nodelete ---'; cat "$R/nodelete.key.txt"
           exit 0
