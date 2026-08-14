@@ -1,0 +1,332 @@
+name: GL direct helper moved-reload runtime
+
+on:
+  push:
+    branches: [diagnostic/gl-direct-helper-f3ab-20260814]
+    paths:
+      - LinuxFieldwork/apply_per_library_guest_bridge_helper.py
+      - LinuxFieldwork/apply_gl_helper_direct_bridge.py
+      - .github/fieldwork/apply_thunkgen_guest_bridge_output.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles_compat.py
+      - .github/workflows/gl-direct-helper-runtime.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gl-runtime:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      ROOTFS: ${{ github.workspace }}/rootfs-gl-direct
+      R: ${{ github.workspace }}/gl-direct-runtime-receipts
+      H: ${{ github.workspace }}/host-gl-direct
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and exact-product provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
+            libcap-dev libgl-dev libgl1-mesa-dri libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev xvfb x11-utils
+
+      - name: Apply direct helper and add runtime-only observability
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_per_library_guest_bridge_helper.py
+          python3 .github/fieldwork/apply_thunkgen_guest_bridge_output.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles_compat.py .
+          python3 LinuxFieldwork/apply_gl_helper_direct_bridge.py | tee "$R/transform.txt"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          guest = Path('ThunkLibs/libGL/libGL_Guest.cpp')
+          s = guest.read_text()
+          old = '''voidFunc* glXGetProcAddress(const GLubyte* procname) {\n  auto Ret = fexfn_pack_glXGetProcAddress(procname);\n'''
+          new = '''voidFunc* glXGetProcAddress(const GLubyte* procname) {\n  // Runtime-only probe hook: expose the typed guest caller T without adding\n  // a persistent name->caller API to the resident companion.\n  if (strcmp(reinterpret_cast<const char*>(procname), "__FEX_DIAG_glGetError") == 0) {\n    return reinterpret_cast<voidFunc*>(HostPtrInvokers.at("glGetError"));\n  }\n  if (strcmp(reinterpret_cast<const char*>(procname), "__FEX_DIAG_glXGetFBConfigs") == 0) {\n    return reinterpret_cast<voidFunc*>(HostPtrInvokers.at("glXGetFBConfigs"));\n  }\n  auto Ret = fexfn_pack_glXGetProcAddress(procname);\n'''
+          assert s.count(old) == 1, s.count(old)
+          guest.write_text(s.replace(old, new, 1))
+
+          bridge = Path('ThunkLibs/libGL_bridge/Guest.cpp')
+          s = bridge.read_text()
+          assert s.count('#include <cstdlib>\n') == 1
+          s = s.replace('#include <cstdlib>\n', '#include <cstdlib>\n#include <cstdio>\n', 1)
+          old = '''extern "C" void* FEXGLBridgeMalloc(size_t size) {\n  return std::malloc(size);\n}\n'''
+          new = '''extern "C" void* FEXGLBridgeMalloc(size_t size) {\n  std::fprintf(stderr, "GL_BRIDGE_MALLOC size=%zu\\n", size);\n  return std::malloc(size);\n}\n'''
+          assert s.count(old) == 1, s.count(old)
+          bridge.write_text(s.replace(old, new, 1))
+          PY
+
+          git add -N ThunkLibs/libGL_bridge/Guest.cpp
+          git diff --check
+          git diff -- ThunkLibs FEXCore Source > "$R/runtime-product.diff"
+          grep -q '^static void OnInit()' ThunkLibs/libGL/libGL_Guest.cpp
+          ! grep -q 'malloc_wrapper' ThunkLibs/libGL/libGL_Guest.cpp
+          grep -q 'fex_gl_bridge_malloc_unpacker()' ThunkLibs/libGL/libGL_Guest.cpp
+          grep -q '__FEX_DIAG_glGetError' ThunkLibs/libGL/libGL_Guest.cpp
+          grep -q 'GL_BRIDGE_MALLOC' ThunkLibs/libGL_bridge/Guest.cpp
+
+      - name: Build FEX runtime, GL host thunk, and direct guest pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build-direct -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build-direct --target FEX FEXServer GL-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 360 "$R/build-host.log"; exit 1; }
+          cp build-direct/HostLibs_64/libGL-host.so "$H/libGL-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest-direct -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build-direct/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-direct --target GL-guest GL_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 420 "$R/build-guest.log"; exit 1; }
+
+          cp guest-direct/gen/thunkgen_bridge_libGL.inl "$R/gl-bridge.inl"
+          cp guest-direct/gen/thunkgen_bridge_accessors_libGL.inl "$R/gl-accessors.inl"
+          test "$(grep -c 'caller=1 unpacker=0' "$R/gl-bridge.inl")" -eq 736
+          ! grep -q 'unpacker=1' "$R/gl-bridge.inl"
+
+          readelf -d guest-direct/libGL-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest-direct/libfex-GL-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-GL-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'RUNPATH.*\$ORIGIN' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          nm -D guest-direct/libfex-GL-bridge.so | tee "$R/bridge.symbols"
+          for sym in FEXGLBridgeMalloc fex_gl_bridge_malloc_unpacker fex_gl_bridge_xsync_unpacker fex_gl_bridge_xgetvisualinfo_unpacker fex_gl_bridge_xdisplaystring_unpacker; do
+            grep -q "$sym" "$R/bridge.symbols"
+          done
+          size guest-direct/libGL-guest.so guest-direct/libfex-GL-bridge.so | tee "$R/size.txt"
+
+      - name: Build amd64 X11 stub and moved-reload probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-direct/libGL-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libGL.so.1"
+          cp guest-direct/libfex-GL-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-GL-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          #include <stdio.h>
+          typedef int (*XErrorHandler)(void *, void *);
+          int XSync(void *d, int discard) { fprintf(stderr,"GUEST_XSYNC display=%p discard=%d\n",d,discard); return 0; }
+          void *XGetVisualInfo(void *d, long mask, void *t, int *count) { fprintf(stderr,"GUEST_XGETVISUALINFO display=%p mask=%ld\n",d,mask); (void)t; if(count)*count=0; return 0; }
+          char *XDisplayString(void *d) { fprintf(stderr,"GUEST_XDISPLAYSTRING display=%p\n",d); static char s[] = ":99"; return s; }
+          XErrorHandler XSetErrorHandler(XErrorHandler h) { return h; }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat >/tmp/gldirect.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mman.h>
+
+          typedef void (*VoidFunc)(void);
+          typedef VoidFunc (*GLXGET)(const unsigned char *);
+          typedef unsigned int (*GLGETERROR)(void);
+          typedef void *(*GLXGETFBCONFIGS)(void *, int, int *);
+          typedef uintptr_t (*GETADDR)(void);
+          struct range { uintptr_t a,b; } old[16]; static int oldn;
+
+          static int map_has(void *p, const char *needle) {
+            FILE *f=fopen("/proc/self/maps","r"); char l[1024]; uintptr_t x=(uintptr_t)p;
+            if(!f)return -1;
+            while(fgets(l,sizeof l,f)){
+              unsigned long a,b;
+              if(sscanf(l,"%lx-%lx",&a,&b)==2&&x>=a&&x<b){
+                int ok=strstr(l,needle)!=0; fprintf(stderr,"MAP %p %s",p,l); fclose(f); return ok;
+              }
+            }
+            fclose(f); fprintf(stderr,"UNMAPPED %p\n",p); return 0;
+          }
+
+          static void capture_wrapper(void) {
+            FILE*f=fopen("/proc/self/maps","r"); char l[1024]; oldn=0;
+            while(f&&fgets(l,sizeof l,f)&&oldn<16){
+              unsigned long a,b;
+              if(strstr(l,"/usr/lib/x86_64-linux-gnu/libGL.so.1")&&sscanf(l,"%lx-%lx",&a,&b)==2){
+                old[oldn++]=(struct range){a,b}; fprintf(stderr,"OLD_GL_RANGE %lx-%lx\n",a,b);
+              }
+            }
+            if(f)fclose(f);
+          }
+
+          static int reserve_old(void) {
+            for(int i=0;i<oldn;i++){
+              size_t n=old[i].b-old[i].a;
+              void*p=mmap((void*)old[i].a,n,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+              if(p==MAP_FAILED){fprintf(stderr,"RESERVE_FAIL %d %lx-%lx errno=%d\n",i,old[i].a,old[i].b,errno);return -1;}
+              fprintf(stderr,"RESERVED %lx-%lx\n",old[i].a,old[i].b);
+            }
+            return 0;
+          }
+
+          static int call_configs(GLXGETFBCONFIGS fn, uintptr_t token, const char *tag) {
+            int n=0; void *p=fn((void*)token,0,&n);
+            fprintf(stderr,"%s configs=%p count=%d\n",tag,p,n);
+            return p&&n>0 ? 0 : -1;
+          }
+
+          static void *required(void *h, const char *name) {
+            void *p=dlsym(h,name);
+            if(!p) fprintf(stderr,"DLSYM_FAIL %s %s\n",name,dlerror());
+            return p;
+          }
+
+          int main(void) {
+            void *x11=dlopen("libX11.so.6",RTLD_NOW|RTLD_LOCAL);
+            if(!x11){fprintf(stderr,"X11_FAIL %s\n",dlerror());return 2;}
+            void *h=dlopen("libGL.so.1",RTLD_NOW|RTLD_LOCAL);
+            if(!h){fprintf(stderr,"GL_FAIL %s\n",dlerror());return 3;}
+            GLXGET get0=(GLXGET)required(h,"glXGetProcAddress"); if(!get0)return 4;
+            GLGETERROR err0=(GLGETERROR)get0((const unsigned char*)"glGetError");
+            GLXGETFBCONFIGS cfg0=(GLXGETFBCONFIGS)get0((const unsigned char*)"glXGetFBConfigs");
+            void *terr0=(void*)get0((const unsigned char*)"__FEX_DIAG_glGetError");
+            void *tcfg0=(void*)get0((const unsigned char*)"__FEX_DIAG_glXGetFBConfigs");
+            if(!err0||!cfg0||!terr0||!tcfg0)return 5;
+
+            void *bh=dlopen("libfex-GL-bridge.so",RTLD_NOW|RTLD_NOLOAD);
+            if(!bh){fprintf(stderr,"BRIDGE_NOLOAD_FAIL %s\n",dlerror());return 6;}
+            void *malloc_target=required(bh,"FEXGLBridgeMalloc");
+            GETADDR malloc_unpack_get=(GETADDR)required(bh,"fex_gl_bridge_malloc_unpacker");
+            GETADDR xsync_unpack_get=(GETADDR)required(bh,"fex_gl_bridge_xsync_unpacker");
+            GETADDR xvisual_unpack_get=(GETADDR)required(bh,"fex_gl_bridge_xgetvisualinfo_unpacker");
+            GETADDR xdisplay_unpack_get=(GETADDR)required(bh,"fex_gl_bridge_xdisplaystring_unpacker");
+            if(!malloc_target||!malloc_unpack_get||!xsync_unpack_get||!xvisual_unpack_get||!xdisplay_unpack_get)return 7;
+            void *malloc_unpack=(void*)malloc_unpack_get();
+            void *xsync_unpack=(void*)xsync_unpack_get();
+            void *xvisual_unpack=(void*)xvisual_unpack_get();
+            void *xdisplay_unpack=(void*)xdisplay_unpack_get();
+
+            fprintf(stderr,"GEN1 get=%p Herr=%p Terr=%p Hcfg=%p Tcfg=%p malloc_target=%p malloc_unpack=%p xsync_unpack=%p xvisual_unpack=%p xdisplay_unpack=%p\n",
+                    (void*)get0,(void*)err0,terr0,(void*)cfg0,tcfg0,malloc_target,malloc_unpack,xsync_unpack,xvisual_unpack,xdisplay_unpack);
+            if(map_has(terr0,"/libfex-GL-bridge.so")!=1||map_has(tcfg0,"/libfex-GL-bridge.so")!=1)return 8;
+            if(map_has(malloc_target,"/libfex-GL-bridge.so")!=1||map_has(malloc_unpack,"/libfex-GL-bridge.so")!=1)return 9;
+            if(map_has(xsync_unpack,"/libfex-GL-bridge.so")!=1||map_has(xvisual_unpack,"/libfex-GL-bridge.so")!=1||map_has(xdisplay_unpack,"/libfex-GL-bridge.so")!=1)return 10;
+            if(err0()!=0)return 11;
+            if(call_configs(cfg0,0x12345000,"BEFORE_CLOSE_CONFIGS"))return 12;
+
+            capture_wrapper();
+            if(oldn==0)return 13;
+            dlclose(bh);
+            if(dlclose(h))return 14;
+            if(map_has((void*)get0,"/usr/lib/x86_64-linux-gnu/libGL.so.1")!=0)return 15;
+            if(map_has(terr0,"/libfex-GL-bridge.so")!=1||map_has(tcfg0,"/libfex-GL-bridge.so")!=1)return 16;
+            if(map_has(malloc_target,"/libfex-GL-bridge.so")!=1||map_has(malloc_unpack,"/libfex-GL-bridge.so")!=1)return 17;
+            if(map_has(xsync_unpack,"/libfex-GL-bridge.so")!=1||map_has(xdisplay_unpack,"/libfex-GL-bridge.so")!=1)return 18;
+
+            fprintf(stderr,"AFTER_CLOSE_BEGIN\n");
+            if(err0()!=0)return 19;
+            if(call_configs(cfg0,0x12346000,"AFTER_CLOSE_CONFIGS"))return 20;
+            if(reserve_old())return 21;
+
+            void *h2=dlopen("libGL.so.1",RTLD_NOW|RTLD_LOCAL);
+            if(!h2){fprintf(stderr,"RELOAD_FAIL %s\n",dlerror());return 22;}
+            GLXGET get1=(GLXGET)required(h2,"glXGetProcAddress"); if(!get1)return 23;
+            GLGETERROR err1=(GLGETERROR)get1((const unsigned char*)"glGetError");
+            GLXGETFBCONFIGS cfg1=(GLXGETFBCONFIGS)get1((const unsigned char*)"glXGetFBConfigs");
+            void *terr1=(void*)get1((const unsigned char*)"__FEX_DIAG_glGetError");
+            void *tcfg1=(void*)get1((const unsigned char*)"__FEX_DIAG_glXGetFBConfigs");
+            fprintf(stderr,"GEN2 get_old=%p get_new=%p moved=%d Herr_old=%p Herr_new=%p same_H=%d Hcfg_old=%p Hcfg_new=%p same_cfg_H=%d Terr_old=%p Terr_new=%p same_T=%d Tcfg_old=%p Tcfg_new=%p same_cfg_T=%d\n",
+                    (void*)get0,(void*)get1,get0!=get1,(void*)err0,(void*)err1,err0==err1,(void*)cfg0,(void*)cfg1,cfg0==cfg1,terr0,terr1,terr0==terr1,tcfg0,tcfg1,tcfg0==tcfg1);
+            if(get0==get1||err0!=err1||cfg0!=cfg1)return 24;
+            if(terr0!=terr1||tcfg0!=tcfg1)return 25;
+            if(map_has(terr1,"/libfex-GL-bridge.so")!=1||map_has(tcfg1,"/libfex-GL-bridge.so")!=1)return 26;
+            if(err1()!=0)return 27;
+            if(call_configs(cfg1,0x12347000,"RELOAD_CONFIGS"))return 28;
+            if(dlclose(h2))return 29;
+            if(err0()!=0)return 30;
+            if(call_configs(cfg0,0x12348000,"FINAL_RETAINED_CONFIGS"))return 31;
+            fprintf(stderr,"REAL_GL_DIRECT_HELPER_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/gldirect.c -ldl -o "$ROOTFS/opt/fex-ci/gldirect"
+
+      - name: Execute moved-reload PFN and retained callback lifetime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          Xvfb :99 -screen 0 640x480x24 +extension GLX > "$R/xvfb.log" 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 60); do DISPLAY=:99 xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+          DISPLAY=:99 xdpyinfo >/dev/null
+
+          set +e
+          DISPLAY=:99 FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 50s build-direct/Bin/FEX /opt/fex-ci/gldirect \
+            > "$R/probe.out" 2> "$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          test "$rc" -eq 0
+
+          grep -q 'AFTER_CLOSE_BEGIN' "$R/probe.err"
+          after_line="$(grep -n 'AFTER_CLOSE_BEGIN' "$R/probe.err" | head -1 | cut -d: -f1)"
+          tail -n "+$after_line" "$R/probe.err" > "$R/after-close.txt"
+          grep -q 'AFTER_CLOSE_CONFIGS' "$R/after-close.txt"
+          grep -q 'GL_BRIDGE_MALLOC' "$R/after-close.txt"
+          grep -q 'GUEST_XSYNC display=0x12346000' "$R/after-close.txt"
+          grep -q 'GUEST_XDISPLAYSTRING display=0x12346000' "$R/after-close.txt"
+          grep -q 'RESERVED ' "$R/after-close.txt"
+          grep -q 'moved=1' "$R/after-close.txt"
+          grep -q 'same_H=1' "$R/after-close.txt"
+          grep -q 'same_cfg_H=1' "$R/after-close.txt"
+          grep -q 'same_T=1' "$R/after-close.txt"
+          grep -q 'same_cfg_T=1' "$R/after-close.txt"
+          grep -q 'FINAL_RETAINED_CONFIGS' "$R/after-close.txt"
+          grep -q 'REAL_GL_DIRECT_HELPER_OK' "$R/after-close.txt"
+          echo GL_DIRECT_HELPER_RUNTIME_OK
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-direct-helper-runtime-${{ github.run_id }}
+          path: gl-direct-runtime-receipts
+          retention-days: 30
