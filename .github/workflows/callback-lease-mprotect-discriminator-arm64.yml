@@ -1,0 +1,142 @@
+name: Callback lease mprotect discriminator ARM64
+
+on:
+  push:
+    branches: [ci/callback-lease-mprotect-discriminator-20260814]
+    paths:
+      - .github/fieldwork/patch_callback_leased_mprotect.py
+      - .github/workflows/callback-lease-mprotect-discriminator-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mprotect-discriminator:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-mprotect
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-owner-claim-id-20260814
+          path: owner-helper
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_REF }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          printf 'carrier=%s\nproduct=%s\nfieldwork=%s\n' \
+            "$(git rev-parse HEAD)" "$(git -C src rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" | tee "$R/identity.txt"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro && tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 .github/fieldwork/patch_callback_inflight_fixture.py /tmp/repro/fex-full-thunk-pair
+          python3 .github/fieldwork/patch_callback_deferred_expectations.py /tmp/repro/fex-full-thunk-pair
+          python3 .github/fieldwork/patch_callback_leased_mprotect.py /tmp/repro/fex-full-thunk-pair
+          (cd /tmp/repro/fex-full-thunk-pair && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) > "$R/build-fixture.log" 2>&1
+
+      - name: Apply OwnerID callback lease stack
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 owner-helper/.github/fieldwork/merge_callback_tombstone.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          python3 owner-helper/.github/fieldwork/pre_map_fixed_retire.py src
+          python3 owner-helper/.github/fieldwork/add_map_fixed_rollback_transaction.py src
+          python3 owner-helper/.github/fieldwork/add_vma_owner_id.py src
+          python3 owner-helper/.github/fieldwork/add_owner_claim_identity.py src
+          python3 .github/fieldwork/add_callback_descriptor_after_tombstone.py src
+          python3 .github/fieldwork/relax_owner_generation_registry_anchor.py
+          python3 .github/fieldwork/add_callback_owner_generation_lease.py src
+          git -C src diff --check
+          git -C src diff > "$R/candidate.diff"
+
+      - name: Build FEX
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-fex.log" 2>&1
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          mkdir -p "$ROOTFS/opt/fex-ci"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute protection discriminator
+        shell: bash
+        run: |
+          set +e
+          (cd "$ROOTFS/opt/fex-ci" && \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="/tmp/repro/fex-full-thunk-pair/host" timeout 15s \
+            "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/guest/callback_inflight) \
+            > "$R/run.stdout" 2> "$R/run.stderr"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/run.exit"
+          grep -E 'LEASE_MPROTECT|INFLIGHT|DIAG_CALLBACK_(OWNER|DESCRIPTOR)' "$R/run.stderr" | tee "$R/key-lines.txt" || true
+          grep -q 'INFLIGHT callback-entered-host-block' "$R/run.stderr"
+          grep -q 'LEASE_MPROTECT start' "$R/run.stderr"
+          grep -q 'LEASE_MPROTECT returned rv=0 errno=0 target-executable=0' "$R/run.stderr"
+          test "$rc" -ne 124
+          printf 'mprotect_discriminator_rc=%s\n' "$rc" | tee "$R/result.txt"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: callback-lease-mprotect-${{ github.run_id }}
+          path: receipts-mprotect
+          retention-days: 30
