@@ -1,0 +1,98 @@
+name: Vulkan derived resident bridge build 32-bit
+
+on:
+  push:
+    branches: [ci/vulkan-derived-bridge-32-build-20260814]
+    paths:
+      - .github/workflows/vulkan-derived-bridge-build-32.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  derived-bridge-32:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      R: ${{ github.workspace }}/receipts-bridge-32
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and source identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            gcc-multilib-x86-64-linux-gnu g++-multilib-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev binutils
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+          git merge-base HEAD 3288618bdb08cd46b1920d5772e376701e728f70 | tee "$R/prototype-base.txt"
+
+      - name: Build thunk generator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" -v \
+            > "$R/build-thunkgen.log" 2>&1 || { tail -n 240 "$R/build-thunkgen.log"; exit 1; }
+
+      - name: Build 32-bit wrapper and resident bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest32 -G Ninja \
+            -DBITNESS=32 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_32.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest32.log" 2>&1 || { tail -n 240 "$R/cmake-guest32.log"; exit 1; }
+          cmake --build guest32 --target vulkan_bridge-guest vulkan-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest32.log" 2>&1 || { tail -n 320 "$R/build-guest32.log"; exit 1; }
+
+          test -f guest32/libfex-vulkan-bridge.so
+          test -f guest32/libvulkan-guest.so
+          test -f guest32/gen/thunkgen_guest_libvulkan.inl
+          test -f guest32/gen/thunkgen_guest_libvulkan_bridge.inl
+          test -f guest32/gen/thunkgen_guest_libvulkan_bridge_accessors.inl
+
+          file guest32/libfex-vulkan-bridge.so guest32/libvulkan-guest.so | tee "$R/files.txt"
+          readelf -h guest32/libfex-vulkan-bridge.so | tee "$R/bridge.elf"
+          readelf -d guest32/libfex-vulkan-bridge.so | tee "$R/bridge.dynamic"
+          readelf -d guest32/libvulkan-guest.so | tee "$R/vulkan.dynamic"
+          grep -q 'Class:.*ELF32' "$R/bridge.elf"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/vulkan.dynamic"
+          grep -q 'NEEDED.*libfex-vulkan-bridge.so' "$R/vulkan.dynamic"
+
+          count_source="$(grep -c 'MAKE_CALLBACK_THUNK' guest32/gen/thunkgen_guest_libvulkan.inl)"
+          count_bridge="$(grep -c 'MAKE_CALLBACK_THUNK' guest32/gen/thunkgen_guest_libvulkan_bridge.inl)"
+          printf 'SOURCE_SIGNATURES=%s\nBRIDGE_SIGNATURES=%s\n' "$count_source" "$count_bridge" | tee "$R/signature-counts.txt"
+          test "$count_source" -gt 0
+          test "$count_source" -eq "$count_bridge"
+          grep -q 'FEXGetResidentCallerForHostFunction' guest32/gen/thunkgen_guest_libvulkan_bridge_accessors.inl
+          grep -q 'FEXAllocateResidentHostTrampolineForGuestFunction' guest32/gen/thunkgen_guest_libvulkan_bridge_accessors.inl
+          echo DERIVED_VULKAN_BRIDGE_32_BUILD_OK | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-derived-bridge-32-${{ github.run_id }}
+          path: receipts-bridge-32
+          retention-days: 30
