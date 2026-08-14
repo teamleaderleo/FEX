@@ -302,5 +302,14 @@ target_link_options(PlaceholderX11 PRIVATE "LINKER:-soname,libX11.so.6")
 set_target_properties(PlaceholderX11 PROPERTIES NO_SONAME ON)
 target_link_libraries(GL-guest PRIVATE PlaceholderX11)
 
-generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp)
+generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp RESIDENT_BRIDGE)
+
+add_library(libcuda_bridge-guest-deps INTERFACE)
+target_link_libraries(libcuda_bridge-guest-deps INTERFACE libcuda-guest-deps)
+set(GEN_libcuda_bridge "${GEN_libcuda_BRIDGE}")
+add_guest_lib(cuda_bridge "libfex-cuda-bridge.so")
+set_target_properties(cuda_bridge-guest PROPERTIES OUTPUT_NAME "fex-cuda-bridge")
+target_link_options(cuda_bridge-guest PRIVATE "LINKER:-z,nodelete")
+
 add_guest_lib(cuda "libcuda.so.1")
+target_link_libraries(cuda-guest PRIVATE cuda_bridge-guest)

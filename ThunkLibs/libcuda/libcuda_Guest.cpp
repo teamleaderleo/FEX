@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MIT
 #include "common/Guest.h"
 #include "cuda_defines.h"
+#include "thunkgen_guest_libcuda_bridge_accessors.inl"
 
+#define AllocateHostTrampolineForGuestFunction FEXAllocateResidentHostTrampolineForGuestFunction
 #include "thunkgen_guest_libcuda.inl"
+#undef AllocateHostTrampolineForGuestFunction
 #include <cstdio>
 #include <dlfcn.h>
 #include <functional>
@@ -14,7 +17,7 @@
 // Maps cuda API function names to the address of a guest function which is
 // linked to the corresponding host function pointer
 const std::unordered_map<std::string_view, uintptr_t /* guest function address */> HostPtrInvokers = std::invoke([]() {
-#define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(GetCallerForHostFunction(name));
+#define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(FEXGetResidentCallerForHostFunction(name));
   std::unordered_map<std::string_view, uintptr_t> Ret;
   FOREACH_internal_SYMBOL(PAIR);
   return Ret;
