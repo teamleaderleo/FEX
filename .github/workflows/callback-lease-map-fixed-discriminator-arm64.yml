@@ -1,10 +1,12 @@
-name: Callback lease MAP_FIXED discriminator ARM64
+name: Callback lease MAP_FIXED reject/retry ARM64
 
 on:
   push:
-    branches: [ci/callback-lease-map-fixed-discriminator-20260814]
+    branches: [ci/callback-lease-map-fixed-reject-20260814]
     paths:
       - .github/fieldwork/patch_callback_leased_map_fixed.py
+      - .github/fieldwork/patch_callback_map_fixed_retry.py
+      - .github/fieldwork/add_lease_aware_map_fixed_reject.py
       - .github/workflows/callback-lease-map-fixed-discriminator-arm64.yml
   workflow_dispatch:
 
@@ -65,9 +67,10 @@ jobs:
           python3 .github/fieldwork/patch_callback_inflight_fixture.py /tmp/repro/fex-full-thunk-pair
           python3 .github/fieldwork/patch_callback_deferred_expectations.py /tmp/repro/fex-full-thunk-pair
           python3 .github/fieldwork/patch_callback_leased_map_fixed.py /tmp/repro/fex-full-thunk-pair
+          python3 .github/fieldwork/patch_callback_map_fixed_retry.py /tmp/repro/fex-full-thunk-pair
           (cd /tmp/repro/fex-full-thunk-pair && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) > "$R/build-fixture.log" 2>&1
 
-      - name: Apply OwnerID lease stack
+      - name: Apply OwnerID lease stack plus replacement guard
         shell: bash
         run: |
           set -euxo pipefail
@@ -83,6 +86,7 @@ jobs:
           python3 .github/fieldwork/add_callback_descriptor_after_tombstone.py src
           python3 .github/fieldwork/relax_owner_generation_registry_anchor.py
           python3 .github/fieldwork/add_callback_owner_generation_lease.py src
+          python3 .github/fieldwork/add_lease_aware_map_fixed_reject.py src
           git -C src diff --check
           git -C src diff > "$R/candidate.diff"
 
@@ -105,7 +109,7 @@ jobs:
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
 
-      - name: Execute destructive replacement discriminator
+      - name: Execute reject/release/retry gate
         shell: bash
         run: |
           set +e
@@ -113,15 +117,21 @@ jobs:
           rc=$?
           set -e
           echo "$rc" | tee "$R/run.exit"
-          grep -E 'LEASE_MAP_FIXED|INFLIGHT|DIAG_CALLBACK_(OWNER|DESCRIPTOR)|DIAG_MAP_FIXED' "$R/run.stderr" | tee "$R/key-lines.txt" || true
-          grep -q 'INFLIGHT callback-entered-host-block' "$R/run.stderr"
-          grep -q 'INFLIGHT close-done-before-release=1 target-mapped-before-release=1 unpacker-mapped-before-release=1' "$R/run.stderr"
-          grep -q 'LEASE_MAP_FIXED start' "$R/run.stderr"
-          printf 'discriminator_rc=%s\n' "$rc" | tee "$R/result.txt"
+          grep -E 'LEASE_MAP_FIXED|INFLIGHT|DIAG_CALLBACK_(OWNER|LEASE|DESCRIPTOR)|DIAG_MAP_FIXED|DIAG_OWNER_MAP_FIXED' "$R/run.stderr" | tee "$R/key-lines.txt" || true
+          test "$rc" -eq 0
+          grep -q 'DIAG_CALLBACK_LEASE_MAP_FIXED_REJECT' "$R/run.stderr"
+          grep -Eq 'LEASE_MAP_FIXED returned rv=0xffffffffffffffff errno=16' "$R/run.stderr"
+          grep -q 'LEASE_MAP_FIXED done-before-release=1' "$R/run.stderr"
+          grep -q 'INFLIGHT worker-returned rv=70053' "$R/run.stderr"
+          grep -q 'INFLIGHT mapped-after-release target=0 unpacker=0' "$R/run.stderr"
+          grep -Eq 'LEASE_MAP_FIXED retry-after-release rv=0x[0-9a-f]+ errno=0 mapped=1' "$R/run.stderr"
+          grep -q 'INFLIGHT child stale-first-callback exit=113' "$R/run.stderr"
+          grep -q 'INFLIGHT DEFERRED_LEASE_PASS' "$R/run.stderr"
+          echo CALLBACK_LEASE_MAP_FIXED_REJECT_RETRY_OK | tee "$R/result.txt"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: callback-lease-map-fixed-${{ github.run_id }}
+          name: callback-lease-map-fixed-reject-${{ github.run_id }}
           path: receipts-map-fixed
           retention-days: 30
