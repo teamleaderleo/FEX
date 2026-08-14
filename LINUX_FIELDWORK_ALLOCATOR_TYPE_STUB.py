@@ -80,8 +80,8 @@ member_needle = '''      if (types.at(type).UsesCustomRepackFor(host_member_fiel
         continue;
 '''
 member_repl = '''      if (get_type_name(context, type) == "VkAllocationCallbacks") {
-        fmt::print(stderr, "ALLOC_COMPAT member={} custom={} host_type={}\\n", host_member_field->getNameAsString(),
-                   types.at(type).UsesCustomRepackFor(host_member_field), host_member_type.getAsString());
+        fmt::print(stderr, "ALLOC_COMPAT member={} custom={}\\n", host_member_field->getNameAsString(),
+                   types.at(type).UsesCustomRepackFor(host_member_field));
       }
       if (types.at(type).UsesCustomRepackFor(host_member_field)) {
         member_compat.push_back(TypeCompatibility::Repackable);
