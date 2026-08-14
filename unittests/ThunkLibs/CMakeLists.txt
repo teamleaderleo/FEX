@@ -8,6 +8,9 @@ target_compile_definitions(thunkgentest PRIVATE
   "X86_DEV_ROOTFS=\"${X86_DEV_ROOTFS}\""
 )
 
+add_test(NAME VulkanCustomRouteInventory.ThunkGen
+  COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_custom_route_inventory.py" "${CMAKE_SOURCE_DIR}")
+
 add_custom_target(thunkgen_tests
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
   USES_TERMINAL
