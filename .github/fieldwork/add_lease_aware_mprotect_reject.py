@@ -3,29 +3,21 @@ from pathlib import Path
 import sys
 
 
-def once(path: Path, old: str, new: str, label: str) -> None:
-    text = path.read_text()
-    n = text.count(old)
-    if n != 1:
-        raise SystemExit(f"{label}: expected one anchor, found {n}")
-    path.write_text(text.replace(old, new, 1))
-
-
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit(f"usage: {sys.argv[0]} FEX_SOURCE_ROOT")
     root = Path(sys.argv[1]).resolve()
     smc = root / "Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp"
+    text = smc.read_text()
 
-    once(
-        smc,
-        '''uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len, int prot) {
+    needle = '''uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len, int prot) {
   uint64_t Result {};
+'''
+    count = text.count(needle)
+    if count != 1:
+        raise SystemExit(f"mprotect active lease guard: expected one function prefix, found {count}")
 
-  {
-''',
-        '''uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len, int prot) {
-  uint64_t Result {};
+    guard = '''
 
   // Removing execute permission from a guest range while an already-entered
   // callback owner generation is leased can invalidate its return path before
@@ -43,12 +35,8 @@ def main() -> None:
       }
     }
   }
-
-  {
-''',
-        "mprotect active lease guard",
-    )
-
+'''
+    smc.write_text(text.replace(needle, needle + guard, 1))
     print("Added EBUSY guard for execute-removing mprotect over an active callback OwnerID lease")
 
 
