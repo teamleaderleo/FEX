@@ -1,0 +1,39 @@
+name: Native Vulkan debug allocator survey
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/vulkan-debug-allocator-forwarding-clean-20260814]
+    paths:
+      - .github/workflows/vulkan-debug-allocator-native-survey.yml
+      - LinuxFieldwork/vk_allocator_debug_extensions.c
+
+permissions:
+  contents: read
+
+jobs:
+  survey:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan headers and Lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvulkan-dev mesa-vulkan-drivers
+      - name: Run native debug allocator probe
+        run: |
+          set -euxo pipefail
+          cc -O0 -g -Wall -Wextra -Werror LinuxFieldwork/vk_allocator_debug_extensions.c -ldl -o debug-allocator-probe
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          VK_DRIVER_FILES="$ICD" ./debug-allocator-probe 2>native.stderr
+          cat native.stderr
+          grep -q 'PASS debug allocator extension matrix' native.stderr
+      - name: Upload survey
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-debug-allocator-survey-${{ github.run_id }}
+          path: native.stderr
+          retention-days: 30
