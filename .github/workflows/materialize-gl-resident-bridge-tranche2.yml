@@ -1,0 +1,181 @@
+name: Materialize GL resident bridge tranche 2
+
+on:
+  push:
+    branches: [diagnostic/gl-direct-helper-f3ab-20260814]
+    paths:
+      - LinuxFieldwork/apply_gl_helper_direct_bridge.py
+      - .github/workflows/materialize-gl-resident-bridge-tranche2.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-materialize:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: 48e28a2ce9da1334feb8d7b77dbade66efa24be2
+      OUTPUT_BRANCH: integration/per-library-resident-bridges-gl-f3ab-20260814
+      R: ${{ github.workspace }}/gl-tranche2-receipts
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Preserve validated transform and enter clean integration source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          cp LinuxFieldwork/apply_gl_helper_direct_bridge.py /tmp/apply_gl_helper_direct_bridge.py
+          git cat-file -e "$SOURCE_SHA^{commit}"
+          git checkout --detach "$SOURCE_SHA"
+          git submodule update --init --recursive
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD | tee "$R/input-source.txt"
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config python3 \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers libwayland-dev binutils
+
+      - name: Apply only validated GL source delta
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 /tmp/apply_gl_helper_direct_bridge.py | tee "$R/transform.txt"
+          git add -N ThunkLibs/libGL_bridge/Guest.cpp
+          git diff --check
+          git diff -- ThunkLibs > "$R/source.diff"
+          test -s "$R/source.diff"
+
+          git diff --name-only | sort | tee "$R/source-files.txt"
+          cat > "$R/expected-source-files.txt" <<'EOF'
+          ThunkLibs/GuestLibs/CMakeLists.txt
+          ThunkLibs/libGL/libGL_Guest.cpp
+          ThunkLibs/libGL_bridge/Guest.cpp
+          EOF
+          diff -u "$R/expected-source-files.txt" "$R/source-files.txt"
+
+          grep -q '#include "thunkgen_bridge_accessors_libGL.inl"' ThunkLibs/libGL/libGL_Guest.cpp
+          grep -q 'FEXGetResidentCallerForHostFunction(name)' ThunkLibs/libGL/libGL_Guest.cpp
+          grep -q 'fex_gl_bridge_malloc_unpacker()' ThunkLibs/libGL/libGL_Guest.cpp
+          ! grep -q 'malloc_wrapper' ThunkLibs/libGL/libGL_Guest.cpp
+          grep -q 'add_guest_bridge(GL_bridge "libfex-GL-bridge.so"' ThunkLibs/GuestLibs/CMakeLists.txt
+          grep -q 'INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../libGL"' ThunkLibs/GuestLibs/CMakeLists.txt
+          grep -q 'FEXGLBridgeMalloc' ThunkLibs/libGL_bridge/Guest.cpp
+          grep -q 'fex_gl_bridge_malloc_unpacker' ThunkLibs/libGL_bridge/Guest.cpp
+
+      - name: Build combined host and guest targets
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target \
+            thunkgen GL-host-64 vulkan-host-64 cuda-host-64 wayland-client-host-64 \
+            -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1 \
+            || { tail -n 420 "$R/build-host.log"; exit 1; }
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target \
+            GL-guest GL_bridge-guest \
+            vulkan-guest vulkan_bridge-guest \
+            cuda-guest cuda_bridge-guest \
+            wayland-client-guest wayland-client_bridge-guest \
+            -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1 \
+            || { tail -n 520 "$R/build-guest.log"; exit 1; }
+
+      - name: Verify generated GL roles and all resident ELF boundaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp guest/gen/thunkgen_bridge_libGL.inl "$R/gl-bridge.inl"
+          cp guest/gen/thunkgen_bridge_accessors_libGL.inl "$R/gl-accessors.inl"
+          test "$(grep -c 'caller=1 unpacker=0' "$R/gl-bridge.inl")" -eq 736
+          ! grep -q 'unpacker=1' "$R/gl-bridge.inl"
+
+          for pair in \
+            'gl libGL-guest.so libfex-GL-bridge.so' \
+            'vulkan libvulkan-guest.so libfex-vulkan-bridge.so' \
+            'cuda libcuda-guest.so libfex-cuda-bridge.so' \
+            'wayland libwayland-client-guest.so libfex-wayland-client-bridge.so'; do
+            set -- $pair
+            name="$1"; wrapper="guest/$2"; bridge="guest/$3"
+            readelf -d "$wrapper" > "$R/${name}-wrapper.dynamic"
+            readelf -d "$bridge" > "$R/${name}-bridge.dynamic"
+            ! grep -q 'FLAGS_1.*NODELETE' "$R/${name}-wrapper.dynamic"
+            grep -q 'NEEDED.*libfex-' "$R/${name}-wrapper.dynamic"
+            grep -q 'RUNPATH.*\$ORIGIN' "$R/${name}-wrapper.dynamic"
+            grep -q 'FLAGS_1.*NODELETE' "$R/${name}-bridge.dynamic"
+          done
+
+          nm -D guest/libfex-GL-bridge.so | tee "$R/gl-bridge.symbols"
+          for sym in FEXGLBridgeMalloc fex_gl_bridge_malloc_unpacker fex_gl_bridge_xsync_unpacker fex_gl_bridge_xgetvisualinfo_unpacker fex_gl_bridge_xdisplaystring_unpacker; do
+            grep -q "$sym" "$R/gl-bridge.symbols"
+          done
+
+          size \
+            guest/libGL-guest.so guest/libfex-GL-bridge.so \
+            guest/libvulkan-guest.so guest/libfex-vulkan-bridge.so \
+            guest/libcuda-guest.so guest/libfex-cuda-bridge.so \
+            guest/libwayland-client-guest.so guest/libfex-wayland-client-bridge.so \
+            | tee "$R/size.txt"
+          echo COMBINED_TRANCHE2_BUILD_ELF_OK | tee "$R/gate.txt"
+
+      - name: Create one clean source-only commit and push tranche 2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git add \
+            ThunkLibs/GuestLibs/CMakeLists.txt \
+            ThunkLibs/libGL/libGL_Guest.cpp \
+            ThunkLibs/libGL_bridge/Guest.cpp
+          git diff --cached --check
+          git diff --cached --name-only | sort | tee "$R/staged-files.txt"
+          diff -u "$R/expected-source-files.txt" "$R/staged-files.txt"
+          git diff --cached --binary > /tmp/gl-resident-tranche2.patch
+          cp /tmp/gl-resident-tranche2.patch "$R/source-only.patch"
+
+          git reset --hard "$SOURCE_SHA"
+          git checkout -B "$OUTPUT_BRANCH" "$SOURCE_SHA"
+          git apply --index /tmp/gl-resident-tranche2.patch
+          git diff --cached --check
+          git diff --cached --name-only | sort | tee "$R/final-files.txt"
+          diff -u "$R/expected-source-files.txt" "$R/final-files.txt"
+
+          git config user.name Leo
+          git config user.email cheerleaderleo@outlook.com
+          git commit -m 'Research: add GL resident guest bridge'
+          git rev-parse HEAD | tee "$R/integration-commit.txt"
+          git rev-parse HEAD^ | tee "$R/integration-parent.txt"
+          test "$(cat "$R/integration-parent.txt")" = "$SOURCE_SHA"
+          git push origin "HEAD:refs/heads/$OUTPUT_BRANCH"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: materialized-gl-resident-tranche2-${{ github.run_id }}
+          path: gl-tranche2-receipts
+          retention-days: 30
