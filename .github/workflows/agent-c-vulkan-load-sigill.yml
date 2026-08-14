@@ -1,4 +1,4 @@
-name: Agent C two-commit Vulkan proc routing matrix
+name: Agent C final Vulkan proc routing matrix
 
 on:
   push:
@@ -11,11 +11,11 @@ permissions:
   contents: read
 
 jobs:
-  two-commit-head:
+  final-head:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
-      FEX_SHA: 579860a098bdbe94e39970535771bada0f3ed853
+      FEX_SHA: 4f8130c298433a7a9165392d33fc0a3e6be3202b
       FIELDWORK_SHA: 1b268a6742768086aa8355e997c10b4423319ba6
       DEBIAN_FRONTEND: noninteractive
       ROOTFS: ${{ github.workspace }}/rootfs
@@ -72,7 +72,7 @@ jobs:
           VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 report gipa positive >"$R/native-report.out" 2>"$R/native-report.err"
           VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 utils gipa positive >"$R/native-utils.out" 2>"$R/native-utils.err"
 
-      - name: Build clean two-commit FEX Vulkan thunk pair
+      - name: Build exact clean candidate and Vulkan thunk pair
         shell: bash
         run: |
           set -euxo pipefail
@@ -91,6 +91,7 @@ jobs:
             -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
             >"$R/cmake-guest.log" 2>&1
           cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
+          file src/build/Bin/FEX src/build/Bin/FEXServer "$HOST/libvulkan-host.so" guest/libvulkan-guest.so >"$R/artifacts.file.txt"
 
       - name: Build repaired amd64 rootfs and probes
         shell: bash
@@ -107,13 +108,19 @@ jobs:
           cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
           cat >/tmp/x11-stub.c <<'EOF'
-          long XSync(void) { return 0; }
-          void *XGetVisualInfo(void) { return 0; }
-          const char *XDisplayString(void) { return ":fex-ci-stub"; }
+          int XSync(void *display, int discard) { (void)display; (void)discard; return 0; }
+          void *XGetVisualInfo(void *display, long mask, void *templ, int *count) { (void)display; (void)mask; (void)templ; if (count) *count = 0; return 0; }
+          char *XDisplayString(void *display) { (void)display; static char value[] = ":fex-ci-stub"; return value; }
           EOF
-          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libX11.so.6 /tmp/x11-stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
-          x86_64-linux-gnu-gcc -O2 -Wall -Wextra fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c -ldl -o "$ROOTFS/opt/fex-ci/callback-probe"
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 \
+            /tmp/x11-stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/callback-probe"
+
           cat >/tmp/null-gipa.c <<'EOF'
           #include <dlfcn.h>
           #include <stdio.h>
@@ -123,7 +130,7 @@ jobs:
           int main(int argc, char **argv) {
             if (argc != 3) return 64;
             void *h = dlopen("libvulkan.so.1", RTLD_NOW|RTLD_LOCAL);
-            if (!h) return 2;
+            if (!h) { fprintf(stderr, "DLERROR %s\n", dlerror()); return 2; }
             GIPA g = (GIPA)dlsym(h,"vkGetInstanceProcAddr");
             if (!g) return 3;
             PFN p = g(NULL, argv[1]);
@@ -135,7 +142,48 @@ jobs:
           EOF
           x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/null-gipa.c -ldl -o "$ROOTFS/opt/fex-ci/null-gipa"
 
-      - name: Run two-commit callback and proc-address matrix
+          cat >/tmp/self-gipa.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          typedef void (*PFN)(void);
+          typedef void *VkInstance;
+          typedef int32_t VkResult;
+          typedef PFN (*GIPA)(VkInstance, const char *);
+          typedef PFN (*GDPA)(void *, const char *);
+          typedef struct { int32_t sType; const void *pNext; const char *pApplicationName; uint32_t applicationVersion; const char *pEngineName; uint32_t engineVersion; uint32_t apiVersion; } VkApplicationInfo;
+          typedef struct { int32_t sType; const void *pNext; uint32_t flags; const VkApplicationInfo *pApplicationInfo; uint32_t enabledLayerCount; const char *const *ppEnabledLayerNames; uint32_t enabledExtensionCount; const char *const *ppEnabledExtensionNames; } VkInstanceCreateInfo;
+          typedef VkResult (*CreateInstance)(const VkInstanceCreateInfo *, const void *, VkInstance *);
+          int main(void) {
+            void *h = dlopen("libvulkan.so.1", RTLD_NOW|RTLD_LOCAL);
+            if (!h) { fprintf(stderr,"DLERROR %s\n", dlerror()); return 2; }
+            GIPA gipa = (GIPA)dlsym(h,"vkGetInstanceProcAddr");
+            GDPA gdpa = (GDPA)dlsym(h,"vkGetDeviceProcAddr");
+            CreateInstance create = (CreateInstance)dlsym(h,"vkCreateInstance");
+            if (!gipa || !gdpa || !create) return 3;
+            VkApplicationInfo app = {0, 0, "self-gipa", 1, "none", 1, (1u << 22)};
+            VkInstanceCreateInfo ci = {1, 0, 0, &app, 0, 0, 0, 0};
+            VkInstance instance = 0;
+            VkResult r = create(&ci, 0, &instance);
+            fprintf(stderr,"SELF_CREATE result=%d instance=%p direct_gipa=%p direct_gdpa=%p\n", r, instance, (void*)gipa, (void*)gdpa);
+            if (r != 0 || !instance) return 10;
+            PFN self_gipa = gipa(instance,"vkGetInstanceProcAddr");
+            PFN self_gdpa = gipa(instance,"vkGetDeviceProcAddr");
+            PFN destroy = ((GIPA)self_gipa)(instance,"vkDestroyInstance");
+            PFN null_gipa = gipa(0,"vkGetInstanceProcAddr");
+            PFN null_gdpa = gipa(0,"vkGetDeviceProcAddr");
+            fprintf(stderr,"SELF_RESULT instance_gipa=%p instance_gdpa=%p destroy=%p null_gipa=%p null_gdpa=%p\n", (void*)self_gipa, (void*)self_gdpa, (void*)destroy, (void*)null_gipa, (void*)null_gdpa);
+            if (self_gipa != (PFN)gipa) return 20;
+            if (self_gdpa != (PFN)gdpa) return 21;
+            if (!destroy) return 22;
+            if (null_gipa != (PFN)gipa) return 23;
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/self-gipa.c -ldl -o "$ROOTFS/opt/fex-ci/self-gipa"
+
+      - name: Run final callback and proc-address matrix
         shell: bash
         run: |
           set -uxo pipefail
@@ -158,12 +206,13 @@ jobs:
           run_case utils-gipa /opt/fex-ci/callback-probe utils gipa 0
           run_case null-report /opt/fex-ci/null-gipa vkCreateDebugReportCallbackEXT null
           run_case null-shader /opt/fex-ci/null-gipa vkCreateShaderModule null
+          run_case self-gipa /opt/fex-ci/self-gipa
           {
-            for name in report-direct report-gipa utils-direct utils-gipa null-report null-shader; do
+            for name in report-direct report-gipa utils-direct utils-gipa null-report null-shader self-gipa; do
               printf '%s=' "$name"; cat "$R/$name.exit"
             done
-          } | tee "$R/two-commit-matrix.txt"
-          for name in report-direct report-gipa utils-direct utils-gipa null-report null-shader; do
+          } | tee "$R/final-matrix.txt"
+          for name in report-direct report-gipa utils-direct utils-gipa null-report null-shader self-gipa; do
             test "$(cat "$R/$name.exit")" = 0
           done
 
@@ -171,7 +220,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-c-two-commit-${{ github.run_id }}
+          name: agent-c-final-proc-routing-${{ github.run_id }}
           path: receipts
           if-no-files-found: warn
           retention-days: 30
