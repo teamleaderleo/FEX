@@ -3,10 +3,12 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 
 static volatile unsigned alloc_calls;
+static volatile unsigned realloc_calls;
 static volatile unsigned free_calls;
 static int cookie;
 
@@ -17,7 +19,7 @@ static size_t normalize_alignment(size_t a) {
   return p;
 }
 
-struct Header { void *base; };
+struct Header { void *base; size_t size; };
 
 __attribute__((used,noinline)) static void *alloc_body(void *user, size_t size, size_t alignment, VkSystemAllocationScope scope) {
   if (user != &cookie) _exit(91);
@@ -28,10 +30,35 @@ __attribute__((used,noinline)) static void *alloc_body(void *user, size_t size, 
   if (!base) return NULL;
   uintptr_t raw = (uintptr_t)base + sizeof(struct Header);
   uintptr_t aligned = (raw + alignment - 1) & ~(uintptr_t)(alignment - 1);
-  ((struct Header *)(aligned - sizeof(struct Header)))->base = base;
+  struct Header *h = (struct Header *)(aligned - sizeof(struct Header));
+  h->base = base;
+  h->size = size;
   fprintf(stderr, "EVENT_ALLOC ptr=%p size=%zu align=%zu scope=%u\n", (void *)aligned, size, alignment, (unsigned)scope);
   fflush(stderr);
   return (void *)aligned;
+}
+
+__attribute__((used,noinline)) static void *realloc_body(void *user, void *original, size_t size, size_t alignment, VkSystemAllocationScope scope) {
+  if (user != &cookie) _exit(93);
+  ++realloc_calls;
+  fprintf(stderr, "EVENT_REALLOC_ENTER ptr=%p size=%zu align=%zu count=%u\n", original, size, alignment, realloc_calls);
+  fflush(stderr);
+  if (!original) return alloc_body(user, size, alignment, scope);
+  struct Header *oldh = (struct Header *)((uintptr_t)original - sizeof(struct Header));
+  if (size == 0) {
+    free(oldh->base);
+    fprintf(stderr, "EVENT_REALLOC_FREE_RETURN ptr=%p\n", original);
+    fflush(stderr);
+    return NULL;
+  }
+  size_t old_size = oldh->size;
+  void *p = alloc_body(user, size, alignment, scope);
+  if (!p) return NULL;
+  memcpy(p, original, old_size < size ? old_size : size);
+  free(oldh->base);
+  fprintf(stderr, "EVENT_REALLOC_RETURN old=%p new=%p\n", original, p);
+  fflush(stderr);
+  return p;
 }
 
 __attribute__((used,noinline)) static void free_body(void *user, void *memory) {
@@ -52,12 +79,17 @@ __attribute__((naked,noinline)) static void *VKAPI_CALL allocation_cb(void *u, s
   (void)u; (void)s; (void)a; (void)sc;
   __asm__ volatile("jmp alloc_body");
 }
+__attribute__((naked,noinline)) static void *VKAPI_CALL reallocation_cb(void *u, void *p, size_t s, size_t a, VkSystemAllocationScope sc) {
+  (void)u; (void)p; (void)s; (void)a; (void)sc;
+  __asm__ volatile("jmp realloc_body");
+}
 __attribute__((naked,noinline)) static void VKAPI_CALL free_cb(void *u, void *p) {
   (void)u; (void)p;
   __asm__ volatile("jmp free_body");
 }
 #else
 static void *VKAPI_CALL allocation_cb(void *u, size_t s, size_t a, VkSystemAllocationScope sc) { return alloc_body(u, s, a, sc); }
+static void *VKAPI_CALL reallocation_cb(void *u, void *p, size_t s, size_t a, VkSystemAllocationScope sc) { return realloc_body(u, p, s, a, sc); }
 static void VKAPI_CALL free_cb(void *u, void *p) { free_body(u, p); }
 #endif
 
@@ -106,7 +138,7 @@ int main(void) {
   VkAllocationCallbacks cb = {
     .pUserData = &cookie,
     .pfnAllocation = allocation_cb,
-    .pfnReallocation = NULL,
+    .pfnReallocation = reallocation_cb,
     .pfnFree = free_cb,
     .pfnInternalAllocation = NULL,
     .pfnInternalFree = NULL,
@@ -115,11 +147,11 @@ int main(void) {
   VkEvent event = VK_NULL_HANDLE;
   fprintf(stderr, "EVENT_CREATE_ENTER\n"); fflush(stderr);
   r = vkCreateEvent(device, &eci, &cb, &event);
-  fprintf(stderr, "EVENT_CREATE_RETURN result=%d event=%llu alloc=%u free=%u\n", r, (unsigned long long)event, alloc_calls, free_calls); fflush(stderr);
+  fprintf(stderr, "EVENT_CREATE_RETURN result=%d event=%llu alloc=%u realloc=%u free=%u\n", r, (unsigned long long)event, alloc_calls, realloc_calls, free_calls); fflush(stderr);
   if (r != VK_SUCCESS) return 10;
   fprintf(stderr, "EVENT_DESTROY_ENTER event=%llu\n", (unsigned long long)event); fflush(stderr);
   vkDestroyEvent(device, event, &cb);
-  fprintf(stderr, "EVENT_DESTROY_RETURN alloc=%u free=%u\n", alloc_calls, free_calls); fflush(stderr);
+  fprintf(stderr, "EVENT_DESTROY_RETURN alloc=%u realloc=%u free=%u\n", alloc_calls, realloc_calls, free_calls); fflush(stderr);
 
   vkDestroyDevice(device, NULL);
   vkDestroyInstance(instance, NULL);
