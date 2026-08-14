@@ -1,0 +1,62 @@
+name: Vulkan pNext dummy callback experiment
+on:
+  workflow_dispatch:
+  push:
+    branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
+    paths: [LINUX_FIELDWORK_DEBUG_UTILS_PNEXT_DUMMY.patch, .github/workflows/linux-fieldwork-vulkan-pnext-dummy.yml]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-callback-ci
+          path: fieldwork
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang lld clang-tools libclang-dev llvm-dev pkg-config ccache gcc-x86-64-linux-gnu g++-x86-64-linux-gnu gcc-i686-linux-gnu g++-i686-linux-gnu libcap-dev libglfw3-dev libepoxy-dev python3-dev libsdl2-dev libasound2-dev libdrm-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libgl-dev libegl-dev libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
+      - name: Apply candidates
+        run: |
+          set -euxo pipefail
+          git apply LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
+          git apply --check LINUX_FIELDWORK_DEBUG_UTILS_PNEXT_DUMMY.patch
+          git apply LINUX_FIELDWORK_DEBUG_UTILS_PNEXT_DUMMY.patch
+          git diff --check
+      - name: Build FEX
+        run: |
+          set -euxo pipefail
+          C=$(dirname "$(find /usr/lib/llvm-18 -name ClangConfig.cmake -print -quit)")
+          L=$(dirname "$(find /usr/lib/llvm-18 -name LLVMConfig.cmake -print -quit)")
+          CC=clang CXX=clang++ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX="$PWD/install" -DUSE_LINKER=lld -DENABLE_LTO=False -DENABLE_ASSERTIONS=True -DBUILD_TESTING=False -DBUILD_THUNKS=True -DBUILD_FEXCONFIG=False -DENABLE_CLANG_THUNKS=True -DRANGES_NATIVE=OFF -DClang_DIR="$C" -DLLVM_DIR="$L"
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+      - name: Run pNext preserved-callback probe
+        run: |
+          set -euxo pipefail
+          P=fieldwork/investigations/fex-vulkan-thunk-lifecycle
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$P/debug_utils_pnext_zero_probe.c" -ldl -o /tmp/probe
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -Wl,-soname,libX11.so.6 "$P/x11_symbol_fixture.c" -o /tmp/libX11.so.6
+          sudo systemctl start docker || true
+          sudo docker pull --platform linux/amd64 ubuntu:24.04
+          cid=$(sudo docker create --platform linux/amd64 ubuntu:24.04)
+          mkdir rootfs
+          sudo docker export "$cid" | sudo tar -C rootfs -xf -
+          sudo docker rm "$cid"
+          sudo mkdir -p rootfs/tmp rootfs/usr/lib/x86_64-linux-gnu
+          sudo cp /tmp/probe rootfs/tmp/probe
+          sudo cp /tmp/libX11.so.6 rootfs/usr/lib/x86_64-linux-gnu/libX11.so.6
+          sudo cp install/share/fex-emu/GuestThunks/libvulkan-guest.so rootfs/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+          ICD=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' | head -1)
+          mkdir -p "$HOME/.fex-emu"
+          printf '{"Config":{"RootFS":"%s/rootfs","ThunkConfig":"%s/install/share/fex-emu/ThunksDB.json"},"ThunksDB":{"Vulkan":1}}\n' "$PWD" "$PWD" > "$HOME/.fex-emu/Config.json"
+          VK_ICD_FILENAMES="$ICD" FEX_ROOTFS="$PWD/rootfs" FEX_THUNKCONFIG="$PWD/install/share/fex-emu/ThunksDB.json" FEX_THUNKGUESTLIBS="$PWD/install/share/fex-emu/GuestThunks" FEX_THUNKHOSTLIBS="$PWD/install/lib/fex-emu/HostThunks" install/bin/FEX /tmp/probe 2>&1 | tee /tmp/pnext-dummy.log
+          grep -q 'FEX_DEBUG_UTILS_PNEXT_DUMMY_HIT' /tmp/pnext-dummy.log
+          grep -Eq 'PNEXT_ZERO_CREATE result=0 instance=0x[0-9a-fA-F]+ callback_count=0' /tmp/pnext-dummy.log
