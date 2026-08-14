@@ -1,0 +1,165 @@
+name: Vulkan instance allocator forwarding clean matrix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/vulkan-instance-allocator-forwarding-clean-20260814]
+    paths:
+      - .github/workflows/vulkan-instance-allocator-forwarding-clean.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    env:
+      CANDIDATE_SHA: 715ff36bff2fd9f2353ab31613dc41ae106f3938
+      SUPPORT_SHA: 24b1349efd1a9650b8041971049cb68315f12e50
+      PROBE_SHA: 4efe0461e7949daf760a652a8f312f0802cc0c0e
+      FEX_PORTABLE: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: carrier
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.SUPPORT_SHA }}
+          path: support
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PROBE_SHA }}
+          path: probe-support
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: product
+          submodules: recursive
+
+      - name: Install dependencies and prove candidate identity
+        run: |
+          set -euxo pipefail
+          test "$(git -C product rev-parse HEAD)" = "$CANDIDATE_SHA"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build nasm clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers
+
+      - name: Apply validated allocator mediation plus instance forwarding only
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          python3 ../support/LINUX_FIELDWORK_ALLOCATOR_TRAMPOLINE.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/libvulkan/Host.cpp')
+          s = p.read_text()
+          old = '  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);'
+          new = '  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, a_1, &out);'
+          assert s.count(old) == 1, s.count(old)
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git diff --check
+          git diff --name-only | tee ../product-files.txt
+          printf '%s\n' \
+            ThunkLibs/libvulkan/Guest.cpp \
+            ThunkLibs/libvulkan/Host.cpp \
+            ThunkLibs/libvulkan/libvulkan_interface.cpp \
+            | sort > ../expected-product-files.txt
+          sort ../product-files.txt > ../actual-product-files.txt
+          diff -u ../expected-product-files.txt ../actual-product-files.txt
+          grep -n 'LDR_PTR(vkCreateInstance)(vk_struct_base, a_1, &out)' ThunkLibs/libvulkan/Host.cpp | tee ../forwarded-instance.txt
+          test "$(wc -l < ../forwarded-instance.txt)" -eq 1
+
+      - name: Re-run const repack regression
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=ON \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/
+          cmake --build build --target thunkgentest -- -j"$(nproc)"
+          build/Bin/thunkgentest "StructRepacking" | tee ../thunkgentest.txt
+
+      - name: Build plain FEX Vulkan thunk path
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$PWD" -DGENERATOR_EXE="$PWD/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)"
+
+      - name: Prepare native and FEX instance probes
+        run: |
+          set -euxo pipefail
+          mkdir -p receipts host-thunks
+          cc -O0 -g -Wall -Wextra -Werror probe-support/LinuxFieldwork/vk_allocator_instance_probe.c -ldl -o receipts/native-probe
+          docker pull --platform=linux/amd64 ubuntu:24.04
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir rootfs-amd64
+          docker export "$cid" | tar -C rootfs-amd64 -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p rootfs-amd64/usr/lib/x86_64-linux-gnu rootfs-amd64/opt/fex-ci
+          cp product/guest-build/libvulkan-guest.so rootfs-amd64/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+          cp product/build/HostLibs_64/libvulkan-host.so host-thunks/libvulkan-host.so
+          x86_64-linux-gnu-gcc -O0 -g -Wall -Wextra -Werror probe-support/LinuxFieldwork/vk_allocator_instance_probe.c -ldl -o rootfs-amd64/opt/fex-ci/instance-probe
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o rootfs-amd64/usr/lib/x86_64-linux-gnu/libX11.so.6
+
+      - name: Execute clean instance allocator matrix
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          set +e
+          VK_DRIVER_FILES="$ICD" timeout 30s receipts/native-probe >receipts/native.stdout 2>receipts/native.stderr
+          native_rc=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" \
+            timeout 30s product/build/Bin/FEX /opt/fex-ci/instance-probe \
+            >receipts/fex.stdout 2>receipts/fex.stderr
+          fex_rc=$?
+          set -e
+          printf 'candidate=%s\nnative=%s\nfex=%s\n' "$CANDIDATE_SHA" "$native_rc" "$fex_rc" | tee receipts/final-matrix.txt
+          printf '%s\n' '--- native ---'; cat receipts/native.stderr
+          printf '%s\n' '--- fex ---'; cat receipts/fex.stderr
+          test "$native_rc" -eq 0
+          test "$fex_rc" -eq 0
+          for file in receipts/native.stderr receipts/fex.stderr; do
+            grep -q 'PASS allocator native-valid create/destroy callbacks observed' "$file"
+            grep -E -q 'MARK create-return result=0 .*alloc=[1-9]' "$file"
+            grep -E -q 'MARK destroy-return .*free=[1-9]' "$file"
+          done
+          printf '%s\n' 'OUTCOME=clean_candidate_manual_mediation_plus_instance_allocator_forward_passed' >> receipts/final-matrix.txt
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-instance-allocator-clean-${{ github.run_id }}
+          path: |
+            receipts
+            product-files.txt
+            expected-product-files.txt
+            actual-product-files.txt
+            forwarded-instance.txt
+            thunkgentest.txt
+          retention-days: 30
