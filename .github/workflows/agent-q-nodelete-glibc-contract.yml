@@ -1,0 +1,90 @@
+name: Agent Q glibc NODELETE contract
+
+on:
+  push:
+    branches: [ci/agent-q-nodelete-glibc-contract-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run NODELETE loader contract
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -f /tmp/nodelete-fini.log
+          cat > /tmp/nodelete.c <<'EOF'
+          #include <stdio.h>
+          static int init_count;
+          static int fini_count;
+          __attribute__((constructor)) static void init(void) { ++init_count; }
+          __attribute__((destructor)) static void fini(void) {
+            ++fini_count;
+            FILE *f = fopen("/tmp/nodelete-fini.log", "a");
+            if (f) { fprintf(f, "fini init=%d fini=%d\n", init_count, fini_count); fclose(f); }
+          }
+          __attribute__((visibility("default"))) int nodelete_probe(int *fini) {
+            if (fini) *fini = fini_count;
+            return init_count;
+          }
+          EOF
+          cc -shared -fPIC -O2 -Wl,-z,nodelete -Wl,-soname,libnodelete-probe.so \
+            /tmp/nodelete.c -o /tmp/libnodelete-probe.so
+          readelf -d /tmp/libnodelete-probe.so | tee /tmp/nodelete.dynamic
+          grep -q 'FLAGS_1.*NODELETE' /tmp/nodelete.dynamic
+
+          cat > /tmp/loader.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          typedef int (*probe_t)(int *);
+          static void check(probe_t p, const char *tag) {
+            int fini = -1;
+            int init = p(&fini);
+            fprintf(stderr, "%s init=%d fini=%d fn=%p\n", tag, init, fini, (void *)p);
+            if (init != 1 || fini != 0) exit(20);
+          }
+          int main(void) {
+            void *h = dlopen("/tmp/libnodelete-probe.so", RTLD_NOW | RTLD_LOCAL);
+            if (!h) { fprintf(stderr, "%s\n", dlerror()); return 2; }
+            probe_t p = (probe_t)dlsym(h, "nodelete_probe");
+            if (!p) return 3;
+            check(p, "FIRST_LOAD");
+            if (dlclose(h)) return 4;
+            check(p, "AFTER_DLCLOSE_RETAINED_FN");
+
+            void *noload = dlopen("/tmp/libnodelete-probe.so", RTLD_NOW | RTLD_NOLOAD);
+            fprintf(stderr, "RTLD_NOLOAD handle=%p\n", noload);
+            if (!noload) return 5;
+            probe_t pn = (probe_t)dlsym(noload, "nodelete_probe");
+            if (!pn) return 6;
+            check(pn, "AFTER_NOLOAD");
+            dlclose(noload);
+
+            void *global = dlopen("/tmp/libnodelete-probe.so", RTLD_NOW | RTLD_GLOBAL);
+            if (!global) return 7;
+            probe_t pg = (probe_t)dlsym(RTLD_DEFAULT, "nodelete_probe");
+            fprintf(stderr, "GLOBAL_PROMOTION default_fn=%p\n", (void *)pg);
+            if (!pg) return 8;
+            check(pg, "AFTER_GLOBAL_PROMOTION");
+            if (pg != p) return 9;
+            dlclose(global);
+            check(p, "AFTER_FINAL_DLCLOSE");
+            fprintf(stderr, "NODELETE_GLIBC_CONTRACT_OK\n");
+            return 0;
+          }
+          EOF
+          cc -O2 -Wall -Wextra -Werror /tmp/loader.c -ldl -o /tmp/loader
+          /tmp/loader 2> /tmp/loader.err
+          cat /tmp/loader.err
+          grep -q NODELETE_GLIBC_CONTRACT_OK /tmp/loader.err
+          test -f /tmp/nodelete-fini.log
+          cat /tmp/nodelete-fini.log
+          test "$(wc -l < /tmp/nodelete-fini.log)" -eq 1
