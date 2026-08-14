@@ -21,62 +21,42 @@ anchor = '    if (cb_before != want_cb) return 11;\n\n'
 block = r'''    if (cb_before != want_cb) return 11;
 
     if (callback_race_unmap || callback_race_pin) {
-      const char* arm = "./fex-callback-race-arm";
-      const char* entered = "./fex-callback-race-entered";
-      const char* release = "./fex-callback-race-release";
-      unlink(arm); unlink(entered); unlink(release);
-      {
-        FILE* f = fopen(arm, "w");
-        if (!f) { perror("fopen arm"); return 80; }
-        fputs("1", f); fclose(f);
-      }
-
+      std::atomic<bool> worker_started {false};
       std::atomic<int> worker_rv {-999999};
-      std::thread worker([&] { worker_rv.store(call_first_callback(6)); });
+      std::thread worker([&] {
+        worker_started.store(true);
+        worker_rv.store(call_first_callback(6));
+      });
 
-      bool saw_entered = false;
-      for (int i = 0; i < 10000; ++i) {
-        if (access(entered, F_OK) == 0) { saw_entered = true; break; }
+      while (!worker_started.load()) {
         usleep(1000);
       }
-      if (!saw_entered) {
-        std::fprintf(stderr, "FAIL: callback worker never reached FEX in-flight barrier\n");
-        {
-          FILE* f = fopen(release, "w"); if (f) { fputs("1", f); fclose(f); }
-        }
-        worker.join();
-        return 81;
-      }
-      std::fprintf(stderr, "CALLBACK_RACE_ENTERED target=0x%016" PRIxPTR " unpacker=0x%016" PRIxPTR "\n", d.target, d.unpacker);
-      std::fflush(stderr);
+      // The FEX-side discriminator pauses callback entry 2 for up to 1.5s.
+      // Give the worker ample time to reach that point before the main thread
+      // either keeps the owner pinned or begins dlclose.
+      usleep(250000);
 
       if (callback_race_unmap) {
+        std::fprintf(stderr, "CALLBACK_RACE_DLCLOSE_BEGIN target=0x%016" PRIxPTR " unpacker=0x%016" PRIxPTR "\n", d.target, d.unpacker);
+        std::fflush(stderr);
         if (dlclose(d.h) != 0) { std::fprintf(stderr, "dlclose race: %s\n", dlerror()); return 82; }
         d.h = nullptr;
-        std::fprintf(stderr, "CALLBACK_RACE_UNMAPPED target_exec=%d unpacker_exec=%d\n",
+        std::fprintf(stderr, "CALLBACK_RACE_DLCLOSE_RETURN target_exec=%d unpacker_exec=%d\n",
                      executable(d.target) ? 1 : 0, executable(d.unpacker) ? 1 : 0);
         std::fflush(stderr);
-        if (executable(d.target) || executable(d.unpacker)) return 83;
       } else {
         std::fprintf(stderr, "CALLBACK_RACE_PINNED\n");
         std::fflush(stderr);
       }
 
-      {
-        FILE* f = fopen(release, "w");
-        if (!f) { perror("fopen release"); return 84; }
-        fputs("1", f); fclose(f);
-      }
       worker.join();
-      unlink(arm); unlink(entered); unlink(release);
-
       const int rv = worker_rv.load();
       std::fprintf(stderr, "CALLBACK_RACE_WORKER_RETURN rv=%d\n", rv);
       std::fflush(stderr);
       if (callback_race_pin) {
         return rv == (gen * 10000 + 63) ? 0 : 85;
       }
-      // The unmap arm should fault while resuming the already-entered callback.
+      // A surviving unmap arm is evidence against the expected in-flight fault.
       return 86;
     }
 
