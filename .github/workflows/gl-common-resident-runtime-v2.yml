@@ -1,0 +1,83 @@
+name: Common GL resident bridge runtime v2
+
+on:
+  push:
+    branches: [ci/gl-common-resident-runtime-20260814]
+    paths: [.github/workflows/gl-common-resident-runtime-v2.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gl:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 80
+    env:
+      BASE: c348a19d91219d4df6cdaa86839607565e001fa2
+      ROOTFS: ${{ github.workspace }}/rootfs-gl-common
+      R: ${{ github.workspace }}/gl-common-receipts
+      H: ${{ github.workspace }}/host-gl-common
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Extract validated experiment and remove receipt-only SIGPIPE
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('.github/workflows/gl-common-resident-runtime.yml').read_text().splitlines()
+          scripts=[]; i=0
+          while i < len(source):
+              line=source[i]; stripped=line.lstrip()
+              if stripped != 'run: |':
+                  i += 1; continue
+              base=len(line)-len(stripped); block=[]; i += 1
+              while i < len(source):
+                  row=source[i]
+                  if row.strip() and len(row)-len(row.lstrip()) <= base:
+                      break
+                  block.append('' if not row.strip() else row[base+2:]); i += 1
+              text='\n'.join(block)+'\n'
+              text=text.replace(" | head -n 20 | tee \"$R/bridge.exports\"", " | tee \"$R/bridge.exports\"")
+              scripts.append(text)
+          if len(scripts) != 4:
+              raise SystemExit(f'expected 4 shell steps, got {len(scripts)}')
+          out=Path('/tmp/gl-common-v2'); out.mkdir(exist_ok=True)
+          for n,s in enumerate(scripts,1):
+              p=out/f'{n:02d}.sh'; p.write_text('#!/usr/bin/env bash\n'+s); p.chmod(0o755); print('EXTRACTED',p)
+          PY
+
+      - name: Execute common-helper GL unload/reload experiment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          for step in /tmp/gl-common-v2/*.sh; do
+            echo "===== $step ====="
+            "$step"
+          done
+
+      - name: Assert final runtime receipt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat "$R/probe.err"
+          grep -q 'AFTER_CLOSE_BEGIN' "$R/probe.err"
+          grep -q 'AFTER_CLOSE_CONFIGS' "$R/probe.err"
+          grep -q 'GEN2 .* moved=1 .*same_err=1 .*same_cfg=1' "$R/probe.err"
+          grep -q 'FINAL_RETAINED_CONFIGS' "$R/probe.err"
+          grep -q 'GL_COMMON_RESIDENT_OK' "$R/probe.err"
+          grep -q 'GL_COMMON_HELPER_RUNTIME_OK' "$R/result.txt"
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-common-resident-v2-${{ github.run_id }}
+          path: gl-common-receipts
+          retention-days: 30
