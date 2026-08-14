@@ -29,7 +29,7 @@ def main() -> None:
     replace_once(
         analysis_cpp,
         '''        thunked_funcptrs[type.getAsString()] = std::pair {type.getTypePtr(), no_param_annotations};\n''',
-        '''        // Store the function prototype rather than the pointer type so all\n        // bridge consumers see the same representation as generated callbacks.\n        auto funcptr = type->getPointeeType()->getAs<clang::FunctionProtoType>();\n        if (!funcptr) {\n          throw report_error(template_arg_loc, "Expected a prototype function-pointer type");\n        }\n        // Explicit function-pointer type declarations predate directional\n        // bridge roles, so conservatively keep both capabilities.\n        thunked_funcptrs[type.getAsString()] = {context.getCanonicalType(funcptr), no_param_annotations, true, true};\n''',
+        '''        // Store the function prototype rather than the pointer type so all\n        // bridge consumers see the same representation as generated callbacks.\n        auto funcptr = type->getPointeeType()->getAs<clang::FunctionProtoType>();\n        if (!funcptr) {\n          throw report_error(*decl->getSourceRange().getBegin().getPtrEncoding(), "Expected a prototype function-pointer type");\n        }\n        // Explicit function-pointer type declarations predate directional\n        // bridge roles, so conservatively keep both capabilities.\n        thunked_funcptrs[type.getAsString()] = {context.getCanonicalType(funcptr), no_param_annotations, true, true};\n''',
         "explicit function-pointer registration")
     replace_once(
         analysis_cpp,
@@ -53,7 +53,7 @@ def main() -> None:
     replace_once(
         data_layout_cpp,
         '''    auto& [type, param_annotations] = funcptr_type_it->second;\n    auto func_type = type->getAs<clang::FunctionProtoType>();\n''',
-        '''    auto& funcptr_info = funcptr_type_it->second;\n    auto* type = funcptr_info.type;\n    auto& param_annotations = funcptr_info.param_annotations;\n    auto func_type = type->getAs<clang::FunctionProtoType>();\n''',
+        '''    auto& funcptr_info = funcptr_type_it->second;\n    auto* type = funcptr_info.type;\n    auto func_type = type->getAs<clang::FunctionProtoType>();\n''',
         "data_layout.cpp function-pointer record")
 
     text = gen_cpp.read_text()
@@ -68,8 +68,6 @@ def main() -> None:
     text = text.replace(old, new, 1)
     gen_cpp.write_text(text)
 
-    # Replace the research -guest-bridge loop with role-aware canonical-signature
-    # aggregation and hash-stable exported caller/unpacker entrypoints.
     old = r'''    std::vector<std::vector<unsigned char>> sha256s;
     for (auto type_it = thunked_funcptrs.begin(); type_it != thunked_funcptrs.end(); ++type_it) {
       auto* type = type_it->second.type;
@@ -135,9 +133,6 @@ def main() -> None:
 '''
     replace_once(gen_cpp, old, new, "role-aware guest bridge emission")
 
-    # Replace the accessor placeholder with an independently generated, typed
-    # declaration fragment. Stable hash-based symbol names allow this to be a
-    # separate thunkgen invocation without relying on unordered-map iteration.
     accessor_old = r'''  // Companion declaration fragment. The role-aware transform replaces this
   // placeholder with typed caller/unpacker accessors keyed by canonical
   // signature hash. Keeping this as a separate generator mode avoids parsing
