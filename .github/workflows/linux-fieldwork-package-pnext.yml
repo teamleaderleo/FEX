@@ -1,0 +1,41 @@
+name: Package Vulkan instance pNext candidate
+on:
+  workflow_dispatch:
+  push:
+    branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
+    paths:
+      - .github/workflows/linux-fieldwork-package-pnext.yml
+permissions:
+  contents: write
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: carrier
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: fix/vulkan-instance-callback-pnext
+          path: product
+          fetch-depth: 0
+      - name: Apply reviewed pNext repair
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD)" = 71afe476751deac24adabd1adb575fd2337b6e0a
+          python3 ../carrier/LINUX_FIELDWORK_DEBUG_UTILS_PNEXT_CLEAN.py
+          git diff --check
+          test "$(git diff --name-only)" = ThunkLibs/libvulkan/Host.cpp
+          git diff -- ThunkLibs/libvulkan/Host.cpp
+      - name: Commit source-only candidate
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          git config user.name 'Linux Fieldwork'
+          git config user.email 'linux-fieldwork@users.noreply.github.com'
+          git add ThunkLibs/libvulkan/Host.cpp
+          git commit -m 'ThunkLibs/vulkan: mediate instance pNext debug callbacks'
+          git push origin HEAD:fix/vulkan-instance-callback-pnext
