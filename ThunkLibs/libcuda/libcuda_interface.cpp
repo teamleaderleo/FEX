@@ -164,7 +164,9 @@ struct fex_gen_type<CUDA_MEMSET_NODE_PARAMS_st> : fexgen::opaque_type {};
 template<>
 struct fex_gen_type<CUDA_MEMSET_NODE_PARAMS_v2_st> : fexgen::opaque_type {};
 template<>
-struct fex_gen_type<CUDA_HOST_NODE_PARAMS_st> : fexgen::opaque_type {};
+struct fex_gen_type<CUDA_HOST_NODE_PARAMS_st> {};
+template<>
+struct fex_gen_config<&CUDA_HOST_NODE_PARAMS_st::_0> : fexgen::callback_member {};
 template<>
 struct fex_gen_type<CUDA_HOST_NODE_PARAMS_v2_st> {};
 template<>

@@ -123,14 +123,28 @@ public:
     // If true, emit guest_layout/host_layout definitions even if the type is non-repackable
     bool emit_layout_wrappers = false;
 
-    // Set of members (identified by their field name) with custom repacking
+    // Set of members (identified by their field name) with custom repacking.
+    // callback_members are included here because automatic layout conversion
+    // must leave their raw function-pointer values for callback-specific code.
     std::unordered_set<std::string> custom_repacked_members;
+    std::unordered_set<std::string> callback_members;
 
     bool UsesCustomRepackFor(const clang::FieldDecl* member) const {
       return custom_repacked_members.contains(member->getNameAsString());
     }
     bool UsesCustomRepackFor(const std::string& member_name) const {
       return custom_repacked_members.contains(member_name);
+    }
+    bool UsesCallbackMemberFor(const clang::FieldDecl* member) const {
+      return callback_members.contains(member->getNameAsString());
+    }
+    bool HasManualCustomRepack() const {
+      for (const auto& member : custom_repacked_members) {
+        if (!callback_members.contains(member)) {
+          return true;
+        }
+      }
+      return false;
     }
   };
 
@@ -149,10 +163,18 @@ protected:
   std::vector<ThunkedFunction> thunks;
   std::vector<ThunkedAPIFunction> thunked_api;
 
-  // Set of function types for which to generate Guest->Host thunking trampolines.
-  // The map key is a unique identifier that must be consistent between guest/host processing passes.
-  // The map value is a pair of the function pointer's clang::Type and the mapping of parameter annotations
-  std::unordered_map<std::string, std::pair<const clang::Type*, std::unordered_map<unsigned, ParameterAnnotations>>> thunked_funcptrs;
+  struct ThunkedFuncPtr {
+    const clang::Type* type;
+    std::unordered_map<unsigned, ParameterAnnotations> param_annotations;
+    // Orthogonal bridge roles. Canonical signatures may require either or both.
+    bool needs_caller = false;
+    bool needs_unpacker = false;
+  };
+
+  // Function-pointer bridge registrations. The key preserves source provenance
+  // between guest/host passes; bridge emission later deduplicates canonical
+  // signatures while ORing the role requirements.
+  std::unordered_map<std::string, ThunkedFuncPtr> thunked_funcptrs;
 
   std::unordered_map<const clang::Type*, RepackedType> types;
   std::optional<unsigned> lib_version;

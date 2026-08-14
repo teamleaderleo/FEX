@@ -215,7 +215,8 @@ void AnalyzeDataLayoutAction::OnAnalysisComplete(clang::ASTContext& context) {
   // Register functions that must be guest-callable through host function pointers
   for (auto funcptr_type_it = thunked_funcptrs.begin(); funcptr_type_it != thunked_funcptrs.end(); ++funcptr_type_it) {
     auto& funcptr_id = funcptr_type_it->first;
-    auto& [type, param_annotations] = funcptr_type_it->second;
+    auto& funcptr_info = funcptr_type_it->second;
+    auto* type = funcptr_info.type;
     auto func_type = type->getAs<clang::FunctionProtoType>();
     std::string mangled_name = clang::QualType {type, 0}.getAsString();
     auto cb_sha256 = GetSha256("fexcallback_" + mangled_name);

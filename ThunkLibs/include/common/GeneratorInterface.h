@@ -28,6 +28,11 @@ struct callback_stub : callback_annotation_base {};
 // they must be handled in the same fex_custom_repack_entry/exit functions.
 struct custom_repack {};
 
+// Research prototype: mark a function-pointer structure member as a guest
+// callback. The first implementation treats callback-bearing structures as
+// input-only and reuses the existing guest-allocation/host-finalization path.
+struct callback_member {};
+
 // Type annotation to indicate that guest_layout/host_layout definitions should
 // be emitted even if the type is non-repackable. Pointer members will be
 // copied (or zero-extended) without regard for the referred data.

@@ -50,6 +50,10 @@ int main(int argc, char* const argv[]) {
     output_filenames.host = std::move(output_filename);
   } else if (target_abi == "-guest") {
     output_filenames.guest = std::move(output_filename);
+  } else if (target_abi == "-guest-bridge") {
+    output_filenames.guest_bridge = std::move(output_filename);
+  } else if (target_abi == "-guest-bridge-accessors") {
+    output_filenames.guest_bridge_accessors = std::move(output_filename);
   } else {
     std::cerr << "Unrecognized generator target ABI \"" << target_abi << "\"\n";
     return EXIT_FAILURE;
@@ -105,7 +109,7 @@ int main(int argc, char* const argv[]) {
   Tool.appendArgumentsAdjuster([&](const clang::tooling::CommandLineArguments& Args, clang::StringRef) {
     clang::tooling::CommandLineArguments AdjustedArgs = Args;
     AdjustedArgs.push_back("-DIS_HOST_THUNKGEN_PASS");
-    if (target_abi == "-guest") {
+    if (target_abi == "-guest" || target_abi == "-guest-bridge" || target_abi == "-guest-bridge-accessors") {
       const char* platform = is_32bit_guest ? "i686-linux-gnu" : "x86_64-linux-gnu";
       append_x86_rootfs_includes(AdjustedArgs, platform);
     }

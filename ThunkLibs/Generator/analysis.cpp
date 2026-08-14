@@ -229,7 +229,15 @@ void AnalysisAction::ParseInterface(clang::ASTContext& context) {
         if (decl->getNumBases()) {
           throw report_error(decl->getBeginLoc(), "Function pointer types cannot be annotated");
         }
-        thunked_funcptrs[type.getAsString()] = std::pair {type.getTypePtr(), no_param_annotations};
+        // Store the function prototype rather than the pointer type so all
+        // bridge consumers see the same representation as generated callbacks.
+        auto funcptr = type->getPointeeType()->getAs<clang::FunctionProtoType>();
+        if (!funcptr) {
+          throw report_error(decl->getLocation(), "Expected a prototype function-pointer type");
+        }
+        // Explicit function-pointer type declarations predate directional
+        // bridge roles, so conservatively keep both capabilities.
+        thunked_funcptrs[type.getAsString()] = {context.getCanonicalType(funcptr), no_param_annotations, true, true};
       } else {
         RepackedType repack_info = {.assumed_compatible = annotations.is_opaque || annotations.assumed_compatible,
                                     .pointers_only = annotations.is_opaque && !annotations.assumed_compatible,
@@ -308,7 +316,11 @@ void AnalysisAction::ParseInterface(clang::ASTContext& context) {
         if (llvm::isa<clang::FunctionDecl>(template_args[0].getAsDecl())) {
           // Process later
         } else if (auto annotated_member = llvm::dyn_cast<clang::FieldDecl>(template_args[0].getAsDecl())) {
-          if (decl->getNumBases() != 1 || decl->bases_begin()->getType().getAsString() != "fexgen::custom_repack") {
+          if (decl->getNumBases() != 1) {
+            throw report_error(template_arg_loc, "Unsupported member annotation(s)");
+          }
+          auto member_annotation = decl->bases_begin()->getType().getAsString();
+          if (member_annotation != "fexgen::custom_repack" && member_annotation != "fexgen::callback_member") {
             throw report_error(template_arg_loc, "Unsupported member annotation(s)");
           }
 
@@ -322,8 +334,25 @@ void AnalysisAction::ParseInterface(clang::ASTContext& context) {
           if (repack_info_it->second.assumed_compatible) {
             throw report_error(template_arg_loc, "May not annotate members of opaque types");
           }
-          // Add member to its list of members
-          repack_info_it->second.custom_repacked_members.insert(annotated_member->getNameAsString());
+
+          auto member_name = annotated_member->getNameAsString();
+          repack_info_it->second.custom_repacked_members.insert(member_name);
+
+          if (member_annotation == "fexgen::callback_member") {
+            if (!annotated_member->getType()->isFunctionPointerType()) {
+              throw report_error(template_arg_loc, "callback_member requires a function-pointer field");
+            }
+            auto funcptr = annotated_member->getType()->getPointeeType()->getAs<clang::FunctionProtoType>();
+            if (!funcptr) {
+              throw report_error(template_arg_loc, "callback_member requires a prototype function-pointer field");
+            }
+            if (funcptr->isVariadic()) {
+              throw report_error(template_arg_loc, "Variadic callback members are not supported by this prototype");
+            }
+            repack_info_it->second.callback_members.insert(member_name);
+            thunked_funcptrs["callback_member_" + annotated_member->getQualifiedNameAsString()] =
+              {context.getCanonicalType(funcptr), no_param_annotations, false, true};
+          }
         } else {
           throw report_error(template_arg_loc, "Cannot annotate this kind of symbol");
         }
@@ -425,7 +454,7 @@ void AnalysisAction::ParseInterface(clang::ASTContext& context) {
               data.callbacks.emplace(param_idx, callback);
               if (!callback.is_stub && !data.custom_host_impl) {
                 thunked_funcptrs[emitted_function->getNameAsString() + "_cb" + std::to_string(param_idx)] =
-                  std::pair {context.getCanonicalType(funcptr), no_param_annotations};
+                  {context.getCanonicalType(funcptr), no_param_annotations, false, true};
               }
 
               if (data.callbacks.size() != 1) {
@@ -522,7 +551,7 @@ void AnalysisAction::ParseInterface(clang::ASTContext& context) {
           // For indirect calls, register the function signature as a function pointer type
           if (namespace_info.indirect_guest_calls) {
             thunked_funcptrs[emitted_function->getNameAsString()] =
-              std::pair {context.getCanonicalType(emitted_function->getFunctionType()), data.param_annotations};
+              {context.getCanonicalType(emitted_function->getFunctionType()), data.param_annotations, true, false};
           }
 
           thunks.push_back(std::move(data));

@@ -107,6 +107,22 @@ function(generate NAME SOURCE_FILE)
     COMMAND_EXPAND_LISTS)
 
   list(APPEND OUTPUTS "${OUTFILE}")
+  set(BRIDGE_OUTFILE "${OUTFOLDER}/thunkgen_bridge_${NAME}.inl")
+  set(BRIDGE_ACCESSORS_OUTFILE "${OUTFOLDER}/thunkgen_bridge_accessors_${NAME}.inl")
+  add_custom_command(
+    OUTPUT "${BRIDGE_OUTFILE}" "${BRIDGE_ACCESSORS_OUTFILE}"
+    DEPENDS "${GENERATOR_EXE}"
+    DEPENDS "${SOURCE_FILE}"
+    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest-bridge" "${BRIDGE_OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
+      "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
+      "$<$<BOOL:${prop}>:;-isystem$<JOIN:${prop},;-isystem>>"
+    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest-bridge-accessors" "${BRIDGE_ACCESSORS_OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
+      "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
+      "$<$<BOOL:${prop}>:;-isystem$<JOIN:${prop},;-isystem>>"
+    VERBATIM
+    COMMAND_EXPAND_LISTS)
+  add_custom_target(${NAME}-guest-bridge-gen DEPENDS "${BRIDGE_OUTFILE}" "${BRIDGE_ACCESSORS_OUTFILE}")
+
   set(GEN_${NAME} ${OUTPUTS} PARENT_SCOPE)
 endfunction()
 
@@ -184,6 +200,59 @@ function(add_guest_lib NAME SONAME)
   endif()
 endfunction()
 
+# Linux Fieldwork research helper: package a small process-resident guest bridge
+# next to one ordinary unloadable guest thunk wrapper. Lifetime/role selection
+# remains in thunkgen and library-specific code; this helper only wires targets.
+function(add_guest_bridge BRIDGE_NAME SONAME)
+  set(options)
+  set(one_value_args OUTPUT_NAME WRAPPER_TARGET GENERATOR)
+  set(multi_value_args DEP_TARGETS INCLUDE_DIRS)
+  cmake_parse_arguments(BRIDGE "${options}" "${one_value_args}" "${multi_value_args}" ${ARGN})
+
+  if (TARGET lib${BRIDGE_NAME}-guest-deps)
+    message(FATAL_ERROR "Guest bridge dependency target lib${BRIDGE_NAME}-guest-deps already exists")
+  endif()
+
+  add_library(lib${BRIDGE_NAME}-guest-deps INTERFACE)
+  target_include_directories(lib${BRIDGE_NAME}-guest-deps INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+  if (BRIDGE_INCLUDE_DIRS)
+    target_include_directories(lib${BRIDGE_NAME}-guest-deps INTERFACE ${BRIDGE_INCLUDE_DIRS})
+  endif()
+  foreach(dep IN LISTS BRIDGE_DEP_TARGETS)
+    target_link_libraries(lib${BRIDGE_NAME}-guest-deps INTERFACE ${dep})
+  endforeach()
+
+  add_guest_lib(${BRIDGE_NAME} "${SONAME}")
+
+  if (BRIDGE_OUTPUT_NAME)
+    set_target_properties(${BRIDGE_NAME}-guest PROPERTIES OUTPUT_NAME "${BRIDGE_OUTPUT_NAME}")
+  endif()
+
+  if (TARGET_TYPE STREQUAL "SHARED")
+    target_link_options(${BRIDGE_NAME}-guest PRIVATE "LINKER:-z,nodelete")
+  endif()
+
+  if (BRIDGE_GENERATOR)
+    if (NOT TARGET ${BRIDGE_GENERATOR}-guest-bridge-gen)
+      message(FATAL_ERROR "Guest bridge generator target ${BRIDGE_GENERATOR}-guest-bridge-gen does not exist")
+    endif()
+    add_dependencies(${BRIDGE_NAME}-guest ${BRIDGE_GENERATOR}-guest-bridge-gen)
+  endif()
+
+  if (BRIDGE_WRAPPER_TARGET)
+    if (NOT TARGET ${BRIDGE_WRAPPER_TARGET})
+      message(FATAL_ERROR "Guest bridge wrapper target ${BRIDGE_WRAPPER_TARGET} does not exist")
+    endif()
+    target_link_libraries(${BRIDGE_WRAPPER_TARGET} PRIVATE ${BRIDGE_NAME}-guest)
+    # Installed guest thunks and their library-local companions live together.
+    # Keep lookup independent of global loader paths.
+    target_link_options(${BRIDGE_WRAPPER_TARGET} PRIVATE "LINKER:-rpath,$ORIGIN")
+    if (BRIDGE_GENERATOR)
+      add_dependencies(${BRIDGE_WRAPPER_TARGET} ${BRIDGE_GENERATOR}-guest-bridge-gen)
+    endif()
+  endif()
+endfunction()
+
 # These thunks only support 64-bit
 if (BITNESS EQUAL 64)
   #add_guest_lib(fex_malloc_loader)
@@ -208,6 +277,11 @@ if (BITNESS EQUAL 64)
   target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
   target_include_directories_from_pkgconfig(libvulkan-guest-deps "xcb;x11;xrandr;xrender")
   add_guest_lib(vulkan "libvulkan.so.1")
+  add_guest_bridge(vulkan_bridge "libfex-vulkan-bridge.so"
+    OUTPUT_NAME "fex-vulkan-bridge"
+    WRAPPER_TARGET vulkan-guest
+    GENERATOR libvulkan
+    DEP_TARGETS libvulkan-guest-deps)
 
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories_from_pkgconfig(libdrm-guest-deps libdrm /usr/include/drm /usr/include/libdrm)
@@ -217,6 +291,10 @@ endif()
 generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp)
 add_guest_lib(wayland-client "libwayland-client.so.0.20.0")
 target_include_directories_from_pkgconfig(libwayland-client-guest-deps wayland-client /usr/include/wayland)
+add_guest_bridge(wayland-client_bridge "libfex-wayland-client-bridge.so"
+  OUTPUT_NAME "fex-wayland-client-bridge"
+  WRAPPER_TARGET wayland-client-guest
+  DEP_TARGETS libwayland-client-guest-deps)
 
 generate(libVDSO ${CMAKE_CURRENT_SOURCE_DIR}/../libVDSO/libVDSO_interface.cpp)
 add_guest_lib(VDSO "linux-vdso.so.1")
@@ -269,3 +347,12 @@ target_link_libraries(GL-guest PRIVATE PlaceholderX11)
 
 generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp)
 add_guest_lib(cuda "libcuda.so.1")
+
+# Linux Fieldwork diagnostic: package only the generated escaped executable
+# callers/unpackers in the library-local process-resident companion.
+add_guest_bridge(cuda_bridge "libfex-cuda-bridge.so"
+  OUTPUT_NAME "fex-cuda-bridge"
+  WRAPPER_TARGET cuda-guest
+  GENERATOR libcuda
+  DEP_TARGETS libcuda-guest-deps
+  INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../libcuda")

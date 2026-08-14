@@ -305,12 +305,15 @@ void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std
     fmt::print(file, "  return ret;\n");
     fmt::print(file, "}}\n\n");
 
-    // Forward-declare user-provided repacking functions
-    if (type_repack_info.custom_repacked_members.empty()) {
+    // Forward-declare user-provided repacking functions. callback_member
+    // fields are filled by generated thunk unpacking code, so they do not by
+    // themselves require handwritten custom repack functions. This first
+    // prototype treats such structures as input-only and suppresses exit copyback.
+    if (!type_repack_info.HasManualCustomRepack()) {
       fmt::print(file, "void fex_apply_custom_repacking_entry(host_layout<{}>& source, const guest_layout<{}>& from) {{\n", struct_name, struct_name);
       fmt::print(file, "}}\n");
       fmt::print(file, "bool fex_apply_custom_repacking_exit(guest_layout<{}>& into, const host_layout<{}>& from) {{\n", struct_name, struct_name);
-      fmt::print(file, "  return false;\n");
+      fmt::print(file, "  return {};\n", type_repack_info.callback_members.empty() ? "false" : "true");
       fmt::print(file, "}}\n");
     } else {
       fmt::print(file, "void fex_custom_repack_entry(host_layout<{}>& into, const guest_layout<{}>& from);\n", struct_name, struct_name);
@@ -407,6 +410,149 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
     return fmt::format("{}CBFN{}", function_name, param_index);
   };
 
+  auto get_callback_struct_info = [&](clang::QualType type) -> const RepackedType* {
+    if (!type->isPointerType()) {
+      return nullptr;
+    }
+    auto pointee = type->getPointeeType();
+    if (!pointee->isStructureType()) {
+      return nullptr;
+    }
+    auto key = context.getCanonicalType(pointee.getTypePtr());
+    auto it = types.find(key);
+    if (it == types.end() || it->second.callback_members.empty()) {
+      return nullptr;
+    }
+    return &it->second;
+  };
+
+  // Minimal guest-side fragment for process-resident bridge companions.
+  // This intentionally excludes API packing/public wrappers and emits only
+  // signature-specific CallHostFunction adapters plus symbol enumerators.
+  if (!output_filenames.guest_bridge.empty()) {
+    std::ofstream file(output_filenames.guest_bridge);
+
+    struct BridgeSignature {
+      const clang::Type* type;
+      std::string signature;
+      bool needs_caller;
+      bool needs_unpacker;
+    };
+    std::vector<BridgeSignature> bridge_signatures;
+    for (const auto& [source_key, info] : thunked_funcptrs) {
+      (void)source_key;
+      std::string signature = clang::QualType {info.type, 0}.getAsString();
+      auto existing = std::find_if(bridge_signatures.begin(), bridge_signatures.end(),
+                                   [&](const BridgeSignature& entry) { return entry.signature == signature; });
+      if (existing == bridge_signatures.end()) {
+        bridge_signatures.push_back({info.type, std::move(signature), info.needs_caller, info.needs_unpacker});
+      } else {
+        existing->needs_caller |= info.needs_caller;
+        existing->needs_unpacker |= info.needs_unpacker;
+      }
+    }
+
+    for (std::size_t bridge_idx = 0; bridge_idx < bridge_signatures.size(); ++bridge_idx) {
+      const auto& bridge = bridge_signatures[bridge_idx];
+      auto cb_sha256 = get_sha256("fexcallback_" + bridge.signature, false);
+      std::string symbol_hash;
+      for (auto byte : cb_sha256) {
+        symbol_hash += fmt::format("{:02x}", byte);
+      }
+
+      fmt::print(file, "  // FEX_BRIDGE_ROLE index={} caller={} unpacker={} hash={} {}\n", bridge_idx,
+                 bridge.needs_caller ? 1 : 0, bridge.needs_unpacker ? 1 : 0, symbol_hash, bridge.signature);
+
+      if (bridge.needs_caller) {
+        fmt::print(file, "  MAKE_CALLBACK_THUNK(callback_{}, {}, \"{:#02x}\");\n", bridge_idx, bridge.signature, fmt::join(cb_sha256, ", "));
+        fmt::print(file, "  using fex_bridge_caller_signature_{} = {};\n", bridge_idx, bridge.signature);
+        fmt::print(file, "  extern \"C\" uintptr_t fex_bridge_invoker_{}() {{\n", symbol_hash);
+        fmt::print(file, "    return reinterpret_cast<uintptr_t>(GetCallerForHostFunction((fex_bridge_caller_signature_{}*)nullptr));\n", bridge_idx);
+        file << "  }\n";
+      }
+      if (bridge.needs_unpacker) {
+        fmt::print(file, "  using fex_bridge_unpacker_signature_{} = {};\n", bridge_idx, bridge.signature);
+        fmt::print(file, "  extern \"C\" uintptr_t fex_bridge_unpacker_{}() {{\n", symbol_hash);
+        fmt::print(file, "    return reinterpret_cast<uintptr_t>(&CallbackUnpack<fex_bridge_unpacker_signature_{}>::Unpack);\n", bridge_idx);
+        file << "  }\n";
+      }
+    }
+
+    for (std::size_t namespace_idx = 0; namespace_idx < namespaces.size(); ++namespace_idx) {
+      const auto& ns = namespaces[namespace_idx];
+      file << "#define FOREACH_" << ns.name << (ns.name.empty() ? "" : "_") << "SYMBOL(EXPAND) \\\n";
+      for (auto& symbol : thunked_api) {
+        if (symbol.symtable_namespace.value_or(0) == namespace_idx) {
+          file << "  EXPAND(" << symbol.function_name << ", \"TODO\") \\\n";
+        }
+      }
+      file << "\n";
+    }
+  }
+
+  if (!output_filenames.guest_bridge_accessors.empty()) {
+    std::ofstream file(output_filenames.guest_bridge_accessors);
+    file << "// Generated by thunkgen -guest-bridge-accessors. Do not edit.\n";
+    file << "#pragma once\n#include <cstdint>\n\n";
+    file << "template<typename Signature> struct FEXResidentBridgeInvoker;\n";
+    file << "template<typename Signature> struct FEXResidentBridgeUnpacker;\n\n";
+
+    struct BridgeAccessorSignature {
+      const clang::Type* type;
+      std::string signature;
+      bool needs_caller;
+      bool needs_unpacker;
+    };
+    std::vector<BridgeAccessorSignature> bridge_signatures;
+    for (const auto& [source_key, info] : thunked_funcptrs) {
+      (void)source_key;
+      std::string signature = clang::QualType {info.type, 0}.getAsString();
+      auto existing = std::find_if(bridge_signatures.begin(), bridge_signatures.end(),
+                                   [&](const BridgeAccessorSignature& entry) { return entry.signature == signature; });
+      if (existing == bridge_signatures.end()) {
+        bridge_signatures.push_back({info.type, std::move(signature), info.needs_caller, info.needs_unpacker});
+      } else {
+        existing->needs_caller |= info.needs_caller;
+        existing->needs_unpacker |= info.needs_unpacker;
+      }
+    }
+
+    for (std::size_t bridge_idx = 0; bridge_idx < bridge_signatures.size(); ++bridge_idx) {
+      const auto& bridge = bridge_signatures[bridge_idx];
+      auto cb_sha256 = get_sha256("fexcallback_" + bridge.signature, false);
+      std::string symbol_hash;
+      for (auto byte : cb_sha256) {
+        symbol_hash += fmt::format("{:02x}", byte);
+      }
+      fmt::print(file, "// FEX_BRIDGE_ROLE caller={} unpacker={} hash={} {}\n",
+                 bridge.needs_caller ? 1 : 0, bridge.needs_unpacker ? 1 : 0, symbol_hash, bridge.signature);
+      fmt::print(file, "using fex_bridge_accessor_signature_{} = {};\n", bridge_idx, bridge.signature);
+      if (bridge.needs_caller) {
+        fmt::print(file, "extern \"C\" uintptr_t fex_bridge_invoker_{}();\n", symbol_hash);
+        fmt::print(file, "template<> struct FEXResidentBridgeInvoker<fex_bridge_accessor_signature_{}> {{\n", bridge_idx);
+        fmt::print(file, "  static fex_bridge_accessor_signature_{}* Get() {{ return reinterpret_cast<fex_bridge_accessor_signature_{}*>(fex_bridge_invoker_{}()); }}\n", bridge_idx, bridge_idx, symbol_hash);
+        file << "};\n";
+      }
+      if (bridge.needs_unpacker) {
+        fmt::print(file, "extern \"C\" uintptr_t fex_bridge_unpacker_{}();\n", symbol_hash);
+        fmt::print(file, "template<> struct FEXResidentBridgeUnpacker<fex_bridge_accessor_signature_{}> {{\n", bridge_idx);
+        fmt::print(file, "  static void (*Get())(uintptr_t, void*) {{ return reinterpret_cast<void (*)(uintptr_t, void*)>(fex_bridge_unpacker_{}()); }}\n", symbol_hash);
+        file << "};\n";
+      }
+      file << "\n";
+    }
+
+    file << "template<typename Result, typename... Args>\n";
+    file << "static Result (*FEXGetResidentCallerForHostFunction(Result (*)(Args...)))(Args...) {\n";
+    file << "  return FEXResidentBridgeInvoker<Result(Args...)>::Get();\n}\n\n";
+    file << "template<typename Result, typename... Args>\n";
+    file << "static void (*FEXGetResidentCallbackUnpacker(Result (*)(Args...)))(uintptr_t, void*) {\n";
+    file << "  return FEXResidentBridgeUnpacker<Result(Args...)>::Get();\n}\n\n";
+    file << "template<typename Target>\n";
+    file << "static Target* FEXAllocateResidentHostTrampolineForGuestFunction(Target* GuestTarget) {\n";
+    file << "  return AllocateHostTrampolineForGuestFunction(FEXGetResidentCallbackUnpacker(GuestTarget), GuestTarget);\n}\n";
+  }
+
   // Files used guest-side
   if (!output_filenames.guest.empty()) {
     std::ofstream file(output_filenames.guest);
@@ -423,7 +569,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
     // Guest->Host transition points for invoking runtime host-function pointers based on their signature
     std::vector<std::vector<unsigned char>> sha256s;
     for (auto type_it = thunked_funcptrs.begin(); type_it != thunked_funcptrs.end(); ++type_it) {
-      auto* type = type_it->second.first;
+      auto* type = type_it->second.type;
       std::string funcptr_signature = clang::QualType {type, 0}.getAsString();
 
       auto cb_sha256 = get_sha256("fexcallback_" + funcptr_signature, false);
@@ -466,11 +612,37 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       }
       file << "  } args;\n";
 
+      // callback_member structures are copied on the guest stack so replacing
+      // callback fields never mutates caller-owned input.
+      for (std::size_t idx = 0; idx < data.param_types.size(); ++idx) {
+        auto callback_struct = get_callback_struct_info(data.param_types[idx]);
+        if (!callback_struct) {
+          continue;
+        }
+        auto pointee = data.param_types[idx]->getPointeeType();
+        auto* struct_decl = pointee->getAsStructureType()->getDecl();
+        fmt::print(file, "  {} fex_callback_copy_{} {{}};\n", get_type_name(context, pointee.getTypePtr()), idx);
+        fmt::print(file, "  if (a_{}) {{\n", idx);
+        fmt::print(file, "    fex_callback_copy_{} = *a_{};\n", idx, idx);
+        for (auto* member : struct_decl->fields()) {
+          if (!callback_struct->UsesCallbackMemberFor(member)) {
+            continue;
+          }
+          auto member_name = member->getNameAsString();
+          fmt::print(file, "    fex_callback_copy_{}.{} = AllocateHostTrampolineForGuestFunction(a_{}->{});\n", idx, member_name, idx,
+                     member_name);
+        }
+        fmt::print(file, "  }}\n");
+      }
+
       for (std::size_t idx = 0; idx < data.param_types.size(); ++idx) {
         auto cb = data.callbacks.find(idx);
+        auto callback_struct = get_callback_struct_info(data.param_types[idx]);
 
         file << "  args.a_" << idx << " = ";
-        if (cb == data.callbacks.end() || cb->second.is_stub) {
+        if (callback_struct) {
+          fmt::print(file, "a_{} ? &fex_callback_copy_{} : nullptr;\n", idx, idx);
+        } else if (cb == data.callbacks.end() || cb->second.is_stub) {
           file << "a_" << idx << ";\n";
         } else {
           // Before passing guest function pointers to the host, wrap them in a host-callable trampoline
@@ -675,6 +847,25 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
           // TODO: Require opt-in for this to be emitted since it's single-element only; otherwise, pointers-to-arrays arguments will cause stack trampling
           fmt::print(file, "  auto a_{} = make_repack_wrapper<{}>(args->a_{});\n", param_idx,
                      get_type_name_with_nonconst_pointee(param_type), param_idx);
+
+          if (auto callback_struct = get_callback_struct_info(param_type)) {
+            auto pointee = param_type->getPointeeType();
+            auto* struct_decl = pointee->getAsStructureType()->getDecl();
+            fmt::print(file, "  if (a_{}.data) {{\n", param_idx);
+            for (auto* member : struct_decl->fields()) {
+              if (!callback_struct->UsesCallbackMemberFor(member)) {
+                continue;
+              }
+              auto member_name = member->getNameAsString();
+              fmt::print(file, "    auto fex_callback_{}_{} = args->a_{}.get_pointer()->data.{};\n", param_idx, member_name, param_idx,
+                         member_name);
+              fmt::print(file, "    FinalizeHostTrampolineForGuestFunction(fex_callback_{}_{});\n", param_idx, member_name);
+              fmt::print(file,
+                         "    a_{}.data->data.{} = reinterpret_cast<decltype(a_{}.data->data.{})>(uintptr_t {{ fex_callback_{}_{}.data }});\n",
+                         param_idx, member_name, param_idx, member_name, param_idx, member_name);
+            }
+            fmt::print(file, "  }}\n");
+          }
         } else {
           throw report_error(thunk.decl->getLocation(), "Cannot generate unpacking function for function %0 with unannotated pointer "
                                                         "parameter %1")
@@ -739,7 +930,9 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
     //       e.g. due to differing sizes or due to data layout differences.
     //       Hence, two separate parameter lists are managed here.
     for (auto& host_funcptr_entry : thunked_funcptrs) {
-      auto& [type, param_annotations] = host_funcptr_entry.second;
+      auto& funcptr_info = host_funcptr_entry.second;
+      auto* type = funcptr_info.type;
+      auto& param_annotations = funcptr_info.param_annotations;
       auto func_type = type->getAs<clang::FunctionProtoType>();
       FuncPtrInfo info = {};
 
