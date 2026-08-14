@@ -159,14 +159,16 @@ jobs:
 
           p=Path('Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp')
           s=p.read_text()
-          old='''    if (reinterpret_cast<uintptr_t>(addr) < 0x1'0000'0000ULL) {
-              Result = Get32BitAllocator()->Munmap(addr, length);'''
-          new='''    if (Thread && Size) {
-              Thread->CTX->RetireThunkTrampolineIRTargetsInRange(reinterpret_cast<uintptr_t>(addr), Size);
-            }
+          old="""    auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(VMATracking.Mutex, Thread);
 
-            if (reinterpret_cast<uintptr_t>(addr) < 0x1'0000'0000ULL) {
-              Result = Get32BitAllocator()->Munmap(addr, length);'''
+    if (reinterpret_cast<uintptr_t>(addr) < 0x1'0000'0000ULL) {"""
+          new="""    auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(VMATracking.Mutex, Thread);
+
+    if (Thread && Size) {
+      Thread->CTX->RetireThunkTrampolineIRTargetsInRange(reinterpret_cast<uintptr_t>(addr), Size);
+    }
+
+    if (reinterpret_cast<uintptr_t>(addr) < 0x1'0000'0000ULL) {"""
           if old not in s: raise SystemExit('pre-munmap marker missing')
           p.write_text(s.replace(old,new,1))
           PY
