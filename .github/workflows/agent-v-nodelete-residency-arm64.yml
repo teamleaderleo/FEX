@@ -1,0 +1,139 @@
+name: Agent V NODELETE guest residency delta
+
+on:
+  push:
+    branches: [ci/agent-v-nodelete-residency-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  residency:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with: {submodules: recursive, fetch-depth: 1}
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev libx11-dev \
+            libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev binutils
+      - name: Build FEX, host thunk, normal and NODELETE guest wrappers
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" > "$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+          cp ThunkLibs/GuestLibs/CMakeLists.txt "$R/CMakeLists.nodelete"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s=p.read_text()
+          flag='  if (TARGET_TYPE STREQUAL "SHARED")\n    target_link_options(${NAME}-guest PRIVATE "LINKER:-z,nodelete")\n  endif()\n'
+          if flag not in s: raise SystemExit('NODELETE policy missing')
+          p.write_text(s.replace(flag,'',1))
+          PY
+          cmake -S ThunkLibs/GuestLibs -B guest-normal -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-normal.log" 2>&1
+          cmake --build guest-normal --target vulkan-guest -- -j"$(nproc)" > "$R/build-normal.log" 2>&1
+          cp "$R/CMakeLists.nodelete" ThunkLibs/GuestLibs/CMakeLists.txt
+          cmake -S ThunkLibs/GuestLibs -B guest-nodelete -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-nodelete.log" 2>&1
+          cmake --build guest-nodelete --target vulkan-guest -- -j"$(nproc)" > "$R/build-nodelete.log" 2>&1
+      - name: Prepare minimal amd64 rootfs and mapping probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 >/dev/null
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d,int x){(void)d;(void)x;return 0;}
+          void *XGetVisualInfo(void*d,long m,void*t,int*c){(void)d;(void)m;(void)t;if(c)*c=0;return 0;}
+          char *XDisplayString(void*d){(void)d;return ":0";}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          cat >/tmp/maps.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          static unsigned long selected_bytes(const char *tag) {
+            FILE *f=fopen("/proc/self/maps","r"); if(!f) exit(2);
+            char line[1024]; unsigned long total=0;
+            fprintf(stderr,"SNAPSHOT %s BEGIN\n",tag);
+            while(fgets(line,sizeof(line),f)){
+              unsigned long a=0,b=0;
+              if(sscanf(line,"%lx-%lx",&a,&b)!=2) continue;
+              if(strstr(line,"libvulkan.so.1") || strstr(line,"libstdc++.so.6") || strstr(line,"libgcc_s.so.1") || strstr(line,"libX11.so.6")){
+                total += b-a;
+                fprintf(stderr,"MAP %s %s",tag,line);
+              }
+            }
+            fclose(f);
+            fprintf(stderr,"SNAPSHOT %s selected_bytes=%lu\n",tag,total);
+            return total;
+          }
+          int main(void){
+            unsigned long before=selected_bytes("before");
+            void*h=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);
+            if(!h){fprintf(stderr,"DLERROR %s\n",dlerror());return 3;}
+            unsigned long loaded=selected_bytes("loaded");
+            if(dlclose(h)) return 4;
+            unsigned long closed=selected_bytes("closed");
+            fprintf(stderr,"DELTA load=%ld retained=%ld\n",(long)(loaded-before),(long)(closed-before));
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/maps.c -ldl -o "$ROOTFS/opt/fex-ci/maps"
+      - name: Run mapping A-B
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          LIB="$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          run_case(){
+            name="$1"; src="$2"
+            rm -f "$LIB"; cp "$src" "$LIB"
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" "$FEX" /opt/fex-ci/maps >"$R/$name.out" 2>"$R/$name.err"
+            grep 'DELTA ' "$R/$name.err" | tee "$R/$name.delta"
+          }
+          run_case normal guest-normal/libvulkan-guest.so
+          run_case nodelete guest-nodelete/libvulkan-guest.so
+          echo '--- normal ---'; cat "$R/normal.delta"
+          echo '--- nodelete ---'; cat "$R/nodelete.delta"
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-v-nodelete-residency-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
