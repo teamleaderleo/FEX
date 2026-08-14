@@ -5,6 +5,7 @@ on:
     branches: [ci/thunk-lifetime-integration-20260814]
     paths:
       - .github/fieldwork/merge_callback_tombstone.py
+      - .github/fieldwork/fix_retirement_lock_order.py
       - .github/fieldwork/patch_multiowner_fixture.py
       - .github/fieldwork/promote_multiowner_claims.py
       - .github/workflows/thunk-lifetime-integration-arm64.yml
@@ -71,16 +72,17 @@ jobs:
           python3 retirement-helper/.github/fieldwork/patch_thread_cache_fixture.py /tmp/thread
           python3 .github/fieldwork/patch_multiowner_fixture.py /tmp/multi
 
-      - name: Apply integrated FEX diagnostic
+      - name: Apply integrated FEX diagnostic with coherent locking
         shell: bash
         run: |
           set -euxo pipefail
           python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
           python3 .github/fieldwork/promote_multiowner_claims.py src
           python3 .github/fieldwork/merge_callback_tombstone.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
           git -C src diff --check
           git -C src diff > "$R/integrated-fex.diff"
-          grep -R -n -E 'DIAG_MT|DIAG_MULTI|DIAG_INTEGRATED' src/FEXCore src/Source/Tools/LinuxEmulation | head -160 > "$R/instrumentation-sites.txt" || true
+          grep -R -n -E 'DIAG_MT|DIAG_MULTI|DIAG_INTEGRATED|DIAG_LOCKED' src/FEXCore src/Source/Tools/LinuxEmulation | head -200 > "$R/instrumentation-sites.txt" || true
 
       - name: Build integrated FEX and all fixture variants
         shell: bash
@@ -94,7 +96,7 @@ jobs:
             > "$R/cmake.log" 2>&1
           cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
           for c in force aba thread multi; do
-            (cd "/tmp/$c/fex-full-thunk-pair" && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) \
+            (cd "/tmp/$c/fex-full-thunk-pair" && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu=g++) \
               > "$R/build-$c.log" 2>&1
           done
 
@@ -133,7 +135,7 @@ jobs:
             set -e
             echo "$rc" > "$R/$case_name.exit"
             echo "===== $case_name rc=$rc ====="
-            grep -E 'DIAG_MT|DIAG_MULTI|DIAG_INTEGRATED|thread-cache|multi-owner|reload invoker|retained callback|Link after re-register|current callback after new' \
+            grep -E 'DIAG_MT|DIAG_MULTI|DIAG_INTEGRATED|DIAG_LOCKED|thread-cache|multi-owner|reload invoker|retained callback|Link after re-register|current callback after new' \
               "$R/$case_name.stdout" "$R/$case_name.stderr" || true
           }
 
@@ -148,6 +150,7 @@ jobs:
           test "$(cat "$R/multi.exit")" = 0
 
           grep -q 'DIAG_INTEGRATED_CALLBACK_TOMBSTONE' "$R/force.stderr"
+          grep -q 'DIAG_LOCKED_RETIRE' "$R/force.stderr"
           grep -Eq 'retained callback reload.*exit=113' "$R/force.stdout"
           grep -Eq 'Link after re-register.*exit=0' "$R/force.stdout"
           grep -Eq 'current callback after new.*exit=0' "$R/force.stdout"
