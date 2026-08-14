@@ -184,7 +184,8 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p "$ROOTFS/lib/i386-linux-gnu" "$ROOTFS/usr/lib/i386-linux-gnu" "$ROOTFS/opt/fex-ci"
+          mkdir -p "$ROOTFS/lib/i386-linux-gnu" "$ROOTFS/usr/lib/i386-linux-gnu" \
+            "$ROOTFS/lib32" "$ROOTFS/usr/lib32" "$ROOTFS/opt/fex-ci"
 
           loader="$(x86_64-linux-gnu-gcc -m32 -print-file-name=ld-linux.so.2)"
           if [ "$loader" = ld-linux.so.2 ] || [ ! -e "$loader" ]; then
@@ -205,12 +206,19 @@ jobs:
 
           cp -L "$loader" "$ROOTFS/lib/ld-linux.so.2"
           cp -L "$loader" "$ROOTFS/lib/i386-linux-gnu/ld-linux.so.2"
+          cp -L "$loader" "$ROOTFS/lib32/ld-linux.so.2"
           cp -L "$libc" "$ROOTFS/lib/i386-linux-gnu/libc.so.6"
+          cp -L "$libc" "$ROOTFS/lib32/libc.so.6"
           cp -L "$libm" "$ROOTFS/lib/i386-linux-gnu/libm.so.6"
+          cp -L "$libm" "$ROOTFS/lib32/libm.so.6"
           cp -L "$libstdcpp" "$ROOTFS/usr/lib/i386-linux-gnu/libstdc++.so.6"
+          cp -L "$libstdcpp" "$ROOTFS/usr/lib32/libstdc++.so.6"
           cp -L "$libgcc" "$ROOTFS/usr/lib/i386-linux-gnu/libgcc_s.so.1"
+          cp -L "$libgcc" "$ROOTFS/usr/lib32/libgcc_s.so.1"
           cp guest32/libwayland-client-guest.so "$ROOTFS/usr/lib/i386-linux-gnu/libwayland-client.so.0"
+          cp guest32/libwayland-client-guest.so "$ROOTFS/usr/lib32/libwayland-client.so.0"
           cp guest32/libfex-wayland-client-bridge.so "$ROOTFS/usr/lib/i386-linux-gnu/libfex-wayland-client-bridge.so"
+          cp guest32/libfex-wayland-client-bridge.so "$ROOTFS/usr/lib32/libfex-wayland-client-bridge.so"
 
           cat >/tmp/wayland_array32.c <<'EOF'
           #define _GNU_SOURCE
@@ -296,7 +304,7 @@ jobs:
           x86_64-linux-gnu-gcc -m32 -O2 -Wall -Wextra -Werror /tmp/wayland_array32.c -ldl \
             -o "$ROOTFS/opt/fex-ci/wayland-array32"
           file "$ROOTFS/opt/fex-ci/wayland-array32" "$ROOTFS/lib/ld-linux.so.2" \
-            "$ROOTFS/lib/i386-linux-gnu/libc.so.6" | tee "$R/rootfs-files.txt"
+            "$ROOTFS/lib32/libc.so.6" | tee "$R/rootfs-files.txt"
           readelf -l "$ROOTFS/opt/fex-ci/wayland-array32" | tee "$R/probe.program-headers"
           readelf -d "$ROOTFS/opt/fex-ci/wayland-array32" | tee "$R/probe.dynamic"
           grep -q 'ELF 32-bit' "$R/rootfs-files.txt"
