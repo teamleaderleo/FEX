@@ -1,0 +1,156 @@
+name: Thunkgen indirect annotation identity v1
+
+on:
+  push:
+    branches: [diagnostic/thunkgen-annotation-identity-v1]
+    paths:
+      - .github/workflows/thunkgen-annotation-identity-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  identity:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 55
+    env:
+      R: ${{ github.workspace }}/receipts-thunkgen-annotation-identity-v1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+
+      - name: Build committed thunkgen
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1 \
+            || { tail -n 260 "$R/cmake.log"; exit 1; }
+          cmake --build build --target FEX GL-host-64 -- -j"$(nproc)" -v \
+            > "$R/build.log" 2>&1 || { tail -n 520 "$R/build.log"; exit 1; }
+          test -x build/Bin/thunkgen
+
+      - name: Generate two same-type indirect entries with different annotations
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/identity.cpp <<'EOF'
+          #include <common/GeneratorInterface.h>
+
+          int SameTypeNormal(int *value);
+          int SameTypePassthrough(int *value);
+
+          namespace identity {
+          template<auto>
+          struct fex_gen_config : fexgen::indirect_guest_calls {};
+
+          template<typename>
+          struct fex_gen_type {};
+
+          template<auto, int, typename = void>
+          struct fex_gen_param {};
+
+          template<>
+          struct fex_gen_config<SameTypeNormal> {};
+
+          template<>
+          struct fex_gen_config<SameTypePassthrough> : fexgen::custom_host_impl {};
+
+          template<>
+          struct fex_gen_param<SameTypePassthrough, 0, int *> : fexgen::ptr_passthrough {};
+          }
+          EOF
+
+          build/Bin/thunkgen /tmp/identity.cpp identity -host "$R/host.inl" / -- \
+            -std=c++20 -I"$GITHUB_WORKSPACE/ThunkLibs/include" \
+            > "$R/thunkgen-host.out" 2> "$R/thunkgen-host.err"
+          build/Bin/thunkgen /tmp/identity.cpp identity -guest-resident "$R/guest.inl" / -- \
+            -std=c++20 -I"$GITHUB_WORKSPACE/ThunkLibs/include" \
+            > "$R/thunkgen-guest.out" 2> "$R/thunkgen-guest.err"
+
+          grep 'GuestWrapperForHostFunction' "$R/host.inl" | tee "$R/host-indirect-exports.txt"
+          grep -E '^[[:space:]]*MAKE_CALLBACK_THUNK' "$R/guest.inl" | tee "$R/guest-runtime-signatures.txt"
+          grep -E '^[[:space:]]*MAKE_CALLBACK_THUNK' "$R/guest_bridge.inl" | tee "$R/resident-runtime-signatures.txt"
+
+      - name: Prove signature-only identity aliases distinct annotation handlers
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - "$R/host.inl" "$R/result.txt" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          text = Path(sys.argv[1]).read_text()
+          rows = {}
+          for line in text.splitlines():
+              if 'GuestWrapperForHostFunction' not in line:
+                  continue
+              if '// SameTypeNormal' in line:
+                  rows['normal'] = line
+              if '// SameTypePassthrough' in line:
+                  rows['passthrough'] = line
+
+          if set(rows) != {'normal', 'passthrough'}:
+              raise SystemExit(f'missing generated indirect rows: {rows}')
+
+          hash_re = re.compile(r'\(uint8_t\*\)"((?:\\x[0-9a-fA-F]{2})+)"')
+          hashes = {}
+          for key, line in rows.items():
+              m = hash_re.search(line)
+              if not m:
+                  raise SystemExit(f'no hash in {key}: {line}')
+              hashes[key] = m.group(1)
+
+          if hashes['normal'] != hashes['passthrough']:
+              raise SystemExit(f'identity already annotation-sensitive: {hashes}')
+          if rows['normal'] == rows['passthrough']:
+              raise SystemExit('expected distinct host handlers')
+          if '.is_passthrough=true' in rows['normal']:
+              raise SystemExit('normal handler unexpectedly passthrough')
+          if '.is_passthrough=true' not in rows['passthrough']:
+              raise SystemExit('passthrough annotation missing from second handler')
+
+          result = (
+              'THUNKGEN_INDIRECT_ANNOTATION_IDENTITY_COLLISION_PROVEN\n'
+              f'hash={hashes["normal"]}\n'
+              f'normal={rows["normal"]}\n'
+              f'passthrough={rows["passthrough"]}\n'
+          )
+          Path(sys.argv[2]).write_text(result)
+          print(result, end='')
+          PY
+
+          test "$(wc -l < "$R/guest-runtime-signatures.txt" | tr -d ' ')" = 1
+          test "$(wc -l < "$R/resident-runtime-signatures.txt" | tr -d ' ')" = 1
+          diff -u "$R/guest-runtime-signatures.txt" "$R/resident-runtime-signatures.txt" > "$R/signature-set.diff"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunkgen-annotation-identity-v1-${{ github.run_id }}
+          path: receipts-thunkgen-annotation-identity-v1
+          retention-days: 30
