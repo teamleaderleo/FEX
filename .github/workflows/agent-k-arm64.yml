@@ -1,0 +1,116 @@
+name: Agent K ARM64 NODELETE guest thunk lifetime
+
+on:
+  push:
+    branches: [ci/agent-k-arm64-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nodelete:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and fixture variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" /tmp/normal /tmp/nodelete
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          cd /tmp/repro/fex-full-thunk-pair
+          make clean
+          make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++
+          cp -a guest /tmp/normal/
+          cp -a host /tmp/normal/
+          readelf -d guest/liblifetime-guest.so > "$R/normal.dynamic.txt"
+          if grep -q NODELETE "$R/normal.dynamic.txt"; then exit 41; fi
+          make clean
+          make HOST_CXX=g++ GUEST_CXX='x86_64-linux-gnu-g++ -Wl,-z,nodelete'
+          cp -a guest /tmp/nodelete/
+          cp -a host /tmp/nodelete/
+          readelf -d guest/liblifetime-guest.so > "$R/nodelete.dynamic.txt"
+          grep NODELETE "$R/nodelete.dynamic.txt"
+
+      - name: Build FEX
+        shell: bash
+        run: |
+          set -euxo pipefail
+          printf 'fex=%s\nfieldwork=%s\ncarrier=%s\n' \
+            "$(git rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" "$GITHUB_SHA" > "$R/identity.txt"
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
+          cmake --build build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build.log" 2>&1 || { tail -n 200 "$R/build.log"; exit 1; }
+
+      - name: Prepare rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci/normal" "$ROOTFS/opt/fex-ci/nodelete"
+          cp -a /tmp/normal/guest/. "$ROOTFS/opt/fex-ci/normal/"
+          cp -a /tmp/nodelete/guest/. "$ROOTFS/opt/fex-ci/nodelete/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute normal and NODELETE controls
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/normal" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS=/tmp/normal/host timeout 30s \
+            "$FEX" /opt/fex-ci/normal/fex_full_lifetime --call-stale) > "$R/normal.stdout" 2> "$R/normal.stderr"
+          normal_rc=$?
+          (cd "$ROOTFS/opt/fex-ci/nodelete" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS=/tmp/nodelete/host timeout 30s \
+            "$FEX" /opt/fex-ci/nodelete/fex_full_lifetime --call-stale) > "$R/nodelete.stdout" 2> "$R/nodelete.stderr"
+          nodelete_rc=$?
+          set -e
+          printf 'normal=%s\nnodelete=%s\n' "$normal_rc" "$nodelete_rc" | tee "$R/exits.txt"
+          grep -E 'generation|after dlclose|mapped|unmapped|retained|callback|signal=|exit=' "$R/normal.stdout" > "$R/normal.key.txt" || true
+          grep -E 'generation|after dlclose|mapped|unmapped|retained|callback|signal=|exit=' "$R/nodelete.stdout" > "$R/nodelete.key.txt" || true
+          echo '--- normal ---'; cat "$R/normal.key.txt"
+          echo '--- nodelete ---'; cat "$R/nodelete.key.txt"
+          exit 0
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-k-nodelete-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
