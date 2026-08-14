@@ -37,7 +37,9 @@ jobs:
           ref: ${{ env.FEX_SOURCE_REF }}
           path: src
           submodules: recursive
-          fetch-depth: 1
+          # Keep the two routing commits plus their FEX-2608 base so the
+          # provenance diff below is a real local Git comparison.
+          fetch-depth: 3
 
       - name: Checkout lifetime helper
         uses: actions/checkout@v4
