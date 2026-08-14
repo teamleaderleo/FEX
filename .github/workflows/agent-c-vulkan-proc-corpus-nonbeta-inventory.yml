@@ -1,0 +1,103 @@
+name: Agent C non-beta Vulkan proc corpus inventory
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-vulkan-proc-corpus-nonbeta-inventory.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Generate non-beta regular Vulkan corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p receipts
+          python3 - <<'PY'
+          import collections, json, pathlib, xml.etree.ElementTree as ET
+          root=ET.parse('src/External/Vulkan-Headers/registry/vk.xml').getroot()
+          aliases={}
+          for c in root.findall('./commands/command'):
+            if c.get('alias'):
+              aliases[c.get('name')]=c.get('alias')
+          def canon(n):
+            seen=set()
+            while n in aliases and n not in seen:
+              seen.add(n); n=aliases[n]
+            return n
+
+          all_regular=set()
+          nonbeta=set()
+          beta=set()
+          providers=collections.defaultdict(list)
+
+          for feature in root.findall('./feature'):
+            if 'vulkan' not in set((feature.get('api') or '').split(',')):
+              continue
+            label='CORE_'+(feature.get('number') or feature.get('name') or '?')
+            for req in feature.findall('./require'):
+              req_apis=set((req.get('api') or 'vulkan').split(','))
+              if 'vulkan' not in req_apis: continue
+              for cmd in req.findall('command'):
+                n=cmd.get('name')
+                if n:
+                  all_regular.add(n); nonbeta.add(n); providers[n].append({'provider':label,'beta':False})
+
+          for ext in root.findall('./extensions/extension'):
+            if 'vulkan' not in set((ext.get('supported') or '').split(',')):
+              continue
+            is_beta=(ext.get('provisional') == 'true')
+            label=ext.get('name') or 'UNKNOWN_EXTENSION'
+            for req in ext.findall('./require'):
+              req_api=req.get('api')
+              if req_api and 'vulkan' not in set(req_api.split(',')): continue
+              for cmd in req.findall('command'):
+                n=cmd.get('name')
+                if not n: continue
+                all_regular.add(n)
+                (beta if is_beta else nonbeta).add(n)
+                providers[n].append({'provider':label,'beta':is_beta})
+
+          # A command remains in the non-beta corpus when any core/non-provisional provider exposes it.
+          beta_only=sorted(all_regular-nonbeta)
+          names=sorted(nonbeta)
+          summary={
+            'all_regular_spellings':len(all_regular),
+            'nonbeta_spellings':len(names),
+            'beta_only_spellings':len(beta_only),
+            'nonbeta_alias_spellings':sum(n in aliases for n in names),
+            'nonbeta_canonical_commands':len({canon(n) for n in names}),
+          }
+          pathlib.Path('receipts/nonbeta-commands.txt').write_text(''.join(n+'\n' for n in names))
+          pathlib.Path('receipts/beta-only-commands.txt').write_text(''.join(n+'\n' for n in beta_only))
+          pathlib.Path('receipts/nonbeta-inventory.json').write_text(json.dumps({
+            'summary':summary,
+            'beta_only':[{'name':n,'providers':providers[n]} for n in beta_only],
+          },indent=2)+'\n')
+          print(json.dumps(summary,indent=2))
+          print('BETA_ONLY')
+          for n in beta_only:
+            print(n, ','.join(p['provider'] for p in providers[n]), sep='\t')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-vulkan-proc-nonbeta-inventory-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
