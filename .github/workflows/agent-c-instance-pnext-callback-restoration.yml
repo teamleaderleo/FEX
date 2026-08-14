@@ -1,0 +1,193 @@
+name: Agent C Vulkan non-mutating instance pNext callback filter
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-instance-pnext-callback-restoration.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+  DEBIAN_FRONTEND: noninteractive
+  ROOTFS: ${{ github.workspace }}/rootfs-amd64
+  HOST: ${{ github.workspace }}/host
+  R: ${{ github.workspace }}/receipts
+  FEX_PORTABLE: 1
+
+jobs:
+  restoration:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          echo "fex_sha=$(git -C src rev-parse HEAD)" | tee "$R/identity.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools \
+            vulkan-validationlayers debootstrap
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" > "$R/lvp-icd.txt"
+          VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
+
+      - name: Apply restoration candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/ThunkLibs/libvulkan/Host.cpp')
+          s=p.read_text()
+          fn=s.index('FEXFN_IMPL(vkCreateInstance)')
+          start=s.index('  const VkInstanceCreateInfo* vk_struct_base = a_0;',fn)
+          end=s.index('\n\n  VkInstance out;',start)
+          new='''  struct PNextRestore {
+            VkBaseInStructure* Structure;
+            const VkBaseInStructure* PNext;
+          };
+
+          std::vector<PNextRestore> pnext_restore;
+          const VkInstanceCreateInfo* vk_struct_base = a_0;
+          for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(vk_struct_base); vk_struct->pNext;) {
+            const auto next_type = vk_struct->pNext->sType;
+            // Ignore guest callbacks installed for temporary debug callbacks during instance creation.
+            if (next_type == VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT ||
+                next_type == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT) {
+              // Temporarily splice the callback-bearing node out. Re-check the same predecessor
+              // so consecutive callback nodes are all removed.
+              auto* mutable_struct = const_cast<VkBaseInStructure*>(vk_struct);
+              pnext_restore.push_back({mutable_struct, mutable_struct->pNext});
+              mutable_struct->pNext = mutable_struct->pNext->pNext;
+              continue;
+            }
+            vk_struct = vk_struct->pNext;
+          }'''
+          s=s[:start]+new+s[end:]
+          call='''  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
+          *a_2.get_pointer() = to_guest(to_host_layout(out));'''
+          replacement='''  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
+          for (auto it = pnext_restore.rbegin(); it != pnext_restore.rend(); ++it) {
+            it->Structure->pNext = it->PNext;
+          }
+          *a_2.get_pointer() = to_guest(to_host_layout(out));'''
+          if call not in s:
+            raise SystemExit('vkCreateInstance native-call region not found')
+          p.write_text(s.replace(call,replacement,1))
+          PY
+          git -C src diff --check
+          git -C src diff -- ThunkLibs/libvulkan/Host.cpp | tee "$R/candidate.diff"
+          grep -q 'DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT' "$R/candidate.diff"
+          grep -q 'pnext_restore.rbegin' "$R/candidate.diff"
+
+      - name: Build mixed-chain integrity probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat >/tmp/pnext-integrity.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #define VK_NO_PROTOTYPES
+          #include <vulkan/vulkan.h>
+
+          static volatile uint32_t utils_count, report_count;
+          VKAPI_ATTR VkBool32 VKAPI_CALL utils_cb(VkDebugUtilsMessageSeverityFlagBitsEXT a,VkDebugUtilsMessageTypeFlagsEXT b,const VkDebugUtilsMessengerCallbackDataEXT*c,void*d){
+            (void)a;(void)b;(void)c;(void)d;++utils_count;fprintf(stderr,"UNEXPECTED_UTILS_CALLBACK\n");fflush(stderr);return VK_FALSE;
+          }
+          VKAPI_ATTR VkBool32 VKAPI_CALL report_cb(VkDebugReportFlagsEXT a,VkDebugReportObjectTypeEXT b,uint64_t c,size_t d,int32_t e,const char*f,const char*g,void*h){
+            (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;++report_count;fprintf(stderr,"UNEXPECTED_REPORT_CALLBACK\n");fflush(stderr);return VK_FALSE;
+          }
+          static int has_layer(PFN_vkEnumerateInstanceLayerProperties fn,const char*w){uint32_t n=0;if(fn(&n,NULL)!=VK_SUCCESS)return 0;VkLayerProperties*p=calloc(n?n:1,sizeof(*p));if(!p)return 0;if(fn(&n,p)!=VK_SUCCESS){free(p);return 0;}int ok=0;for(uint32_t i=0;i<n;++i)if(!strcmp(p[i].layerName,w))ok=1;free(p);return ok;}
+          static int has_ext(PFN_vkEnumerateInstanceExtensionProperties fn,const char*w){uint32_t n=0;if(fn(NULL,&n,NULL)!=VK_SUCCESS)return 0;VkExtensionProperties*p=calloc(n?n:1,sizeof(*p));if(!p)return 0;if(fn(NULL,&n,p)!=VK_SUCCESS){free(p);return 0;}int ok=0;for(uint32_t i=0;i<n;++i)if(!strcmp(p[i].extensionName,w))ok=1;free(p);return ok;}
+          int main(void){
+            void*vk=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);if(!vk)return 10;
+            PFN_vkCreateInstance create=(PFN_vkCreateInstance)dlsym(vk,"vkCreateInstance");
+            PFN_vkDestroyInstance destroy=(PFN_vkDestroyInstance)dlsym(vk,"vkDestroyInstance");
+            PFN_vkEnumerateInstanceLayerProperties el=(PFN_vkEnumerateInstanceLayerProperties)dlsym(vk,"vkEnumerateInstanceLayerProperties");
+            PFN_vkEnumerateInstanceExtensionProperties ee=(PFN_vkEnumerateInstanceExtensionProperties)dlsym(vk,"vkEnumerateInstanceExtensionProperties");
+            if(!create||!destroy||!el||!ee)return 11;
+            const char*layer="VK_LAYER_KHRONOS_validation";
+            if(!has_layer(el,layer)||!has_ext(ee,VK_EXT_DEBUG_UTILS_EXTENSION_NAME)||!has_ext(ee,VK_EXT_DEBUG_REPORT_EXTENSION_NAME))return 12;
+            VkDebugUtilsMessengerCreateInfoEXT utils={.sType=VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,.messageSeverity=VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,.messageType=VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,.pfnUserCallback=utils_cb};
+            VkDebugReportCallbackCreateInfoEXT report={.sType=VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT,.pNext=&utils,.flags=VK_DEBUG_REPORT_INFORMATION_BIT_EXT|VK_DEBUG_REPORT_WARNING_BIT_EXT|VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT|VK_DEBUG_REPORT_ERROR_BIT_EXT|VK_DEBUG_REPORT_DEBUG_BIT_EXT,.pfnCallback=report_cb};
+            VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName="fex-pnext-restoration",.apiVersion=VK_API_VERSION_1_0};
+            const char*layers[]={layer};const char*exts[]={VK_EXT_DEBUG_UTILS_EXTENSION_NAME,VK_EXT_DEBUG_REPORT_EXTENSION_NAME};
+            VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pNext=&report,.flags=(VkInstanceCreateFlags)0x80000000u,.pApplicationInfo=&app,.enabledLayerCount=1,.ppEnabledLayerNames=layers,.enabledExtensionCount=2,.ppEnabledExtensionNames=exts};
+            const void*orig_ici=ici.pNext;const void*orig_report=report.pNext;const void*orig_utils=utils.pNext;
+            fprintf(stderr,"RESTORE_BEFORE_CREATE ici=%p report=%p utils=%p\n",ici.pNext,report.pNext,utils.pNext);fflush(stderr);
+            VkInstance instance=VK_NULL_HANDLE;VkResult r=create(&ici,NULL,&instance);
+            int is=(ici.pNext==orig_ici),rs=(report.pNext==orig_report),us=(utils.pNext==orig_utils);
+            fprintf(stderr,"RESTORE_AFTER_CREATE result=%d instance=%p ici_same=%d report_same=%d utils_same=%d callbacks=%u/%u\n",r,(void*)instance,is,rs,us,utils_count,report_count);fflush(stderr);
+            if(r!=VK_SUCCESS||instance==VK_NULL_HANDLE)return 20;if(utils_count||report_count)return 21;if(!is||!rs||!us)return 40;
+            destroy(instance,NULL);
+            fprintf(stderr,"RESTORE_AFTER_DESTROY ici_same=%d report_same=%d utils_same=%d callbacks=%u/%u\n",ici.pNext==orig_ici,report.pNext==orig_report,utils.pNext==orig_utils,utils_count,report_count);fflush(stderr);
+            if(utils_count||report_count)return 22;if(ici.pNext!=orig_ici||report.pNext!=orig_report||utils.pNext!=orig_utils)return 41;
+            if(dlclose(vk)!=0)return 23;fprintf(stderr,"RESTORE_RETURN unchanged=1 callbacks=0\n");return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -g -Wall -Wextra -Werror -Isrc/External/Vulkan-Headers/include /tmp/pnext-integrity.c -ldl -o /tmp/pnext-integrity
+
+      - name: Build focused candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON \
+            -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ >"$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v >"$R/build-host.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
+
+      - name: Build amd64 rootfs and run
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo debootstrap --arch=amd64 --foreign --variant=minbase --components=main,universe --include=libvulkan1,libx11-6 noble "$ROOTFS" http://archive.ubuntu.com/ubuntu >"$R/debootstrap.log" 2>&1
+          sudo find "$ROOTFS" -type f -name '*.deb' -print | sort > "$R/rootfs-debs.txt"
+          sed -n 's/^I: Extracting \([^ ]*\)\.\.\.$/\1/p' "$R/debootstrap.log" | sort -u > "$R/rootfs-already-extracted.txt"
+          while IFS= read -r deb; do pkg="$(dpkg-deb -f "$deb" Package)"; grep -Fxq "$pkg" "$R/rootfs-already-extracted.txt" && continue; sudo dpkg-deb -x "$deb" "$ROOTFS"; done < "$R/rootfs-debs.txt"
+          sudo cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
+          sudo mkdir -p "$ROOTFS/usr/local/bin"; sudo install -m755 /tmp/pnext-integrity "$ROOTFS/usr/local/bin/pnext-integrity"
+          X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"; for sym in XSync XGetVisualInfo XDisplayString; do x86_64-linux-gnu-readelf -Ws "$X11" | grep -E " ${sym}(@|$)" | head -1; done
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"; LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          timeout 90s env VK_DRIVER_FILES="$LVP_ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" "$FEX" /usr/local/bin/pnext-integrity >"$R/fex.out" 2>"$R/fex.err"
+          echo 0 > "$R/fex.exit"; cat "$R/fex.err"
+          grep -q '^RESTORE_AFTER_CREATE .*ici_same=1 report_same=1 utils_same=1 callbacks=0/0' "$R/fex.err"
+          grep -q '^RESTORE_AFTER_DESTROY ici_same=1 report_same=1 utils_same=1 callbacks=0/0' "$R/fex.err"
+          grep -q '^RESTORE_RETURN unchanged=1 callbacks=0' "$R/fex.err"
+          ! grep -q '^UNEXPECTED_' "$R/fex.err"
+          printf 'fex_exit=0\nguest_chain_unchanged=1\nguest_callbacks=0\nrestoration_candidate=pass\n' | tee "$R/summary.txt"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-c-instance-pnext-callback-restoration-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
