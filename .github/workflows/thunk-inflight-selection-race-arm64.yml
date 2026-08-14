@@ -1,8 +1,8 @@
-name: Thunk in-flight selection race ARM64
+name: Thunk in-flight selection race current-main ARM64
 
 on:
   push:
-    branches: [ci/thunk-inflight-selection-race-20260814]
+    branches: [ci/thunk-inflight-selection-race-f3ab-20260814]
     paths:
       - .github/fieldwork/apply_multithread_owner_retire_diag.py
       - .github/fieldwork/patch_thread_cache_fixture.py
@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 50
     env:
-      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FEX_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
       FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
       ROOTFS: ${{ github.workspace }}/rootfs-amd64
       R: ${{ github.workspace }}/receipts
@@ -141,6 +141,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: thunk-inflight-selection-race-${{ github.run_id }}
+          name: thunk-inflight-selection-race-current-main-${{ github.run_id }}
           path: receipts
           retention-days: 30
