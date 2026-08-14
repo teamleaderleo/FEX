@@ -1,0 +1,145 @@
+name: Common GL resident bridge runtime
+
+on:
+  push:
+    branches: [ci/gl-common-resident-runtime-20260814]
+    paths: [.github/workflows/gl-common-resident-runtime.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gl:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 80
+    env:
+      BASE: c348a19d91219d4df6cdaa86839607565e001fa2
+      ROOTFS: ${{ github.workspace }}/rootfs-gl-common
+      R: ${{ github.workspace }}/gl-common-receipts
+      H: ${{ github.workspace }}/host-gl-common
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          git merge-base --is-ancestor "$BASE" HEAD
+          test -z "$(git diff --name-only "$BASE" -- ThunkLibs FEXCore Source)"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils libcap-dev \
+            libgl-dev libgl1-mesa-dri libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev xvfb x11-utils
+
+      - name: Build common-helper GL pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer GL-host-64 -- -j"$(nproc)" -v >"$R/build-host.log" 2>&1 || { tail -n 360 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libGL-host.so "$H/libGL-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target GL-guest GL_bridge-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1 || { tail -n 420 "$R/build-guest.log"; exit 1; }
+          readelf -d guest/libGL-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest/libfex-GL-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-GL-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'RUNPATH.*\$ORIGIN' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          nm -D guest/libfex-GL-bridge.so | grep -E 'FEXGLBridgeMalloc|fex_bridge_invoker_' | head -n 20 | tee "$R/bridge.exports"
+          grep -q 'FEXGLBridgeMalloc' "$R/bridge.exports"
+          test "$(grep -c 'fex_bridge_invoker_' "$R/bridge.exports")" -ge 1
+
+      - name: Prepare amd64 runtime and probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 >"$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"; trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"; docker export "$cid" | tar -C "$ROOTFS" -xf -; docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libGL-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libGL.so.1"
+          cp guest/libfex-GL-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-GL-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          #include <stdio.h>
+          typedef int (*XErrorHandler)(void*,void*);
+          int XSync(void*d,int x){fprintf(stderr,"GUEST_XSYNC display=%p discard=%d\n",d,x);return 0;}
+          void*XGetVisualInfo(void*d,long m,void*t,int*n){fprintf(stderr,"GUEST_XGETVISUALINFO display=%p mask=%ld\n",d,m);(void)t;if(n)*n=0;return 0;}
+          char*XDisplayString(void*d){fprintf(stderr,"GUEST_XDISPLAYSTRING display=%p\n",d);static char s[]=":99";return s;}
+          XErrorHandler XSetErrorHandler(XErrorHandler h){return h;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          cat >/tmp/probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/mman.h>
+          typedef void (*VoidFunc)(void); typedef VoidFunc(*GLXGET)(const unsigned char*); typedef unsigned(*GLGETERROR)(void); typedef void*(*GLXGETFBCONFIGS)(void*,int,int*);
+          struct range{uintptr_t a,b;} old[16]; static int oldn;
+          static int map_has(void*p,const char*n){FILE*f=fopen("/proc/self/maps","r");char l[1024];uintptr_t x=(uintptr_t)p;if(!f)return-1;while(fgets(l,sizeof l,f)){unsigned long a,b;if(sscanf(l,"%lx-%lx",&a,&b)==2&&x>=a&&x<b){int ok=strstr(l,n)!=0;fprintf(stderr,"MAP %p %s",p,l);fclose(f);return ok;}}fclose(f);fprintf(stderr,"UNMAPPED %p\n",p);return 0;}
+          static void capture(void){FILE*f=fopen("/proc/self/maps","r");char l[1024];oldn=0;while(f&&fgets(l,sizeof l,f)&&oldn<16){unsigned long a,b;if(strstr(l,"/usr/lib/x86_64-linux-gnu/libGL.so.1")&&sscanf(l,"%lx-%lx",&a,&b)==2){old[oldn++]=(struct range){a,b};fprintf(stderr,"OLD_GL_RANGE %lx-%lx\n",a,b);}}if(f)fclose(f);}
+          static int reserve(void){for(int i=0;i<oldn;i++){size_t z=old[i].b-old[i].a;void*p=mmap((void*)old[i].a,z,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);if(p==MAP_FAILED){fprintf(stderr,"RESERVE_FAIL errno=%d\n",errno);return-1;}fprintf(stderr,"RESERVED %lx-%lx\n",old[i].a,old[i].b);}return 0;}
+          static int cfg(GLXGETFBCONFIGS f,uintptr_t t,const char*tag){int n=0;void*p=f((void*)t,0,&n);fprintf(stderr,"%s configs=%p count=%d\n",tag,p,n);return p&&n>0?0:-1;}
+          int main(void){
+            void*x11=dlopen("libX11.so.6",RTLD_NOW|RTLD_LOCAL);if(!x11)return 2;
+            void*h=dlopen("libGL.so.1",RTLD_NOW|RTLD_LOCAL);if(!h){fprintf(stderr,"GL_FAIL %s\n",dlerror());return 3;}
+            GLXGET g0=(GLXGET)dlsym(h,"glXGetProcAddress");if(!g0)return 4;
+            GLGETERROR e0=(GLGETERROR)g0((const unsigned char*)"glGetError");GLXGETFBCONFIGS c0=(GLXGETFBCONFIGS)g0((const unsigned char*)"glXGetFBConfigs");if(!e0||!c0)return 5;
+            fprintf(stderr,"GEN1 get=%p err=%p cfg=%p\n",(void*)g0,(void*)e0,(void*)c0);if(e0()!=0||cfg(c0,0x12345000,"BEFORE_CLOSE_CONFIGS"))return 6;
+            capture();uintptr_t oldget=(uintptr_t)g0;if(dlclose(h))return 7;if(map_has((void*)oldget,"/usr/lib/x86_64-linux-gnu/libGL.so.1")!=0)return 8;
+            fprintf(stderr,"AFTER_CLOSE_BEGIN\n");if(e0()!=0||cfg(c0,0x12346000,"AFTER_CLOSE_CONFIGS"))return 9;if(reserve())return 10;
+            void*h2=dlopen("libGL.so.1",RTLD_NOW|RTLD_LOCAL);if(!h2){fprintf(stderr,"RELOAD_FAIL %s\n",dlerror());return 11;}GLXGET g1=(GLXGET)dlsym(h2,"glXGetProcAddress");GLGETERROR e1=(GLGETERROR)g1((const unsigned char*)"glGetError");GLXGETFBCONFIGS c1=(GLXGETFBCONFIGS)g1((const unsigned char*)"glXGetFBConfigs");
+            fprintf(stderr,"GEN2 get_old=%p get_new=%p moved=%d err_old=%p err_new=%p same_err=%d cfg_old=%p cfg_new=%p same_cfg=%d\n",(void*)g0,(void*)g1,g0!=g1,(void*)e0,(void*)e1,e0==e1,(void*)c0,(void*)c1,c0==c1);
+            if(g0==g1||e0!=e1||c0!=c1)return 12;if(e1()!=0||cfg(c1,0x12347000,"RELOAD_CONFIGS"))return 13;if(dlclose(h2))return 14;if(e0()!=0||cfg(c0,0x12348000,"FINAL_RETAINED_CONFIGS"))return 15;
+            fprintf(stderr,"GL_COMMON_RESIDENT_OK\n");return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/probe.c -ldl -o "$ROOTFS/opt/fex-ci/probe"
+
+      - name: Execute unload and moved reload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          Xvfb :99 -screen 0 640x480x24 +extension GLX >"$R/xvfb.log" 2>&1 & pid=$!; trap 'kill "$pid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 60); do DISPLAY=:99 xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+          DISPLAY=:99 xdpyinfo >/dev/null
+          set +e
+          DISPLAY=:99 FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 45s build/Bin/FEX /opt/fex-ci/probe >"$R/probe.out" 2>"$R/probe.err"; rc=$?
+          set -e
+          echo "$rc" >"$R/probe.exit"; cat "$R/probe.err"; test "$rc" -eq 0
+          grep -q 'AFTER_CLOSE_BEGIN' "$R/probe.err"
+          grep -q 'AFTER_CLOSE_CONFIGS' "$R/probe.err"
+          grep -q 'GEN2 .* moved=1 .*same_err=1 .*same_cfg=1' "$R/probe.err"
+          grep -q 'FINAL_RETAINED_CONFIGS' "$R/probe.err"
+          grep -q 'GL_COMMON_RESIDENT_OK' "$R/probe.err"
+          echo GL_COMMON_HELPER_RUNTIME_OK | tee "$R/result.txt"
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-common-resident-${{ github.run_id }}
+          path: gl-common-receipts
+          retention-days: 30
