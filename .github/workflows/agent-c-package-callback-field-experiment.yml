@@ -11,6 +11,7 @@ permissions:
 
 env:
   BASE_SHA: 8eba4127292690a861da72d8b6089f9fd3a8e253
+  FIELDWORK_SHA: 3e147eac0a82be073d662a2868f7d69f9883b0e4
   TARGET_BRANCH: experiment/vulkan-instance-callback-fields-current-main
 
 jobs:
@@ -24,72 +25,22 @@ jobs:
           path: src
           fetch-depth: 0
 
-      - name: Apply callback-field substitution candidate
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Apply exact experiment
         shell: bash
         run: |
           set -euxo pipefail
           test "$(git -C src rev-parse HEAD)" = "$BASE_SHA"
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('src/ThunkLibs/libvulkan/Host.cpp')
-          s=p.read_text()
-          fn=s.index('static VkResult FEXFN_IMPL(vkCreateInstance)')
-          start=s.index('static VkResult FEXFN_IMPL(vkCreateInstance)', fn)
-          end=s.index('\n\nstatic VkResult FEXFN_IMPL(vkCreateDevice)', start)
-          old=s[start:end]
-          new='''extern "C" VkBool32 DummyVkDebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
-                                                       const VkDebugUtilsMessengerCallbackDataEXT*, void*);
-
-static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, const VkAllocationCallbacks* a_1, guest_layout<VkInstance*> a_2) {
-  struct DebugReportRestore {
-    VkDebugReportCallbackCreateInfoEXT* CreateInfo;
-    PFN_vkDebugReportCallbackEXT Callback;
-  };
-  struct DebugUtilsRestore {
-    VkDebugUtilsMessengerCreateInfoEXT* CreateInfo;
-    PFN_vkDebugUtilsMessengerCallbackEXT Callback;
-  };
-
-  std::vector<DebugReportRestore> report_restore;
-  std::vector<DebugUtilsRestore> utils_restore;
-
-  for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(a_0->pNext); vk_struct;
-       vk_struct = vk_struct->pNext) {
-    if (vk_struct->sType == VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT) {
-      auto* create_info = const_cast<VkDebugReportCallbackCreateInfoEXT*>(
-        reinterpret_cast<const VkDebugReportCallbackCreateInfoEXT*>(vk_struct));
-      report_restore.push_back({create_info, create_info->pfnCallback});
-      create_info->pfnCallback = DummyVkDebugReportCallback;
-    } else if (vk_struct->sType == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT) {
-      auto* create_info = const_cast<VkDebugUtilsMessengerCreateInfoEXT*>(
-        reinterpret_cast<const VkDebugUtilsMessengerCreateInfoEXT*>(vk_struct));
-      utils_restore.push_back({create_info, create_info->pfnUserCallback});
-      create_info->pfnUserCallback = DummyVkDebugUtilsMessengerCallback;
-    }
-  }
-
-  VkInstance out;
-  auto ret = LDR_PTR(vkCreateInstance)(a_0, nullptr, &out);
-
-  for (auto it = utils_restore.rbegin(); it != utils_restore.rend(); ++it) {
-    it->CreateInfo->pfnUserCallback = it->Callback;
-  }
-  for (auto it = report_restore.rbegin(); it != report_restore.rend(); ++it) {
-    it->CreateInfo->pfnCallback = it->Callback;
-  }
-
-  *a_2.get_pointer() = to_guest(to_host_layout(out));
-  return ret;
-}'''
-          p.write_text(s[:start]+new+s[end:])
-          PY
+          test "$(git -C fieldwork rev-parse HEAD)" = "$FIELDWORK_SHA"
+          python3 fieldwork/investigations/fex-vulkan-thunk-lifecycle/apply_instance_callback_field_restoration.py src
           git -C src diff --check
-          git -C src diff -- ThunkLibs/libvulkan/Host.cpp | tee /tmp/candidate.diff
-          grep -q 'pfnCallback = DummyVkDebugReportCallback' /tmp/candidate.diff
-          grep -q 'pfnUserCallback = DummyVkDebugUtilsMessengerCallback' /tmp/candidate.diff
-          grep -q 'it->CreateInfo->pfnCallback = it->Callback' /tmp/candidate.diff
-          grep -q 'it->CreateInfo->pfnUserCallback = it->Callback' /tmp/candidate.diff
-          ! grep -q 'mutable_struct->pNext' /tmp/candidate.diff
+          git -C src diff -- ThunkLibs/libvulkan/Host.cpp
           test "$(git -C src status --short | wc -l)" -eq 1
           git -C src status --short | grep -q '^ M ThunkLibs/libvulkan/Host.cpp$'
 
