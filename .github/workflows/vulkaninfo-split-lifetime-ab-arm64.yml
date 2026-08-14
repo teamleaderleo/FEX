@@ -45,7 +45,7 @@ jobs:
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config ccache \
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
-            libvulkan-dev mesa-vulkan-drivers vulkan-tools xvfb x11-utils
+            libvulkan-dev mesa-vulkan-drivers vulkan-tools xvfb x11-utils ubuntu-keyring file
           LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
           test -n "$LVP"
           echo "$LVP" > "$R/lvp.txt"
@@ -88,70 +88,54 @@ jobs:
           cp guest-unsplit/libvulkan-guest.so "$R/libvulkan-unsplit.so"
           readelf -d "$R/libvulkan-unsplit.so" > "$R/unsplit.dynamic.txt"
 
-      - name: Export amd64 Ubuntu rootfs
+      - name: Assemble amd64 vulkaninfo rootfs without executing foreign code
         shell: bash
         run: |
           set -euxo pipefail
-          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
-          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
-          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
-          mkdir -p "$ROOTFS"
-          docker export "$cid" | tar -C "$ROOTFS" -xf -
-          docker rm "$cid"
-          trap - EXIT
-          # Docker export leaves /etc/resolv.conf pointing at container-managed
-          # resolver state that does not exist when this directory is executed
-          # directly under FEX. Give the amd64 guest the runner's working DNS.
-          sudo rm -f "$ROOTFS/etc/resolv.conf"
-          sudo cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
-          sudo chmod 0644 "$ROOTFS/etc/resolv.conf"
-          cat "$ROOTFS/etc/resolv.conf" > "$R/guest-resolv.conf"
-          # The minimal Ubuntu container also carries dpkg statoverride rows for
-          # service accounts that are intentionally absent from /etc/passwd or
-          # /etc/group (for example _chrony). Full package installation aborts
-          # on those stale rows. Remove only rows whose named user/group is not
-          # present in this exported rootfs.
-          python3 - "$ROOTFS" "$R/statoverride-removed.txt" <<'PY'
-          import pathlib, sys
-          root = pathlib.Path(sys.argv[1])
-          receipt = pathlib.Path(sys.argv[2])
-          passwd = {line.split(':',1)[0] for line in (root/'etc/passwd').read_text().splitlines() if ':' in line}
-          groups = {line.split(':',1)[0] for line in (root/'etc/group').read_text().splitlines() if ':' in line}
-          p = root/'var/lib/dpkg/statoverride'
-          if not p.exists():
-              receipt.write_text('no statoverride file\n')
-              raise SystemExit(0)
-          keep=[]; removed=[]
-          for line in p.read_text().splitlines():
-              parts=line.split(None,3)
-              if len(parts)!=4:
-                  keep.append(line); continue
-              user, group, mode, path = parts
-              user_ok=user.isdigit() or user in passwd
-              group_ok=group.isdigit() or group in groups
-              if user_ok and group_ok:
-                  keep.append(line)
-              else:
-                  removed.append(line)
-          p.write_text(('\n'.join(keep)+'\n') if keep else '')
-          receipt.write_text(('\n'.join(removed)+'\n') if removed else 'none\n')
-          PY
-          cat "$R/statoverride-removed.txt"
-
-      - name: Install amd64 vulkan-tools and X11 by running apt through FEX
-        shell: bash
-        run: |
-          set -euxo pipefail
-          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
-          sudo env FEX_ROOTFS="$ROOTFS" FEX_PORTABLE=1 DEBIAN_FRONTEND=noninteractive \
-            "$FEX" /usr/bin/apt-get update > "$R/guest-apt-update.log" 2>&1 || { tail -n 200 "$R/guest-apt-update.log"; exit 1; }
-          sudo env FEX_ROOTFS="$ROOTFS" FEX_PORTABLE=1 DEBIAN_FRONTEND=noninteractive \
-            "$FEX" /usr/bin/apt-get install -y --no-install-recommends vulkan-tools libx11-6 ca-certificates \
-            > "$R/guest-apt-install.log" 2>&1 || { tail -n 240 "$R/guest-apt-install.log"; exit 1; }
+          rm -rf /tmp/apt-amd64 "$ROOTFS"
+          mkdir -p /tmp/apt-amd64/lists/partial /tmp/apt-amd64/cache/archives/partial "$ROOTFS"
+          : > /tmp/apt-amd64/status
+          cat >/tmp/apt-amd64/sources.list <<'EOF'
+          deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://archive.ubuntu.com/ubuntu noble main universe
+          deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://archive.ubuntu.com/ubuntu noble-updates main universe
+          deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://security.ubuntu.com/ubuntu noble-security main universe
+          EOF
+          APT_OPTS=(
+            -o APT::Architecture=amd64
+            -o APT::Architectures::=amd64
+            -o Dir::Etc::sourcelist=/tmp/apt-amd64/sources.list
+            -o Dir::Etc::sourceparts=-
+            -o Dir::State::lists=/tmp/apt-amd64/lists
+            -o Dir::State::status=/tmp/apt-amd64/status
+            -o Dir::Cache::archives=/tmp/apt-amd64/cache/archives
+            -o APT::Install-Recommends=false
+            -o APT::Install-Suggests=false
+          )
+          sudo apt-get "${APT_OPTS[@]}" update > "$R/amd64-apt-update.log" 2>&1
+          sudo apt-get "${APT_OPTS[@]}" --download-only -y install vulkan-tools libx11-6 ca-certificates \
+            > "$R/amd64-apt-download.log" 2>&1
+          find /tmp/apt-amd64/cache/archives -maxdepth 1 -name '*.deb' -printf '%f\n' | sort | tee "$R/amd64-packages.txt"
+          test -s "$R/amd64-packages.txt"
+          for deb in /tmp/apt-amd64/cache/archives/*.deb; do
+            sudo dpkg-deb -x "$deb" "$ROOTFS"
+          done
           file "$ROOTFS/usr/bin/vulkaninfo" | tee "$R/vulkaninfo.file"
           test -x "$ROOTFS/usr/bin/vulkaninfo"
-          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu"
-          cp "$R/libvulkan-unsplit.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+
+          # Extract-only assembly does not run the distro action that creates
+          # the merged-/usr compatibility interpreter path expected by amd64
+          # ELF binaries. Materialize that one standard path from libc6.
+          find "$ROOTFS" -name 'ld-linux-x86-64.so.2' -ls | tee "$R/amd64-loaders.txt"
+          loader="$(find "$ROOTFS" -type f -name 'ld-linux-x86-64.so.2' | head -1)"
+          test -n "$loader"
+          sudo mkdir -p "$ROOTFS/lib64"
+          sudo cp -L "$loader" "$ROOTFS/lib64/ld-linux-x86-64.so.2"
+          test -x "$ROOTFS/lib64/ld-linux-x86-64.so.2"
+
+          sudo mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu"
+          sudo cp "$R/libvulkan-unsplit.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          find "$ROOTFS/usr/lib/x86_64-linux-gnu" -maxdepth 1 \( -name 'libX11.so.6*' -o -name 'libvulkan.so.1*' -o -name 'libstdc++.so.6*' \) -print | sort > "$R/amd64-runtime-libs.txt"
+          cat "$R/amd64-runtime-libs.txt"
 
       - name: Run unsplit vulkaninfo with Finding A fixed
         shell: bash
@@ -195,8 +179,8 @@ jobs:
           readelf -d guest-split/libfex-vulkan-bridge.so > "$R/split-bridge.dynamic.txt"
           ! grep -q 'FLAGS_1.*NODELETE' "$R/split-wrapper.dynamic.txt"
           grep -q 'FLAGS_1.*NODELETE' "$R/split-bridge.dynamic.txt"
-          cp guest-split/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
-          cp guest-split/libfex-vulkan-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          sudo cp guest-split/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          sudo cp guest-split/libfex-vulkan-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/"
 
       - name: Run split vulkaninfo with identical FEX core and Finding A host thunk
         shell: bash
