@@ -5,6 +5,7 @@ include(${FEX_PROJECT_SOURCE_DIR}/Data/CMake/version_to_variables.cmake)
 option(ENABLE_CLANG_THUNKS "Enable building thunks with clang" FALSE)
 
 find_package(PkgConfig REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 # Use include directories from pkg-config and fall back to global defaults if not available.
 # /usr/include is dropped to avoid mixing foreign-architecture standard library headers.
@@ -207,7 +208,34 @@ if (BITNESS EQUAL 64)
   generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp)
   target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
   target_include_directories_from_pkgconfig(libvulkan-guest-deps "xcb;x11;xrandr;xrender")
+
+  # Derive the resident bridge signature set from the normal generated Vulkan
+  # guest thunk output, keeping the ordinary interface as the single source of truth.
+  set(VULKAN_GUEST_INL "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libvulkan.inl")
+  set(VULKAN_BRIDGE_INL "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libvulkan_bridge.inl")
+  set(VULKAN_BRIDGE_ACCESSORS "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libvulkan_bridge_accessors.inl")
+  add_custom_command(
+    OUTPUT "${VULKAN_BRIDGE_INL}" "${VULKAN_BRIDGE_ACCESSORS}"
+    DEPENDS "${VULKAN_GUEST_INL}" "${FEX_PROJECT_SOURCE_DIR}/ThunkLibs/Generator/extract_guest_bridge.py"
+    COMMAND "${Python3_EXECUTABLE}"
+      "${FEX_PROJECT_SOURCE_DIR}/ThunkLibs/Generator/extract_guest_bridge.py"
+      "${VULKAN_GUEST_INL}" "${VULKAN_BRIDGE_INL}" "${VULKAN_BRIDGE_ACCESSORS}"
+    VERBATIM)
+  add_custom_target(vulkan-bridge-generated DEPENDS "${VULKAN_BRIDGE_INL}" "${VULKAN_BRIDGE_ACCESSORS}")
+
+  add_library(libvulkan_bridge-guest-deps INTERFACE)
+  target_include_directories(libvulkan_bridge-guest-deps INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+  target_include_directories(libvulkan_bridge-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
+  target_include_directories_from_pkgconfig(libvulkan_bridge-guest-deps "xcb;x11;xrandr;xrender")
+  set(GEN_libvulkan_bridge "${VULKAN_BRIDGE_INL}" "${VULKAN_BRIDGE_ACCESSORS}")
+  add_guest_lib(vulkan_bridge "libfex-vulkan-bridge.so")
+  set_target_properties(vulkan_bridge-guest PROPERTIES OUTPUT_NAME "fex-vulkan-bridge")
+  target_link_options(vulkan_bridge-guest PRIVATE "LINKER:-z,nodelete")
+  add_dependencies(vulkan_bridge-guest vulkan-bridge-generated)
+
   add_guest_lib(vulkan "libvulkan.so.1")
+  target_link_libraries(vulkan-guest PRIVATE vulkan_bridge-guest)
+  add_dependencies(vulkan-guest vulkan-bridge-generated)
 
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories_from_pkgconfig(libdrm-guest-deps libdrm /usr/include/drm /usr/include/libdrm)
