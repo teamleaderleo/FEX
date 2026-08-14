@@ -52,7 +52,7 @@ jobs:
           python3 split-helper/.github/fieldwork/apply_vulkan_split_bridge.py "$GITHUB_WORKSPACE"
           git diff --check
           git diff -- ThunkLibs/libvulkan/Guest.cpp ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/split.diff"
-          grep -R -n 'VulkanBridge' ThunkLibs/libvulkan ThunkLibs/GuestLibs | tee "$R/bridge-sites.txt"
+          grep -R -n -E 'fex_vulkan_bridge|vulkan-bridge|GuestBridge' ThunkLibs/libvulkan ThunkLibs/GuestLibs | tee "$R/bridge-sites.txt"
           grep -R -n 'CallHostFunction<FatalError' ThunkLibs/libvulkan | tee "$R/unknown-stub-sites.txt" || true
 
       - name: Build thunk generator
