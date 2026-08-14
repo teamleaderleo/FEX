@@ -1,0 +1,202 @@
+name: Agent C Vulkan 32-bit pNext inventory v2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-pnext-inventory-v2.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - name: Canonicalized inventory
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p receipts
+          python3 - <<'PY'
+          from __future__ import annotations
+          import collections, json, pathlib, re
+          import xml.etree.ElementTree as ET
+
+          root = pathlib.Path('src')
+          interface = (root/'ThunkLibs/libvulkan/libvulkan_interface.cpp').read_text()
+          host = (root/'ThunkLibs/libvulkan/Host.cpp').read_text()
+          xml_root = ET.parse(root/'External/Vulkan-Headers/registry/vk.xml').getroot()
+
+          # Vulkan XML struct alias graph.
+          aliases = {}
+          raw_extends = {}
+          struct_nodes = set()
+          for t in xml_root.findall('./types/type'):
+            if t.get('category') != 'struct': continue
+            name = t.get('name')
+            if not name:
+              n=t.find('name'); name=n.text if n is not None else None
+            if not name: continue
+            struct_nodes.add(name)
+            if t.get('alias'): aliases[name]=t.get('alias')
+            raw_extends[name]=tuple(x.strip() for x in t.get('structextends','').split(',') if x.strip())
+
+          def canon(name):
+            seen=set()
+            while name in aliases and name not in seen:
+              seen.add(name); name=aliases[name]
+            return name
+
+          providers=collections.defaultdict(set)
+          for feature in xml_root.findall('./feature'):
+            label='CORE_'+(feature.get('number') or feature.get('name') or '?')
+            for req in feature.findall('./require'):
+              for t in req.findall('type'):
+                n=t.get('name')
+                if n: providers[canon(n)].add(label)
+          for ext in xml_root.findall('./extensions/extension'):
+            label=ext.get('name') or 'UNKNOWN_EXTENSION'
+            for req in ext.findall('./require'):
+              for t in req.findall('type'):
+                n=t.get('name')
+                if n: providers[canon(n)].add(label)
+
+          effective_extends=collections.defaultdict(set)
+          for name in struct_nodes:
+            c=canon(name)
+            target=name
+            seen=set()
+            while target in aliases and target not in seen:
+              seen.add(target); target=aliases[target]
+            exts=raw_extends.get(name) or raw_extends.get(target) or ()
+            for e in exts: effective_extends[c].add(canon(e))
+
+          headers=[
+            root/'External/Vulkan-Headers/include/vulkan/vulkan_core.h',
+            root/'External/Vulkan-Headers/include/vulkan/vulkan_wayland.h',
+            root/'External/Vulkan-Headers/include/vulkan/vulkan_xcb.h',
+            root/'External/Vulkan-Headers/include/vulkan/vulkan_xlib.h',
+            root/'External/Vulkan-Headers/include/vulkan/vulkan_xlib_xrandr.h',
+          ]
+          struct_re=re.compile(r'typedef\s+struct\s+(Vk[A-Za-z0-9_]+)\s*\{(.*?)\}\s*\1\s*;',re.S)
+          blocks={}
+          header_raw=set()
+          for hp in headers:
+            for m in struct_re.finditer(hp.read_text(errors='replace')):
+              if not re.search(r'\bpNext\b',m.group(2)): continue
+              header_raw.add(m.group(1)); blocks[canon(m.group(1))]=m.group(2)
+          header_set={canon(n) for n in header_raw}
+
+          ar=re.compile(r'^\s*struct\s+fex_gen_config<&(?P<n>Vk[A-Za-z0-9_]+)::pNext>\s*:\s*fexgen::custom_repack')
+          annotations_raw=set()
+          for line in interface.splitlines():
+            if line.lstrip().startswith('//'): continue
+            m=ar.match(line)
+            if m: annotations_raw.add(m.group('n'))
+          annotations={canon(n) for n in annotations_raw}
+
+          hr=re.compile(r'^VULKAN_(DEFAULT|NONDEFAULT)_CUSTOM_REPACK\((Vk[A-Za-z0-9_]+)\)')
+          hooks_raw=set()
+          for line in host.splitlines():
+            s=line.strip()
+            if s.startswith('//'): continue
+            m=hr.match(s)
+            if m: hooks_raw.add(m.group(2))
+          hooks={canon(n) for n in hooks_raw}
+
+          hb=re.search(r'next_handlers\s*\{(.*?)\n\};',host,re.S)
+          if not hb: raise SystemExit('next_handlers not found')
+          handlers_raw=set(re.findall(r'converters<[^,>]+,\s*(Vk[A-Za-z0-9_]+)\s*>',hb.group(1)))
+          handlers={canon(n) for n in handlers_raw}
+
+          legal={n for n in header_set if effective_extends.get(n)}
+          top_level=header_set-legal
+
+          def risk(n):
+            body=blocks.get(n,'')
+            decls=[' '.join(x.split()) for x in body.split(';') if x.strip()]
+            ptrs=[d for d in decls if '*' in d and not re.search(r'\bpNext\b',d)]
+            abi=sorted(set(re.findall(r'\b(?:size_t|uintptr_t|intptr_t|PFN_[A-Za-z0-9_]+)\b',body)))
+            unionish=('VkDeviceOrHostAddress' in body or 'VkDescriptorDataEXT' in body)
+            return ptrs,abi,unionish,bool(ptrs or abi or unionish)
+
+          def rank(n):
+            ps=providers.get(n,set())
+            if any(x.startswith('CORE_') for x in ps): return 0
+            if any(x.startswith('VK_KHR_') for x in ps): return 1
+            if any(x.startswith('VK_EXT_') for x in ps): return 2
+            return 3
+
+          missing_handlers=legal-handlers
+          missing_annotations=header_set-annotations
+          annotation_only=annotations-hooks
+          hook_only=hooks-annotations
+          orphan_handlers=handlers-legal
+          rows=[]
+          for n in sorted(missing_handlers,key=lambda x:(rank(x),not risk(x)[3],x)):
+            ptrs,abi,unionish,prisk=risk(n)
+            rows.append(dict(name=n,pointer_risk=prisk,pointers=ptrs,abi=abi,unionish=unionish,
+                             providers=sorted(providers.get(n,[])),extends=sorted(effective_extends.get(n,[])),
+                             annotated=n in annotations,host_hook=n in hooks))
+
+          summary={
+            'raw_header_pnext_structs':len(header_raw),
+            'canonical_header_pnext_structs':len(header_set),
+            'canonical_legal_extension_nodes':len(legal),
+            'canonical_top_level_roots':len(top_level),
+            'raw_interface_annotations':len(annotations_raw),
+            'canonical_interface_annotations':len(annotations),
+            'raw_host_hooks':len(hooks_raw),
+            'canonical_host_hooks':len(hooks),
+            'raw_recursive_handlers':len(handlers_raw),
+            'canonical_recursive_handlers':len(handlers),
+            'canonical_annotation_only':len(annotation_only),
+            'canonical_host_only':len(hook_only),
+            'canonical_missing_legal_handlers':len(missing_handlers),
+            'canonical_missing_handler_pointer_risk':sum(r['pointer_risk'] for r in rows),
+            'canonical_orphan_handlers':len(orphan_handlers),
+            'canonical_missing_annotations':len(missing_annotations),
+          }
+          payload=dict(summary=summary,missing_handlers=rows,
+                       annotation_only=sorted(annotation_only),host_only=sorted(hook_only),
+                       orphan_handlers=sorted(orphan_handlers),missing_annotations=sorted(missing_annotations),
+                       aliases=aliases)
+          out=pathlib.Path('receipts')
+          (out/'inventory-v2.json').write_text(json.dumps(payload,indent=2)+'\n')
+          with (out/'missing-handlers.tsv').open('w') as f:
+            f.write('name\tpointer_risk\tproviders\textends\tannotated\thost_hook\tpointers\tabi\n')
+            for r in rows:
+              f.write('\t'.join([r['name'],str(int(r['pointer_risk'])),','.join(r['providers']),','.join(r['extends']),
+                                 str(int(r['annotated'])),str(int(r['host_hook'])),' | '.join(r['pointers']),','.join(r['abi'])])+'\n')
+          lines=['# Canonicalized 32-bit Vulkan pNext inventory','',f'Exact candidate: `{__import__("os").environ["FEX_SHA"]}`','', '## Counts','']
+          lines += [f'- `{k}`: **{v}**' for k,v in summary.items()]
+          lines += ['', '## Inventory synchronization','',f'- annotation only: `{sorted(annotation_only)}`',f'- host only: `{sorted(hook_only)}`','',
+                    '## Highest-priority missing legal nodes','']
+          for r in rows[:80]:
+            lines.append(f"- `{r['name']}` — pointer_risk={int(r['pointer_risk'])}; providers={','.join(r['providers'])}; extends={','.join(r['extends'])}; annotated={int(r['annotated'])}; host_hook={int(r['host_hook'])}")
+          (out/'summary.md').write_text('\n'.join(lines)+'\n')
+          print(json.dumps(summary,indent=2))
+          print('ANNOTATION_ONLY',sorted(annotation_only))
+          print('HOST_ONLY',sorted(hook_only))
+          print('TOP_MISSING')
+          for r in rows[:50]: print(r['name'],int(r['pointer_risk']),','.join(r['providers']),','.join(r['extends']),int(r['annotated']),int(r['host_hook']),sep='\t')
+          PY
+          cat receipts/summary.md
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-pnext-inventory-v2-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
