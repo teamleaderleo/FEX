@@ -1,0 +1,60 @@
+name: Agent O NODELETE guest thunk lld gate
+on:
+  push:
+    branches: [ci/agent-o-arm64-20260814]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  vulkan-lld:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      R: ${{ github.workspace }}/receipts
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev libssl-dev pkg-config libcap-dev gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libx11-dev libxcb1-dev libxrandr-dev libxrender-dev libgl-dev libegl-dev
+      - name: Apply policy and build generator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/GuestLibs/CMakeLists.txt'); s=p.read_text()
+          old='  target_link_libraries(${NAME}-guest PRIVATE lib${NAME}-guest-deps)\n'
+          new=old+'  if (TARGET_TYPE STREQUAL "SHARED")\n    target_link_options(${NAME}-guest PRIVATE "LINKER:-z,nodelete")\n  endif()\n'
+          if old not in s: raise SystemExit('policy anchor missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/main-cmake.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" > "$R/thunkgen.log" 2>&1
+          find build -type f -name thunkgen -perm -111 | head -n1 | xargs realpath > "$R/thunkgen-path.txt"
+      - name: Build real Vulkan guest with lld
+        shell: bash
+        run: |
+          set -euxo pipefail
+          THUNKGEN="$(cat "$R/thunkgen-path.txt")"
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_CLANG_THUNKS=ON -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$THUNKGEN" -DX86_DEV_ROOTFS=/ > "$R/guest-cmake.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v > "$R/vulkan-build.log" 2>&1 || { tail -n 200 "$R/vulkan-build.log"; exit 1; }
+          readelf -d guest/libvulkan-guest.so | tee "$R/dynamic.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/dynamic.txt"
+          grep -q 'SONAME.*libvulkan.so.1' "$R/dynamic.txt"
+          grep -q -- '-fuse-ld=lld' "$R/vulkan-build.log"
+          echo REAL_VULKAN_NODELETE_LLD_OK
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-o-nodelete-lld-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
