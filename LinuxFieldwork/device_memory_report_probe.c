@@ -9,12 +9,11 @@ static volatile unsigned callback_count;
 __attribute__((used,noinline)) static void VKAPI_PTR report_body(const VkDeviceMemoryReportCallbackDataEXT *data, void *user) {
   (void)user;
   ++callback_count;
-  fprintf(stderr, "MEM_REPORT callback=%u type=%u size=%llu objectType=%u objectId=%llu\n",
+  fprintf(stderr, "MEM_REPORT callback=%u type=%u size=%llu objectType=%u\n",
           callback_count,
           data ? (unsigned)data->type : 0u,
           data ? (unsigned long long)data->size : 0ull,
-          data ? (unsigned)data->objectType : 0u,
-          data ? (unsigned long long)data->objectId : 0ull);
+          data ? (unsigned)data->objectType : 0u);
   fflush(stderr);
 }
 
