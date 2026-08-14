@@ -131,7 +131,8 @@ jobs:
               >> "$R/amd64-packages.txt"
           done
           sort -o "$R/amd64-packages.txt" "$R/amd64-packages.txt"
-          grep -E '^vulkan-tools\t' "$R/amd64-packages.txt" | tee "$R/vulkan-tools-package.txt"
+          awk -F '\t' '$1 == "vulkan-tools" { print }' "$R/amd64-packages.txt" | tee "$R/vulkan-tools-package.txt"
+          test -s "$R/vulkan-tools-package.txt"
 
           docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
           cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
