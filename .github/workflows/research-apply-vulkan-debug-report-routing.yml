@@ -46,16 +46,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
-            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
           printf 'fex=%s\nfieldwork=%s\ncarrier=%s\n' \
             "$(git -C src rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" "$GITHUB_SHA" > "$R/identity.txt"
           base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
           echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
           mkdir /tmp/repro
           tar xf /tmp/repro.tar.gz -C /tmp/repro
-          cp /tmp/repro/fex-full-thunk-pair/Makefile "$R/Makefile.baseline"
 
-      - name: Build exact current FEX
+      - name: Build exact current FEX and fixture
         shell: bash
         run: |
           set -euxo pipefail
@@ -65,6 +64,8 @@ jobs:
             -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
             -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
           cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
+          make -C /tmp/repro/fex-full-thunk-pair clean
+          make -C /tmp/repro/fex-full-thunk-pair HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/build-fixture.log" 2>&1
 
       - name: Prepare rootfs
         shell: bash
@@ -78,6 +79,7 @@ jobs:
           docker rm "$cid"
           trap - EXIT
           mkdir -p "$ROOTFS/opt/fex-ci/full"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/full/"
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
 
@@ -86,11 +88,6 @@ jobs:
         run: |
           set -uxo pipefail
           PAIR=/tmp/repro/fex-full-thunk-pair
-          make -C "$PAIR" clean
-          make -C "$PAIR" HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/build-baseline.log" 2>&1
-          rm -rf "$ROOTFS/opt/fex-ci/full/guest"
-          cp -a "$PAIR/guest" "$ROOTFS/opt/fex-ci/full/"
-          readelf -d "$PAIR/guest/liblifetime-guest.so" > "$R/baseline.dynamic.txt"
           FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
           set +e
           (cd "$ROOTFS/opt/fex-ci/full" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$PAIR/host" timeout 30s \
@@ -98,52 +95,29 @@ jobs:
           rc=$?
           set -e
           echo "$rc" > "$R/baseline.exit"
-          grep -E 'generation|reload|re-register|retained|fresh|callback|native host stable|signal=|exit=' "$R/baseline.stdout" "$R/baseline.stderr" > "$R/baseline.key-lines.txt" || true
+          grep -E 'generation|reload|re-register|retained|fresh|callback|native host stable|mapped|signal=|exit=' "$R/baseline.stdout" "$R/baseline.stderr" > "$R/baseline.key-lines.txt" || true
           cat "$R/baseline.key-lines.txt"
 
-      - name: Build guest-pinned variant
-        shell: bash
-        run: |
-          set -euxo pipefail
-          PAIR=/tmp/repro/fex-full-thunk-pair
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('/tmp/repro/fex-full-thunk-pair/Makefile')
-          s = p.read_text()
-          if '-shared' not in s:
-              raise SystemExit('fixture Makefile has no shared-library link step')
-          s = s.replace('-shared', '-shared -Wl,-z,nodelete')
-          p.write_text(s)
-          PY
-          cp "$PAIR/Makefile" "$R/Makefile.pinned"
-          make -C "$PAIR" clean
-          make -C "$PAIR" HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/build-pinned.log" 2>&1
-          readelf -d "$PAIR/guest/liblifetime-guest.so" > "$R/pinned.dynamic.txt"
-          grep -q NODELETE "$R/pinned.dynamic.txt"
-          grep NODELETE "$R/pinned.dynamic.txt"
-
-      - name: Pinned ordinary dlclose and reload
+      - name: Pinned lifetime positive control
         shell: bash
         run: |
           set -uxo pipefail
           PAIR=/tmp/repro/fex-full-thunk-pair
-          rm -rf "$ROOTFS/opt/fex-ci/full/guest"
-          cp -a "$PAIR/guest" "$ROOTFS/opt/fex-ci/full/"
           FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
           set +e
           (cd "$ROOTFS/opt/fex-ci/full" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$PAIR/host" timeout 30s \
-            "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime) > "$R/pinned.stdout" 2> "$R/pinned.stderr"
+            "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime --pin) > "$R/pin.stdout" 2> "$R/pin.stderr"
           rc=$?
           set -e
-          echo "$rc" > "$R/pinned.exit"
-          grep -E 'generation|reload|re-register|retained|fresh|callback|native host stable|signal=|exit=' "$R/pinned.stdout" "$R/pinned.stderr" > "$R/pinned.key-lines.txt" || true
-          cat "$R/pinned.key-lines.txt"
+          echo "$rc" > "$R/pin.exit"
+          grep -E 'generation|reload|re-register|retained|fresh|callback|native host stable|mapped|signal=|exit=' "$R/pin.stdout" "$R/pin.stderr" > "$R/pin.key-lines.txt" || true
+          cat "$R/pin.key-lines.txt"
           exit 0
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: guest-thunk-selfpin-${{ github.run_id }}
+          name: guest-thunk-pin-control-${{ github.run_id }}
           path: receipts-selfpin
           retention-days: 30
