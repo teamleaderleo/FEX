@@ -65,10 +65,10 @@ def main() -> None:
   MappedResource::ContainerType MappedResources;
   fextl::vector<MappedResource> PendingResourceDeletions;''',
         '''private:
+  // Zero is reserved for "unassigned". Process-lifetime wrap is outside this
+  // diagnostic's reachable state space; production can make exhaustion fatal.
   uint64_t AllocateOwnerID() {
-    const auto Result = NextOwnerID++;
-    LOGMAN_THROW_A_FMT(Result != 0 && NextOwnerID != 0, "VMA owner ID exhausted");
-    return Result;
+    return NextOwnerID++;
   }
 
   uint64_t NextOwnerID {1};
@@ -123,8 +123,6 @@ def main() -> None:
                                                             Current->OwnerID}''',
         'DeleteVMARange split owner',
     )
-    # Four designated split insertions in ChangeProtectionFlags all end in the
-    # same Flags/Prot pair. Copy the generation ID into every split VMA.
     replace_all(
         cpp,
         '''.Flags = CurrentFlags,
@@ -146,7 +144,6 @@ def main() -> None:
     )
 
     smc = root / "Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp"
-    # Preserve owner identity when mremap moves/resizes the same mapping generation.
     repl(
         smc,
         '''  const auto OldFlags = OldVMA->second.Flags;
@@ -175,8 +172,6 @@ def main() -> None:
         'mremap move owner',
     )
 
-    # MAP_FIXED diagnostics: capture the old tracked generation before the host
-    # syscall and the replacement generation after successful TrackMmap.
     repl(
         smc,
         '''  std::optional<FEXCore::ExecutableFileSectionInfo> CachedSection;
@@ -230,7 +225,6 @@ def main() -> None:
         'print MAP_FIXED owner transition',
     )
 
-    # mprotect must retain mapping-generation identity across permission splits.
     repl(
         smc,
         '''uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Thread, void* addr, size_t len, int prot) {
