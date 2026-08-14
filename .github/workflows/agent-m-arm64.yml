@@ -1,4 +1,4 @@
-name: Agent M real Vulkan guest NODELETE build
+name: Agent M real guest NODELETE build matrix
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  real-vulkan-guest:
+  real-guest-thunks:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     env:
@@ -32,7 +32,7 @@ jobs:
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
             libx11-dev libxcb1-dev libxrandr-dev libxrender-dev libwayland-dev libdrm-dev libasound2-dev libgl-dev libegl-dev binutils
 
-      - name: Apply one-line guest lifetime policy
+      - name: Apply generic guest lifetime policy
         shell: bash
         run: |
           set -euxo pipefail
@@ -63,7 +63,7 @@ jobs:
           test -n "$THUNKGEN"
           realpath "$THUNKGEN" | tee "$R/thunkgen-path.txt"
 
-      - name: Build real Vulkan guest thunk
+      - name: Build representative real guest thunks
         shell: bash
         run: |
           set -euxo pipefail
@@ -76,20 +76,28 @@ jobs:
             -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
             -DGENERATOR_EXE="$THUNKGEN" \
             -DX86_DEV_ROOTFS=/ > "$R/guest-cmake.log" 2>&1
-          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" -v > "$R/vulkan-guest-build.log" 2>&1 || { tail -n 240 "$R/vulkan-guest-build.log"; exit 1; }
-          VULKAN_GUEST="$(find guest-build -type f -name 'libvulkan-guest.so*' | head -n1)"
-          test -n "$VULKAN_GUEST"
-          realpath "$VULKAN_GUEST" | tee "$R/vulkan-guest-path.txt"
-          file "$VULKAN_GUEST" | tee "$R/vulkan-guest-file.txt"
-          readelf -d "$VULKAN_GUEST" | tee "$R/vulkan-guest-dynamic.txt"
-          grep -q 'FLAGS_1.*NODELETE' "$R/vulkan-guest-dynamic.txt"
-          grep -q 'SONAME.*libvulkan.so.1' "$R/vulkan-guest-dynamic.txt"
-          echo REAL_VULKAN_GUEST_NODELETE_OK
+          cmake --build guest-build --target vulkan-guest GL-guest wayland-client-guest cuda-guest -- -j"$(nproc)" -v > "$R/representative-build.log" 2>&1 || { tail -n 280 "$R/representative-build.log"; exit 1; }
+
+          check_so() {
+            name="$1"; soname="$2"; file_name="$3"
+            path="$(find guest-build -type f -name "$file_name" | head -n1)"
+            test -n "$path"
+            file "$path" | tee "$R/${name}-file.txt"
+            readelf -d "$path" | tee "$R/${name}-dynamic.txt"
+            grep -q 'FLAGS_1.*NODELETE' "$R/${name}-dynamic.txt"
+            grep -Fq "SONAME)             Library soname: [$soname]" "$R/${name}-dynamic.txt"
+            echo "REAL_${name}_NODELETE_OK"
+          }
+
+          check_so vulkan libvulkan.so.1 'libvulkan-guest.so*'
+          check_so GL libGL.so.1 'libGL-guest.so*'
+          check_so wayland_client libwayland-client.so.0.20.0 'libwayland-client-guest.so*'
+          check_so cuda libcuda.so.1 'libcuda-guest.so*'
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-m-real-vulkan-nodelete-${{ github.run_id }}
+          name: agent-m-real-nodelete-matrix-${{ github.run_id }}
           path: receipts
           retention-days: 30
