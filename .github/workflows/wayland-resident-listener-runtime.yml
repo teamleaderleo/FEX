@@ -1,0 +1,198 @@
+name: Wayland resident listener lifetime
+
+on:
+  push:
+    branches: [diagnostic/wayland-resident-listener-20260814]
+    paths:
+      - .github/workflows/wayland-resident-listener-runtime.yml
+      - LinuxFieldwork/apply_wayland_deferred_listener_test_hook.py
+      - LinuxFieldwork/apply_wayland_resident_u_listener.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wayland-listener:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      R: ${{ github.workspace }}/receipts-wayland
+      H: ${{ github.workspace }}/host-wayland
+      ROOT_LOCAL: ${{ github.workspace }}/rootfs-wayland-local
+      ROOT_RESIDENT: ${{ github.workspace }}/rootfs-wayland-resident
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 8
+
+      - name: Dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libwayland-dev binutils
+
+      - name: Apply common deferred-listener discriminator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_wayland_deferred_listener_test_hook.py
+          git diff --check
+          git diff -- ThunkLibs/libwayland-client | tee "$R/common-hook.diff"
+
+      - name: Build FEX host and local-unpacker wrapper
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer wayland-client-host-64 -- -j"$(nproc)" \
+            > "$R/build-host.log" 2>&1 || { tail -n 300 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libwayland-client-host.so "$H/libwayland-client-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest-local -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-local.log" 2>&1
+          cmake --build guest-local --target wayland-client-guest -- -j"$(nproc)" \
+            > "$R/build-local.log" 2>&1 || { tail -n 300 "$R/build-local.log"; exit 1; }
+          readelf -d guest-local/libwayland-client-guest.so > "$R/local.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/local.dynamic"
+
+      - name: Build resident-u-listener candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_wayland_resident_u_listener.py
+          git diff --check
+          git diff -- ThunkLibs/libwayland-client ThunkLibs/libwayland-client_bridge ThunkLibs/GuestLibs/CMakeLists.txt \
+            | tee "$R/resident.diff"
+
+          cmake -S ThunkLibs/GuestLibs -B guest-resident -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-resident.log" 2>&1
+          cmake --build guest-resident --target wayland-client-guest wayland-client_bridge-guest -- -j"$(nproc)" \
+            > "$R/build-resident.log" 2>&1 || { tail -n 300 "$R/build-resident.log"; exit 1; }
+          readelf -d guest-resident/libwayland-client-guest.so > "$R/resident-wrapper.dynamic"
+          readelf -d guest-resident/libfex-wayland-client-bridge.so > "$R/resident-bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/resident-wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-wayland-client-bridge.so' "$R/resident-wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/resident-bridge.dynamic"
+
+      - name: Prepare rootfs images and guest probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          for variant in local resident; do
+            rootvar="ROOT_${variant^^}"
+            root="${!rootvar}"
+            cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+            mkdir -p "$root"
+            docker export "$cid" | tar -C "$root" -xf -
+            docker rm "$cid"
+            mkdir -p "$root/usr/lib/x86_64-linux-gnu" "$root/opt/fex-ci"
+            cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$root/usr/lib/x86_64-linux-gnu/" || true
+            cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$root/usr/lib/x86_64-linux-gnu/" || true
+          done
+          cp guest-local/libwayland-client-guest.so "$ROOT_LOCAL/usr/lib/x86_64-linux-gnu/libwayland-client.so.0.20.0"
+          cp guest-resident/libwayland-client-guest.so "$ROOT_RESIDENT/usr/lib/x86_64-linux-gnu/libwayland-client.so.0.20.0"
+          cp guest-resident/libfex-wayland-client-bridge.so "$ROOT_RESIDENT/usr/lib/x86_64-linux-gnu/libfex-wayland-client-bridge.so"
+
+          cat >/tmp/wayland-listener-probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          typedef void (*raw_cb)(void);
+          typedef int (*add_listener_fn)(void*, raw_cb*, void*);
+          struct msg { const char *name; const char *signature; const void **types; };
+          struct iface { const char *name; int version; int method_count; const struct msg *methods; int event_count; const struct msg *events; };
+          struct fake_proxy { const struct iface *interface; };
+          static volatile unsigned callback_count;
+          static volatile uint32_t last_value;
+          static void guest_listener(void *data, void *proxy, uint32_t value) {
+            (void)proxy;
+            ++callback_count; last_value=value;
+            fprintf(stderr,"WAYLAND_GUEST_CALLBACK count=%u value=%u data=%p\n",callback_count,value,data);
+          }
+          static int mapped(void*p){FILE*f=fopen("/proc/self/maps","r");char l[512];uintptr_t x=(uintptr_t)p;if(!f)return -1;while(fgets(l,sizeof l,f)){unsigned long a,b;if(sscanf(l,"%lx-%lx",&a,&b)==2&&x>=a&&x<b){fclose(f);return 1;}}fclose(f);return 0;}
+          int main(void) {
+            static const struct msg event = {"tick","u",0};
+            static const struct iface iface = {"fex_test",1,0,0,1,&event};
+            struct fake_proxy proxy = {&iface};
+            raw_cb table[1] = {(raw_cb)guest_listener};
+            void *h=dlopen("libwayland-client.so.0.20.0",RTLD_NOW|RTLD_LOCAL);
+            if(!h){fprintf(stderr,"DLOPEN_FAIL %s\n",dlerror());return 2;}
+            add_listener_fn add=(add_listener_fn)dlsym(h,"wl_proxy_add_listener"); if(!add)return 3;
+            fprintf(stderr,"WAYLAND_BEFORE add=%p mapped=%d\n",(void*)add,mapped((void*)add));
+            if(add(&proxy,table,(void*)(uintptr_t)0x12345678))return 4;
+            usleep(250000);
+            fprintf(stderr,"WAYLAND_PRE_CLOSE count=%u value=%u\n",callback_count,last_value);
+            if(callback_count!=1||last_value!=41)return 5;
+            if(dlclose(h))return 6;
+            fprintf(stderr,"WAYLAND_AFTER_CLOSE add_mapped=%d count=%u\n",mapped((void*)add),callback_count);
+            if(mapped((void*)add)!=0)return 7;
+            usleep(700000);
+            fprintf(stderr,"WAYLAND_POST_CLOSE count=%u value=%u\n",callback_count,last_value);
+            if(callback_count!=2||last_value!=42)return 8;
+            fprintf(stderr,"WAYLAND_RETAINED_LISTENER_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/wayland-listener-probe.c -ldl -o "$ROOT_LOCAL/opt/fex-ci/probe"
+          cp "$ROOT_LOCAL/opt/fex-ci/probe" "$ROOT_RESIDENT/opt/fex-ci/probe"
+
+      - name: Execute local and resident A/B
+        shell: bash
+        run: |
+          set -uxo pipefail
+          set +e
+          FEX_ROOTFS="$ROOT_LOCAL" FEX_THUNKHOSTLIBS="$H" timeout 20s build/Bin/FEX /opt/fex-ci/probe \
+            > "$R/local.out" 2> "$R/local.err"
+          local_rc=$?
+          FEX_ROOTFS="$ROOT_RESIDENT" FEX_THUNKHOSTLIBS="$H" timeout 20s build/Bin/FEX /opt/fex-ci/probe \
+            > "$R/resident.out" 2> "$R/resident.err"
+          resident_rc=$?
+          set -e
+          printf 'local=%s\nresident=%s\n' "$local_rc" "$resident_rc" | tee "$R/matrix.txt"
+          cat "$R/local.err"
+          cat "$R/resident.err"
+          grep -q 'WAYLAND_PRE_CLOSE count=1 value=41' "$R/local.err"
+          grep -q 'WAYLAND_PRE_CLOSE count=1 value=41' "$R/resident.err"
+          test "$local_rc" -ne 0
+          test "$resident_rc" -eq 0
+          grep -q WAYLAND_RETAINED_LISTENER_OK "$R/resident.err"
+          echo WAYLAND_RESIDENT_LISTENER_AB_OK | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayland-resident-listener-${{ github.run_id }}
+          path: receipts-wayland
+          retention-days: 30
