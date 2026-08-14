@@ -5,10 +5,10 @@
 
 static volatile unsigned callback_count;
 
-static VkBool32 VKAPI_PTR callback_body(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-                                         VkDebugUtilsMessageTypeFlagsEXT types,
-                                         const VkDebugUtilsMessengerCallbackDataEXT *data,
-                                         void *user) {
+__attribute__((used,noinline)) static VkBool32 VKAPI_PTR callback_body(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                                                        VkDebugUtilsMessageTypeFlagsEXT types,
+                                                                        const VkDebugUtilsMessengerCallbackDataEXT *data,
+                                                                        void *user) {
   (void)severity;
   (void)types;
   (void)user;
