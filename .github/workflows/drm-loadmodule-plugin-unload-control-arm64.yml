@@ -1,11 +1,12 @@
-name: DRM resident unpacker + unloadable callback target control
+name: DRM resident unpacker + target-owner lease ARM64
 
 on:
   push:
-    branches: [ci/drm-loadmodule-plugin-unload-control-20260814]
+    branches: [ci/drm-loadmodule-plugin-target-owner-lease-20260814]
     paths:
       - LinuxFieldwork/drm_loadmodule_plugin.c
       - LinuxFieldwork/drm_serverinfo_plugin_inflight_probe.c
+      - LinuxFieldwork/relax_callback_owner_to_target_generation.py
       - .github/workflows/drm-loadmodule-plugin-unload-control-arm64.yml
   workflow_dispatch:
 
@@ -13,13 +14,13 @@ permissions:
   contents: read
 
 jobs:
-  control:
+  target-owner-lease:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 65
+    timeout-minutes: 75
     env:
       PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
       ROOTFS: ${{ github.workspace }}/rootfs-amd64
-      R: ${{ github.workspace }}/receipts-plugin-control
+      R: ${{ github.workspace }}/receipts-plugin-target-owner
       HOST: ${{ github.workspace }}/host-thunks
       FEX_PORTABLE: 1
       DEBIAN_FRONTEND: noninteractive
@@ -28,6 +29,25 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-owner-claim-id-20260814
+          path: owner-helper
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/callback-owner-generation-lease-20260814
+          path: lease-helper
+          fetch-depth: 1
+
       - name: Provenance and dependencies
         run: |
           set -euxo pipefail
@@ -37,12 +57,28 @@ jobs:
           test ! -s "$R/pre-patch-product-source-diff.txt"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libdrm-dev libgl-dev
-      - name: Apply generated DRM resident bridge
+
+      - name: Apply generated DRM resident bridge and target-owner lease
+        shell: bash
         run: |
           set -euxo pipefail
           python3 LinuxFieldwork/apply_drm_serverinfo_generated_resident.py
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py "$GITHUB_WORKSPACE" all
+          python3 lease-helper/.github/fieldwork/promote_multiowner_claims.py "$GITHUB_WORKSPACE"
+          python3 owner-helper/.github/fieldwork/merge_callback_tombstone.py "$GITHUB_WORKSPACE"
+          python3 lease-helper/.github/fieldwork/fix_retirement_lock_order.py "$GITHUB_WORKSPACE"
+          python3 lease-helper/.github/fieldwork/add_revoked_h_state.py "$GITHUB_WORKSPACE"
+          python3 owner-helper/.github/fieldwork/pre_map_fixed_retire.py "$GITHUB_WORKSPACE"
+          python3 owner-helper/.github/fieldwork/add_map_fixed_rollback_transaction.py "$GITHUB_WORKSPACE"
+          python3 owner-helper/.github/fieldwork/add_vma_owner_id.py "$GITHUB_WORKSPACE"
+          python3 owner-helper/.github/fieldwork/add_owner_claim_identity.py "$GITHUB_WORKSPACE"
+          python3 lease-helper/.github/fieldwork/add_callback_descriptor_after_tombstone.py "$GITHUB_WORKSPACE"
+          (cd lease-helper && python3 .github/fieldwork/relax_owner_generation_registry_anchor.py)
+          python3 lease-helper/.github/fieldwork/add_callback_owner_generation_lease.py "$GITHUB_WORKSPACE"
+          python3 LinuxFieldwork/relax_callback_owner_to_target_generation.py "$GITHUB_WORKSPACE"
           git diff --check
-          git diff -- ThunkLibs > "$R/generated-resident.diff"
+          git diff -- ThunkLibs FEXCore Source > "$R/combined.diff"
+
       - name: Build FEX and DRM thunks
         run: |
           set -euxo pipefail
@@ -51,6 +87,7 @@ jobs:
           cp build/HostLibs_64/libdrm-host.so "$HOST/libdrm-host.so"
           cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
           cmake --build guest-build --target drm-guest drm_bridge-guest -- -j"$(nproc)" > "$R/build-guest.log" 2>&1
+
       - name: Prepare guest rootfs and plugin fixture
         run: |
           set -euxo pipefail
@@ -66,10 +103,10 @@ jobs:
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           x86_64-linux-gnu-gcc -O2 -fPIC -shared -Wall -Wextra -Werror LinuxFieldwork/drm_loadmodule_plugin.c -o "$ROOTFS/opt/fex-ci/libdrm-callback-plugin.so"
           x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -I/usr/include/libdrm LinuxFieldwork/drm_serverinfo_plugin_inflight_probe.c -ldl -pthread -o "$ROOTFS/opt/fex-ci/drm-plugin-inflight-probe"
-          readelf -d "$ROOTFS/opt/fex-ci/libdrm-callback-plugin.so" > "$R/plugin.dynamic"
           readelf -d guest-build/libfex-drm-bridge.so > "$R/bridge.dynamic"
           grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
-      - name: Execute target-unload control
+
+      - name: Execute split-owner lifetime discriminator
         shell: bash
         run: |
           set +e
@@ -77,14 +114,17 @@ jobs:
           rc=$?
           set -e
           echo "$rc" | tee "$R/run.exit"
-          cat "$R/run.stderr"
+          grep -E 'DRM_PLUGIN|DIAG_CALLBACK_OWNER_(SPLIT|CREATE|ACQUIRE|RETIRE|DEFER|RELEASE|RECLAIM)' "$R/run.stderr" | tee "$R/key-lines.txt" || true
           grep -q 'DRM_PLUGIN_PROBE callback-blocked mapped-before-close=1' "$R/run.stderr"
+          grep -q 'DIAG_CALLBACK_OWNER_SPLIT' "$R/run.stderr"
+          grep -q 'DIAG_CALLBACK_OWNER_ACQUIRE' "$R/run.stderr"
           grep -q 'DRM_PLUGIN_PROBE plugin-close rc=0' "$R/run.stderr"
           test "$rc" -ne 124
-          printf 'generated_resident_unpacker_plugin_target_control=%s\n' "$rc" | tee "$R/result.txt"
+          printf 'resident_unpacker_target_owner_lease_rc=%s\n' "$rc" | tee "$R/result.txt"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: drm-plugin-target-control-${{ github.run_id }}
-          path: receipts-plugin-control
+          name: drm-plugin-target-owner-lease-${{ github.run_id }}
+          path: receipts-plugin-target-owner
           retention-days: 30
