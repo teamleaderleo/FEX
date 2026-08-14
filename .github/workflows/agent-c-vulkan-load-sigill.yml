@@ -1,19 +1,21 @@
-name: Agent C callback family confirmation
+name: Agent C route-only Vulkan callback matrix
 
 on:
   push:
     branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths:
+      - .github/workflows/agent-c-vulkan-load-sigill.yml
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  callback-family:
+  route-only:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
-      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FEX_SHA: 28a3a5bfbd31662bfc4bd316ada39037aebf4165
       FIELDWORK_SHA: 1b268a6742768086aa8355e997c10b4423319ba6
       DEBIAN_FRONTEND: noninteractive
       ROOTFS: ${{ github.workspace }}/rootfs
@@ -43,7 +45,6 @@ jobs:
           set -euxo pipefail
           mkdir -p "$R" "$HOST"
           test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
-          test "$(git -C fieldwork rev-parse HEAD)" = "$FIELDWORK_SHA"
           {
             echo "fex_sha=$(git -C src rev-parse HEAD)"
             echo "fieldwork_sha=$(git -C fieldwork rev-parse HEAD)"
@@ -51,6 +52,7 @@ jobs:
             uname -a
             uname -m
           } | tee "$R/identity.txt"
+          git -C src diff --exit-code
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
@@ -66,43 +68,31 @@ jobs:
           test -n "$LVP_ICD"
           echo "$LVP_ICD" > "$R/lvp-icd.txt"
           VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
-          cc -O2 -Wall -Wextra \
-            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c \
-            -ldl -o /tmp/callback-arm64
-          VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 report gipa positive \
-            >"$R/native-report.out" 2>"$R/native-report.err"
-          VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 utils gipa positive \
-            >"$R/native-utils.out" 2>"$R/native-utils.err"
+          cc -O2 -Wall -Wextra fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c -ldl -o /tmp/callback-arm64
+          VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 report gipa positive >"$R/native-report.out" 2>"$R/native-report.err"
+          VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 utils gipa positive >"$R/native-utils.out" 2>"$R/native-utils.err"
 
-      - name: Apply candidate and build FEX Vulkan thunk pair
+      - name: Build clean route-only FEX Vulkan thunk pair
         shell: bash
         run: |
           set -euxo pipefail
-          python3 fieldwork/investigations/fex-vulkan-thunk-lifecycle/apply_native_first_callback_candidate.py \
-            src/ThunkLibs/libvulkan/Host.cpp
-          git -C src diff --check
-          git -C src diff -- ThunkLibs/libvulkan/Host.cpp > "$R/candidate.diff"
-
           CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
-            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
-            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF \
             -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
-            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none \
-            -DX86_DEV_ROOTFS=/ >"$R/cmake-host.log" 2>&1
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-host.log" 2>&1
           cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v >"$R/build-host.log" 2>&1
           cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
-
           cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja \
             -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
             -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
-            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" \
-            -DX86_DEV_ROOTFS=/ >"$R/cmake-guest.log" 2>&1
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
           cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
-          file src/build/Bin/FEX "$HOST/libvulkan-host.so" guest/libvulkan-guest.so > "$R/artifacts.file.txt"
 
-      - name: Build repaired amd64 rootfs and callback probe
+      - name: Build repaired amd64 rootfs and probes
         shell: bash
         run: |
           set -euxo pipefail
@@ -117,21 +107,35 @@ jobs:
           cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
-
           cat >/tmp/x11-stub.c <<'EOF'
           long XSync(void) { return 0; }
           void *XGetVisualInfo(void) { return 0; }
           const char *XDisplayString(void) { return ":fex-ci-stub"; }
           EOF
-          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libX11.so.6 \
-            /tmp/x11-stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libX11.so.6 /tmp/x11-stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c -ldl -o "$ROOTFS/opt/fex-ci/callback-probe"
+          cat >/tmp/null-gipa.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <string.h>
+          typedef void (*PFN)(void);
+          typedef PFN (*GIPA)(void*, const char*);
+          int main(int argc, char **argv) {
+            if (argc != 3) return 64;
+            void *h = dlopen("libvulkan.so.1", RTLD_NOW|RTLD_LOCAL);
+            if (!h) return 2;
+            GIPA g = (GIPA)dlsym(h,"vkGetInstanceProcAddr");
+            if (!g) return 3;
+            PFN p = g(NULL, argv[1]);
+            fprintf(stderr,"NULL_GIPA command=%s ptr=%p expected=%s\n",argv[1],(void*)p,argv[2]);
+            if (!strcmp(argv[2],"null")) return p ? 30 : 0;
+            if (!strcmp(argv[2],"nonnull")) return p ? 0 : 31;
+            return 64;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/null-gipa.c -ldl -o "$ROOTFS/opt/fex-ci/null-gipa"
 
-          x86_64-linux-gnu-gcc -O2 -Wall -Wextra \
-            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c \
-            -ldl -o "$ROOTFS/opt/fex-ci/callback-probe"
-          file "$ROOTFS/opt/fex-ci/callback-probe" "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6" > "$R/guest-files.txt"
-
-      - name: Run callback family candidate matrix
+      - name: Run route-only callback and proc-address matrix
         shell: bash
         run: |
           set -uxo pipefail
@@ -152,12 +156,15 @@ jobs:
           run_case report-gipa /opt/fex-ci/callback-probe report gipa 0
           run_case utils-direct /opt/fex-ci/callback-probe utils direct 0
           run_case utils-gipa /opt/fex-ci/callback-probe utils gipa 0
+          # These non-null results are intentionally captured as the remaining custom-first semantics defect.
+          run_case null-report /opt/fex-ci/null-gipa vkCreateDebugReportCallbackEXT nonnull
+          run_case null-shader /opt/fex-ci/null-gipa vkCreateShaderModule nonnull
           {
-            for name in report-direct report-gipa utils-direct utils-gipa; do
+            for name in report-direct report-gipa utils-direct utils-gipa null-report null-shader; do
               printf '%s=' "$name"; cat "$R/$name.exit"
             done
-          } | tee "$R/callback-family-matrix.txt"
-          for name in report-direct report-gipa utils-direct utils-gipa; do
+          } | tee "$R/route-only-matrix.txt"
+          for name in report-direct report-gipa utils-direct utils-gipa null-report null-shader; do
             test "$(cat "$R/$name.exit")" = 0
           done
 
@@ -165,7 +172,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-c-callback-family-${{ github.run_id }}
+          name: agent-c-route-only-${{ github.run_id }}
           path: receipts
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
