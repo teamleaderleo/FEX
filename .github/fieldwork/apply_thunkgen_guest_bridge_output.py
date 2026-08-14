@@ -22,18 +22,18 @@ def main() -> None:
     replace_once(
         interface,
         'struct OutputFilenames {\n  std::string host;\n  std::string guest;\n};',
-        'struct OutputFilenames {\n  std::string host;\n  std::string guest;\n  std::string guest_bridge;\n};',
+        'struct OutputFilenames {\n  std::string host;\n  std::string guest;\n  std::string guest_bridge;\n  std::string guest_bridge_accessors;\n};',
         'OutputFilenames')
 
     replace_once(
         main_cpp,
         '  } else if (target_abi == "-guest") {\n    output_filenames.guest = std::move(output_filename);\n  } else {',
-        '  } else if (target_abi == "-guest") {\n    output_filenames.guest = std::move(output_filename);\n  } else if (target_abi == "-guest-bridge") {\n    output_filenames.guest_bridge = std::move(output_filename);\n  } else {',
+        '  } else if (target_abi == "-guest") {\n    output_filenames.guest = std::move(output_filename);\n  } else if (target_abi == "-guest-bridge") {\n    output_filenames.guest_bridge = std::move(output_filename);\n  } else if (target_abi == "-guest-bridge-accessors") {\n    output_filenames.guest_bridge_accessors = std::move(output_filename);\n  } else {',
         'main target switch')
     replace_once(
         main_cpp,
         '    if (target_abi == "-guest") {\n      const char* platform = is_32bit_guest ? "i686-linux-gnu" : "x86_64-linux-gnu";',
-        '    if (target_abi == "-guest" || target_abi == "-guest-bridge") {\n      const char* platform = is_32bit_guest ? "i686-linux-gnu" : "x86_64-linux-gnu";',
+        '    if (target_abi == "-guest" || target_abi == "-guest-bridge" || target_abi == "-guest-bridge-accessors") {\n      const char* platform = is_32bit_guest ? "i686-linux-gnu" : "x86_64-linux-gnu";',
         'guest include adjustment')
 
     guest_anchor = '  // Files used guest-side\n  if (!output_filenames.guest.empty()) {'
@@ -72,26 +72,39 @@ def main() -> None:
     }
   }
 
+  // Companion declaration fragment. The role-aware transform replaces this
+  // placeholder with typed caller/unpacker accessors keyed by canonical
+  // signature hash. Keeping this as a separate generator mode avoids parsing
+  // generated guest C++ in consumers.
+  if (!output_filenames.guest_bridge_accessors.empty()) {
+    std::ofstream file(output_filenames.guest_bridge_accessors);
+    file << "// thunkgen guest bridge accessors require role-aware emission\\n";
+  }
+
 '''
     replace_once(gen_cpp, guest_anchor, bridge_block + guest_anchor, 'guest bridge emit block')
 
     cmake_anchor = '''  add_custom_command(\n    OUTPUT "${OUTFILE}"\n    DEPENDS "${GENERATOR_EXE}"\n    DEPENDS "${SOURCE_FILE}"\n    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}\n      # Expand compile definitions to space-separated list of -D parameters\n      "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"\n      # Expand include directories to space-separated list of -isystem parameters\n      "$<$<BOOL:${prop}>:;-isystem$<JOIN:${prop},;-isystem>>"\n    VERBATIM\n    COMMAND_EXPAND_LISTS)\n\n  list(APPEND OUTPUTS "${OUTFILE}")\n'''
     cmake_repl = cmake_anchor + r'''  set(BRIDGE_OUTFILE "${OUTFOLDER}/thunkgen_bridge_${NAME}.inl")
+  set(BRIDGE_ACCESSORS_OUTFILE "${OUTFOLDER}/thunkgen_bridge_accessors_${NAME}.inl")
   add_custom_command(
-    OUTPUT "${BRIDGE_OUTFILE}"
+    OUTPUT "${BRIDGE_OUTFILE}" "${BRIDGE_ACCESSORS_OUTFILE}"
     DEPENDS "${GENERATOR_EXE}"
     DEPENDS "${SOURCE_FILE}"
     COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest-bridge" "${BRIDGE_OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
       "$<$<BOOL:${prop}>:;-isystem$<JOIN:${prop},;-isystem>>"
+    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest-bridge-accessors" "${BRIDGE_ACCESSORS_OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
+      "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
+      "$<$<BOOL:${prop}>:;-isystem$<JOIN:${prop},;-isystem>>"
     VERBATIM
     COMMAND_EXPAND_LISTS)
-  add_custom_target(${NAME}-guest-bridge-gen DEPENDS "${BRIDGE_OUTFILE}")
+  add_custom_target(${NAME}-guest-bridge-gen DEPENDS "${BRIDGE_OUTFILE}" "${BRIDGE_ACCESSORS_OUTFILE}")
 
 '''
     replace_once(guest_cmake, cmake_anchor, cmake_repl, 'GuestLibs generate command')
 
-    print('Applied thunkgen -guest-bridge prototype')
+    print('Applied thunkgen -guest-bridge and -guest-bridge-accessors prototype')
 
 
 if __name__ == '__main__':
