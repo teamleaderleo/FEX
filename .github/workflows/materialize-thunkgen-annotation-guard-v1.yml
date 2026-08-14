@@ -1,0 +1,51 @@
+name: Materialize thunkgen annotation guard v1
+
+on:
+  push:
+    branches: [diagnostic/thunkgen-annotation-guard-v1]
+    paths:
+      - .github/workflows/materialize-thunkgen-annotation-guard-v1.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Add conflicting ABI annotation guard
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/Generator/gen.cpp')
+          s = p.read_text()
+          old = '''  struct GuestFuncPtrEntry {\n    std::size_t index;\n    std::string signature;\n    std::vector<unsigned char> sha256;\n    bool used_as_callback;\n  };'''
+          new = '''  struct GuestFuncPtrEntry {\n    std::size_t index;\n    std::string signature;\n    std::vector<unsigned char> sha256;\n    std::unordered_map<unsigned, ParameterAnnotations> param_annotations;\n    std::string registration_key;\n    bool used_as_callback;\n  };'''
+          if s.count(old) != 1:
+              raise SystemExit('GuestFuncPtrEntry anchor missing')
+          s = s.replace(old, new, 1)
+
+          old = '''      if (existing != guest_funcptr_entries.end()) {\n        existing->used_as_callback |= used_as_callback;\n        continue;\n      }\n      guest_funcptr_entries.push_back({\n        .index = static_cast<std::size_t>(std::distance(thunked_funcptrs.begin(), type_it)),\n        .signature = std::move(funcptr_signature),\n        .sha256 = std::move(cb_sha256),\n        .used_as_callback = used_as_callback,\n      });'''
+          new = '''      if (existing != guest_funcptr_entries.end()) {\n        if (existing->param_annotations != type_it->second.second) {\n          throw std::runtime_error(fmt::format(\n            "Conflicting parameter annotations for runtime function pointer signature {}: {} vs {}",\n            funcptr_signature, existing->registration_key, type_it->first));\n        }\n        existing->used_as_callback |= used_as_callback;\n        continue;\n      }\n      guest_funcptr_entries.push_back({\n        .index = static_cast<std::size_t>(std::distance(thunked_funcptrs.begin(), type_it)),\n        .signature = std::move(funcptr_signature),\n        .sha256 = std::move(cb_sha256),\n        .param_annotations = type_it->second.second,\n        .registration_key = type_it->first,\n        .used_as_callback = used_as_callback,\n      });'''
+          if s.count(old) != 1:
+              raise SystemExit('dedupe anchor missing')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git diff --check
+          git diff -- ThunkLibs/Generator/gen.cpp
+
+      - name: Commit source guard
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add ThunkLibs/Generator/gen.cpp
+          git commit -m 'ThunkLibs: reject conflicting indirect ABI annotations'
+          git push origin HEAD:diagnostic/thunkgen-annotation-guard-v1
