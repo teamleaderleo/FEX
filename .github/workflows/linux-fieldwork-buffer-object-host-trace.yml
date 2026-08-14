@@ -1,0 +1,83 @@
+name: Vulkan buffer object host lifetime trace
+on:
+  workflow_dispatch:
+  push:
+    branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
+    paths:
+      - LINUX_FIELDWORK_BUFFER_OBJECT_HOST_TRACE.py
+      - .github/workflows/linux-fieldwork-buffer-object-host-trace.yml
+permissions:
+  contents: read
+jobs:
+  trace:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      PRODUCT_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: carrier
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers
+      - name: Apply allocator mediation and object trace
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          python3 ../carrier/LINUX_FIELDWORK_ALLOCATOR_TRAMPOLINE.py
+          python3 ../carrier/LINUX_FIELDWORK_ALLOCATOR_FREE_HOST_TRACE.py
+          python3 ../carrier/LINUX_FIELDWORK_BUFFER_OBJECT_HOST_TRACE.py
+          git diff --check
+      - name: Build FEX and Vulkan thunks
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_x86_64.cmake" -DFEX_PROJECT_SOURCE_DIR="$PWD" -DGENERATOR_EXE="$PWD/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)"
+          cp build/gen_64/thunkgen_host_libvulkan.inl ../generated-host-vulkan.inl
+      - name: Prepare rootfs and probe
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir rootfs-amd64
+          docker export "$cid" | tar -C rootfs-amd64 -xf -
+          docker rm "$cid"
+          mkdir -p rootfs-amd64/usr/lib/x86_64-linux-gnu rootfs-amd64/opt/fex-ci host-thunks receipts
+          cp generated-host-vulkan.inl receipts/
+          cp product/guest-build/libvulkan-guest.so rootfs-amd64/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+          cp product/build/HostLibs_64/libvulkan-host.so host-thunks/libvulkan-host.so
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o rootfs-amd64/usr/lib/x86_64-linux-gnu/libX11.so.6
+          x86_64-linux-gnu-gcc -std=c11 -O0 -g -Wall -Wextra -Werror carrier/LINUX_FIELDWORK_ALLOCATOR_CROSSCALL_TRACE.c -ldl -o rootfs-amd64/opt/fex-ci/allocator-crosscall-trace
+      - name: Execute host object trace
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" timeout 30s product/build/Bin/FEX /opt/fex-ci/allocator-crosscall-trace >receipts/fex.stdout 2>receipts/fex.stderr
+          fex_rc=$?
+          set -e
+          printf 'fex=%s\n' "$fex_rc" | tee receipts/final-matrix.txt
+          cat receipts/fex.stderr
+      - name: Upload trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buffer-object-host-trace-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
