@@ -1,0 +1,114 @@
+name: Split Vulkan bridge exact FEX-2608 ARM64
+
+on:
+  push:
+    branches: [ci/split-vulkan-bridge-fex2608-20260814]
+    paths:
+      - .github/workflows/split-vulkan-bridge-fex2608-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  split-fex2608:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      FEX_SHA: e869aa644a16e4332cdc15c1ea0b4d13d482385d
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-split
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-customir-retirement
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Extract the already-green split-runtime experiment shell steps
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/split-vulkan-bridge-runtime-v2-arm64.yml')
+          source = workflow.read_text().splitlines()
+          scripts = []
+          i = 0
+          while i < len(source):
+              line = source[i]
+              stripped = line.lstrip()
+              if stripped != 'run: |':
+                  i += 1
+                  continue
+              base = len(line) - len(stripped)
+              block = []
+              i += 1
+              while i < len(source):
+                  row = source[i]
+                  if row.strip() and len(row) - len(row.lstrip()) <= base:
+                      break
+                  if not row.strip():
+                      block.append('')
+                  else:
+                      block.append(row[base + 2:])
+                  i += 1
+              scripts.append('\n'.join(block) + '\n')
+
+          if len(scripts) < 5:
+              raise SystemExit(f'expected split-runtime shell steps, got {len(scripts)}')
+          out = Path('/tmp/split-fex2608-steps')
+          out.mkdir(exist_ok=True)
+          for n, script in enumerate(scripts, 1):
+              p = out / f'{n:02d}.sh'
+              p.write_text('#!/usr/bin/env bash\n' + script)
+              p.chmod(0o755)
+              print(f'EXTRACTED {p} bytes={p.stat().st_size}')
+          PY
+
+      - name: Execute identical split-runtime experiment against FEX-2608 source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          for step in /tmp/split-fex2608-steps/*.sh; do
+            echo "===== EXECUTING $step ON FEX_SHA=$FEX_SHA ====="
+            "$step"
+          done
+
+      - name: Assert exact-version moved-generation split result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f "$R/reload.exit"
+          test "$(cat "$R/reload.exit")" = 0
+          grep -q 'SPLIT_VULKAN_BRIDGE_PASS' "$R/reload.err"
+          grep -q 'PROBE second-open' "$R/reload.err"
+          grep -q 'PROBE after-old-pfn' "$R/reload.err"
+          printf 'exact_fex_sha=%s\n' "$FEX_SHA" | tee "$R/exact-version.txt"
+          echo FEX2608_SPLIT_VULKAN_BRIDGE_PASS
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: split-vulkan-bridge-fex2608-${{ github.run_id }}
+          path: receipts-split
+          retention-days: 30
