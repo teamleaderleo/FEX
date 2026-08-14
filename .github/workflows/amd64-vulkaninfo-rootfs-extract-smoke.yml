@@ -1,0 +1,42 @@
+name: amd64 vulkaninfo rootfs extract smoke
+
+on:
+  push:
+    branches: [ci/thunk-callback-descriptor-20260814]
+    paths:
+      - .github/workflows/amd64-vulkaninfo-rootfs-extract-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mmdebstrap
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mmdebstrap file
+      - name: Extract foreign amd64 rootfs without executing guest scripts
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /tmp/rootfs-amd64
+          sudo mmdebstrap \
+            --variant=extract \
+            --architectures=amd64 \
+            --components=main,universe \
+            --include=vulkan-tools,libx11-6,ca-certificates \
+            noble /tmp/rootfs-amd64 \
+            'deb http://archive.ubuntu.com/ubuntu noble main universe' \
+            'deb http://archive.ubuntu.com/ubuntu noble-updates main universe' \
+            'deb http://security.ubuntu.com/ubuntu noble-security main universe'
+          file /tmp/rootfs-amd64/usr/bin/vulkaninfo
+          test -x /tmp/rootfs-amd64/usr/bin/vulkaninfo
+          test -x /tmp/rootfs-amd64/lib64/ld-linux-x86-64.so.2 -o -x /tmp/rootfs-amd64/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+          ldd_status=0
+          ls -l /tmp/rootfs-amd64/usr/bin/vulkaninfo
+          find /tmp/rootfs-amd64/usr/lib/x86_64-linux-gnu -maxdepth 1 -name 'libX11.so.6*' -o -name 'libvulkan.so.1*' | sort
