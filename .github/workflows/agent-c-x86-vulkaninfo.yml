@@ -94,7 +94,7 @@ jobs:
             noble "$ROOTFS" http://archive.ubuntu.com/ubuntu \
             >"$R/debootstrap.log" 2>&1
 
-          find "$ROOTFS" -type f -name '*.deb' -print | sort | tee "$R/rootfs-debs.txt"
+          sudo find "$ROOTFS" -type f -name '*.deb' -print | sort | tee "$R/rootfs-debs.txt"
           test -s "$R/rootfs-debs.txt"
 
           # Foreign debootstrap already unpacked the base set. Re-extracting those payloads
