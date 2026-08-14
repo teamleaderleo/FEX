@@ -271,6 +271,13 @@ public:
           // This also handles the MREMAP_DONTUNMAP case
           TM.InvalidateGuestCodeRange(Thread, OldAddress, OldSize);
         }
+        if (NewSize != 0) {
+          // A fixed remap may replace executable code at the destination.
+          // Drop any translation cached for that numeric guest address before
+          // the new mapping executes there. For a kernel-chosen free target,
+          // this invalidation is harmless.
+          TM.InvalidateGuestCodeRange(Thread, NewAddress, NewSize);
+        }
       } else {
         // If mapping shrunk, flush the unmapped region
         if (OldSize > NewSize) {
