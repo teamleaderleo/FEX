@@ -31,19 +31,20 @@ s, malloc_count = re.subn(
     '', s, count=1, flags=re.S)
 assert malloc_count == 1, malloc_count
 
-# Replace fixed X11 unpacker and allocator targets in OnInit. These exact forms
-# are stable in the FEX product source used by this diagnostic.
+# Replace fixed X11 unpackers plus both allocator executable addresses in OnInit.
+# These exact forms are stable in the FEX product source used by this diagnostic.
 replacements = {
     '(uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack': 'fex_gl_bridge_xsync_unpacker()',
     '(uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack': 'fex_gl_bridge_xgetvisualinfo_unpacker()',
     '(uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack': 'fex_gl_bridge_xdisplaystring_unpacker()',
+    '(uintptr_t)CallbackUnpack<decltype(malloc_wrapper)>::Unpack': 'fex_gl_bridge_malloc_unpacker()',
     '(uintptr_t)malloc_wrapper': '(uintptr_t)&FEXGLBridgeMalloc',
 }
 for old, new in replacements.items():
     assert s.count(old) == 1, (old, s.count(old))
     s = s.replace(old, new, 1)
 
-decls = '''extern "C" void* FEXGLBridgeMalloc(size_t size);\nextern "C" uintptr_t fex_gl_bridge_xsync_unpacker();\nextern "C" uintptr_t fex_gl_bridge_xgetvisualinfo_unpacker();\nextern "C" uintptr_t fex_gl_bridge_xdisplaystring_unpacker();\n\n'''
+decls = '''extern "C" void* FEXGLBridgeMalloc(size_t size);\nextern "C" uintptr_t fex_gl_bridge_malloc_unpacker();\nextern "C" uintptr_t fex_gl_bridge_xsync_unpacker();\nextern "C" uintptr_t fex_gl_bridge_xgetvisualinfo_unpacker();\nextern "C" uintptr_t fex_gl_bridge_xdisplaystring_unpacker();\n\n'''
 oninit = 'void OnInit() {'
 assert s.count(oninit) == 1, s.count(oninit)
 s = s.replace(oninit, decls + oninit, 1)
@@ -70,6 +71,9 @@ bridge.mkdir(exist_ok=True)
 
 extern "C" void* FEXGLBridgeMalloc(size_t size) {
   return std::malloc(size);
+}
+extern "C" uintptr_t fex_gl_bridge_malloc_unpacker() {
+  return reinterpret_cast<uintptr_t>(&CallbackUnpack<decltype(FEXGLBridgeMalloc)>::Unpack);
 }
 extern "C" uintptr_t fex_gl_bridge_xsync_unpacker() {
   return reinterpret_cast<uintptr_t>(&CallbackUnpack<decltype(XSync)>::Unpack);
