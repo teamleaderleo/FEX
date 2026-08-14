@@ -75,14 +75,14 @@ jobs:
 
           local_old = '''    for (const auto& CodePage : Entry.CodePages) {
               CachedCodePages[CodePage >> 12].insert(Address);
-            }'''
+            }'''.replace('              ', '      ')
           local_new = '''    if (Entry.CodePages.empty()) {
               CachedCodePages[Address >> 12].insert(Address);
             } else {
               for (const auto& CodePage : Entry.CodePages) {
                 CachedCodePages[CodePage >> 12].insert(Address);
               }
-            }'''
+            }'''.replace('              ', '      ')
           if s.count(local_old) != 1:
               raise SystemExit(f'local CacheBlockMapping block count={s.count(local_old)}')
           s = s.replace(local_old, local_new, 1)
