@@ -1,0 +1,34 @@
+name: Vulkan allocator surface audit
+on:
+  workflow_dispatch:
+  push:
+    branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
+    paths:
+      - .github/workflows/linux-fieldwork-vulkan-allocator-audit.yml
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: 71afe476751deac24adabd1adb575fd2337b6e0a
+          path: product
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: 4ab389cfae105a307b809e0df6e9b7e2d7b5eccc
+          path: fieldwork
+      - name: Audit allocator-taking Vulkan commands
+        run: |
+          set -euxo pipefail
+          python3 fieldwork/investigations/fex-vulkan-thunk-lifecycle/audit_vulkan_allocator_surface.py product | tee allocator-surface.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-allocator-surface-${{ github.run_id }}
+          path: allocator-surface.txt
+          retention-days: 30
