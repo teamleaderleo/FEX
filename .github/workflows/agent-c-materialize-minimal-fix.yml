@@ -1,4 +1,4 @@
-name: Agent C amend minimal callback routing fix
+name: Agent C materialize native-first proc availability
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  amend:
+  materialize:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -20,38 +20,122 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fix source indentation and amend commit
+      - name: Apply native-first proc availability semantics
         shell: bash
         run: |
           set -euxo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('ThunkLibs/libvulkan/Host.cpp')
-          lines = p.read_text().splitlines()
-          replacements = {
-              '  return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;': '    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;',
-              '} else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {': '  } else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {',
-              '  return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;': '    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;',
-              '} else if (a_1 == "vkCreateDebugUtilsMessengerEXT"sv) {': '  } else if (a_1 == "vkCreateDebugUtilsMessengerEXT"sv) {',
-              '  return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugUtilsMessengerEXT;': '    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugUtilsMessengerEXT;',
-              '} else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {': '  } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {',
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected one match, found {count}')
+              return text.replace(old, new, 1)
+
+          guest = Path('ThunkLibs/libvulkan/Guest.cpp')
+          s = guest.read_text()
+          old = (
+              'PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {\n'
+              '  if (a_1 == std::string_view {"vkGetDeviceProcAddr"}) {\n'
+              '    return (PFN_vkVoidFunction)vkGetDeviceProcAddr;\n'
+              '  } else {\n'
+              '    auto Ret = fexfn_pack_vkGetInstanceProcAddr(a_0, a_1);\n'
+              '    if (!Ret) {\n'
+              '      return nullptr;\n'
+              '    }\n'
+              '    return MakeGuestCallable(__FUNCTION__, Ret, a_1);\n'
+              '  }\n'
+              '}\n'
+          )
+          new = (
+              'PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {\n'
+              '  auto Ret = fexfn_pack_vkGetInstanceProcAddr(a_0, a_1);\n'
+              '  if (!Ret) {\n'
+              '    return nullptr;\n'
+              '  }\n'
+              '\n'
+              '  if (a_1 == std::string_view {"vkGetInstanceProcAddr"}) {\n'
+              '    return (PFN_vkVoidFunction)vkGetInstanceProcAddr;\n'
+              '  }\n'
+              '  if (a_1 == std::string_view {"vkGetDeviceProcAddr"}) {\n'
+              '    return (PFN_vkVoidFunction)vkGetDeviceProcAddr;\n'
+              '  }\n'
+              '\n'
+              '  return MakeGuestCallable(__FUNCTION__, Ret, a_1);\n'
+              '}\n'
+          )
+          guest.write_text(replace_once(s, old, new, 'guest GIPA'))
+
+          host = Path('ThunkLibs/libvulkan/Host.cpp')
+          s = host.read_text()
+          old = (
+              'static PFN_vkVoidFunction FEXFN_IMPL(vkGetDeviceProcAddr)(VkDevice a_0, const char* a_1) {\n'
+              '  // Just return the host facing function pointer\n'
+              '  // The guest will handle mapping if this exists\n'
+              '\n'
+              '  // Check for functions with custom implementations first\n'
+              '  if (auto ptr = LookupCustomVulkanFunction(a_1)) {\n'
+              '    return ptr;\n'
+              '  }\n'
+              '\n'
+              '  return LDR_PTR(vkGetDeviceProcAddr)(a_0, a_1);\n'
+              '}\n'
+          )
+          new = (
+              'static PFN_vkVoidFunction FEXFN_IMPL(vkGetDeviceProcAddr)(VkDevice a_0, const char* a_1) {\n'
+              '  // Just return the host facing function pointer\n'
+              '  // The guest will handle mapping if this exists\n'
+              '\n'
+              '  auto Native = LDR_PTR(vkGetDeviceProcAddr)(a_0, a_1);\n'
+              '  if (!Native) {\n'
+              '    return nullptr;\n'
+              '  }\n'
+              '\n'
+              '  if (auto ptr = LookupCustomVulkanFunction(a_1)) {\n'
+              '    return ptr;\n'
+              '  }\n'
+              '\n'
+              '  return Native;\n'
+              '}\n'
+          )
+          s = replace_once(s, old, new, 'host GDPA')
+          old = (
+              '  // Check for functions with custom implementations first\n'
+              '  if (auto ptr = LookupCustomVulkanFunction(a_1)) {\n'
+          )
+          new = (
+              '  auto Native = LDR_PTR(vkGetInstanceProcAddr)(a_0, a_1);\n'
+              '  if (!Native) {\n'
+              '    return nullptr;\n'
+              '  }\n'
+              '\n'
+              '  if (auto ptr = LookupCustomVulkanFunction(a_1)) {\n'
+          )
+          s = replace_once(s, old, new, 'host GIPA head')
+          substitutions = {
+              '(void*&)LDR_PTR(vkGetRandROutputDisplayEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkGetRandROutputDisplayEXT");': '(void*&)LDR_PTR(vkGetRandROutputDisplayEXT) = (void*)Native;',
+              '(void*&)LDR_PTR(vkAcquireXlibDisplayEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkAcquireXlibDisplayEXT");': '(void*&)LDR_PTR(vkAcquireXlibDisplayEXT) = (void*)Native;',
+              '(void*&)LDR_PTR(vkGetPhysicalDeviceXcbPresentationSupportKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, XcbPresent);': '(void*&)LDR_PTR(vkGetPhysicalDeviceXcbPresentationSupportKHR) = (void*)Native;',
+              '(void*&)LDR_PTR(vkGetPhysicalDeviceXlibPresentationSupportKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, XlibPresent);': '(void*&)LDR_PTR(vkGetPhysicalDeviceXlibPresentationSupportKHR) = (void*)Native;',
           }
-          seen = {k: 0 for k in replacements}
-          out = []
-          for line in lines:
-              if line in replacements:
-                  seen[line] += 1
-                  line = replacements[line]
-              out.append(line)
-          missing = {k: v for k, v in seen.items() if v != 1}
-          if missing:
-              raise SystemExit(f'unexpected callback formatting matches: {missing}')
-          p.write_text('\n'.join(out) + '\n')
+          for old_line, new_line in substitutions.items():
+              s = replace_once(s, old_line, new_line, old_line.split('=')[0].strip())
+          s = replace_once(s,
+              '  return LDR_PTR(vkGetInstanceProcAddr)(a_0, a_1);\n}\n\n#ifdef IS_32BIT_THUNK\n',
+              '  return Native;\n}\n\n#ifdef IS_32BIT_THUNK\n',
+              'host GIPA tail')
+          host.write_text(s)
           PY
           git diff --check
-          git diff -- ThunkLibs/libvulkan/Host.cpp
+          git diff -- ThunkLibs/libvulkan/Guest.cpp ThunkLibs/libvulkan/Host.cpp
+
+      - name: Commit proc availability semantics
+        shell: bash
+        run: |
+          set -euxo pipefail
           git config user.name 'Agent C internal fieldwork'
           git config user.email 'actions@users.noreply.github.com'
-          git add ThunkLibs/libvulkan/Host.cpp
-          git commit --amend --no-edit
-          git push --force-with-lease origin HEAD:fix/vulkan-callback-proc-routing
+          git add ThunkLibs/libvulkan/Guest.cpp ThunkLibs/libvulkan/Host.cpp
+          git commit -m 'ThunkLibs/vulkan: preserve native proc availability'
+          git push origin HEAD:fix/vulkan-callback-proc-routing
