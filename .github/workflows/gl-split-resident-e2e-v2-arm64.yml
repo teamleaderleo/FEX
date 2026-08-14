@@ -56,12 +56,12 @@ jobs:
                       block.append(row[base + 2:])
                   i += 1
               text = '\n'.join(block) + '\n'
-              # The first run failed only because the tiny generated C probe put
-              # two if-statements on one line under -Werror. Keep the source and
-              # experiment identical; demote only this cosmetic GCC warning.
+              # The original experiment's tiny C probe has two same-line ifs.
+              # Change only that probe compilation policy; all FEX/GL source,
+              # runtime assertions, and ownership changes remain identical.
               text = text.replace(
-                  '-Wall -Wextra -Werror \\\n',
-                  '-Wall -Wextra -Werror -Wno-error=misleading-indentation \\\n')
+                  'x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/glprobe.c',
+                  'x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -Wno-error=misleading-indentation /tmp/glprobe.c')
               scripts.append(text)
 
           if len(scripts) < 5:
