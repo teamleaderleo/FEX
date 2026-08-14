@@ -2,7 +2,7 @@ name: CUDA direct role bridge retained callback
 
 on:
   push:
-    branches: [diagnostic/cuda-direct-role-bridge-20260814]
+    branches: [diagnostic/cuda-direct-role-bridge-f3ab-20260814]
     paths:
       - .github/fieldwork/apply_thunkgen_guest_bridge_output.py
       - .github/fieldwork/apply_thunkgen_bridge_roles.py
