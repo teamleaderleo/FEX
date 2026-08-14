@@ -2,95 +2,71 @@
 from pathlib import Path
 import sys
 
-root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('.')
-path = root / 'FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp'
-s = path.read_text()
 
-include_anchor = '#include <cstring>\n'
-if '#include <cstdlib>\n' not in s:
-    if include_anchor not in s:
-        raise SystemExit('missing cstring include anchor')
-    s = s.replace(include_anchor, include_anchor + '#include <cstdlib>\n', 1)
+def main() -> None:
+    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('.')
+    path = root / 'FEXCore/Source/Interface/Core/JIT/JIT.cpp'
+    s = path.read_text()
 
-sleep_anchor = '''static void SleepThread(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::CpuStateFrame* Frame) {
-  CTX->SyscallHandler->SleepThread(CTX, Frame);
-}
+    inc = '#include <cstdio>\n#include <cstring>\n#include <unistd.h>\n'
+    repl_inc = '#include <atomic>\n#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <unistd.h>\n'
+    if inc not in s:
+        raise SystemExit('JIT include anchor missing')
+    s = s.replace(inc, repl_inc, 1)
 
-'''
-helper = r'''static constexpr uintptr_t DiagnosticInflightSyntheticH = 0x0000700000020000ULL;
+    function_anchor = '''uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {\n'''
+    helper = r'''static constexpr uintptr_t DiagnosticInflightSyntheticH = 0x0000700000020000ULL;
 static constexpr const char* DiagnosticInflightArm = "/tmp/fex-thunk-inflight-arm";
 static constexpr const char* DiagnosticInflightSelected = "/tmp/fex-thunk-inflight-selected";
 static constexpr const char* DiagnosticInflightResume = "/tmp/fex-thunk-inflight-resume";
 
-static uintptr_t DiagnosticPauseSelectedThunk(uintptr_t HostBlock) {
-  if (::access(DiagnosticInflightArm, F_OK) != 0) {
-    return HostBlock;
+static void DiagnosticPauseSelectedThunk(uintptr_t GuestRip, uintptr_t HostCode) {
+  if (GuestRip != DiagnosticInflightSyntheticH || ::access(DiagnosticInflightArm, F_OK) != 0) {
+    return;
   }
 
-  const int FD = ::open(DiagnosticInflightSelected, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-  if (FD >= 0) {
-    static constexpr char Marker[] = "selected\n";
-    (void)::write(FD, Marker, sizeof(Marker) - 1);
-    (void)::close(FD);
+  static std::atomic_flag Claimed = ATOMIC_FLAG_INIT;
+  if (Claimed.test_and_set(std::memory_order_acq_rel)) {
+    return;
   }
 
-  fprintf(stderr, "DIAG_INFLIGHT_SELECTED H=%#lx block=%#lx\n", DiagnosticInflightSyntheticH, HostBlock);
-  for (size_t I = 0; I < 30000; ++I) {
-    if (::access(DiagnosticInflightResume, F_OK) == 0) {
-      fprintf(stderr, "DIAG_INFLIGHT_RESUME H=%#lx block=%#lx\n", DiagnosticInflightSyntheticH, HostBlock);
-      return HostBlock;
-    }
+  FILE* Selected = std::fopen(DiagnosticInflightSelected, "w");
+  if (!Selected) {
+    std::fprintf(stderr, "DIAG_INFLIGHT_MARKER_FAIL H=%#lx\n", GuestRip);
+    std::_Exit(123);
+  }
+  std::fprintf(Selected, "%lx %lx\n", GuestRip, HostCode);
+  std::fclose(Selected);
+
+  std::fprintf(stderr, "DIAG_INFLIGHT_SELECTED H=%#lx block=%#lx\n", GuestRip, HostCode);
+  std::fflush(stderr);
+  while (::access(DiagnosticInflightResume, F_OK) != 0) {
     ::usleep(1000);
   }
-
-  fprintf(stderr, "DIAG_INFLIGHT_TIMEOUT H=%#lx block=%#lx\n", DiagnosticInflightSyntheticH, HostBlock);
-  _exit(124);
+  std::fprintf(stderr, "DIAG_INFLIGHT_RESUME H=%#lx block=%#lx\n", GuestRip, HostCode);
+  std::fflush(stderr);
 }
 
 '''
-if 'DiagnosticPauseSelectedThunk' not in s:
-    if sleep_anchor not in s:
-        raise SystemExit('missing SleepThread anchor')
-    s = s.replace(sleep_anchor, sleep_anchor + helper, 1)
+    if function_anchor not in s:
+        raise SystemExit('ExitFunctionLink anchor missing')
+    s = s.replace(function_anchor, helper + function_anchor, 1)
 
-jump_anchor = '''        // Jump to the block
-        br(TMP4);
-'''
-injection = r'''        // Diagnostic-only deterministic race point. The lookup cache has already
-        // yielded a compiled block for H, but the branch has not happened yet.
-        // A second guest thread can now retire H and replace its guest owner.
-        if (std::getenv("FEX_DIAG_INFLIGHT_SELECT")) {
-          ARMEmitter::ForwardLabel l_NotDiagnosticInflightH;
-          LoadConstant(ARMEmitter::Size::i64Bit, TMP1, DiagnosticInflightSyntheticH);
-          sub(ARMEmitter::Size::i64Bit, TMP1, RipReg, TMP1);
-          (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &l_NotDiagnosticInflightH);
+    lock_anchor = '''  // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking\n  auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);\n\n  // Lock here is necessary to prevent simultaneous linking and delinking\n'''
+    lock_repl = '''  {\n    // Keep selection identical to the product path. The diagnostic pause starts\n    // after lookup/code-invalidation guards are released so another guest thread\n    // can retire H while this thread retains the selected HostCode pointer.\n    auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);\n\n    // Lock here is necessary to prevent simultaneous linking and delinking\n'''
+    if lock_anchor not in s:
+        raise SystemExit('ExitFunctionLink invalidation-lock anchor missing')
+    s = s.replace(lock_anchor, lock_repl, 1)
 
-          SpillStaticRegs(TMP1);
-          mov(ARMEmitter::XReg::x0, TMP4);
-          LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1,
-                       reinterpret_cast<uintptr_t>(&DiagnosticPauseSelectedThunk));
-          if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
-            GenerateIndirectRuntimeCall<uintptr_t, uintptr_t>(ARMEmitter::Reg::r1);
-          } else {
-            blr(ARMEmitter::Reg::r1);
-          }
+    tail_anchor = '''    Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);\n  }\n\n  return HostCode;\n}\n'''
+    tail_repl = '''    Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);\n    }\n  } // release lookup and code-invalidation guards before forcing the race\n\n  if (std::getenv("FEX_DIAG_INFLIGHT_SELECT")) {\n    DiagnosticPauseSelectedThunk(GuestRip, HostCode);\n  }\n  return HostCode;\n}\n'''
+    if tail_anchor not in s:
+        raise SystemExit('ExitFunctionLink tail anchor missing')
+    s = s.replace(tail_anchor, tail_repl, 1)
 
-          if (!TMP_ABIARGS) {
-            mov(TMP1, ARMEmitter::XReg::x0);
-          }
-          FillStaticRegs();
-          br(TMP1);
+    path.write_text(s)
+    print(path)
 
-          (void)Bind(&l_NotDiagnosticInflightH);
-        }
 
-        // Jump to the block
-        br(TMP4);
-'''
-if 'l_NotDiagnosticInflightH' not in s:
-    if jump_anchor not in s:
-        raise SystemExit('missing dispatcher jump anchor')
-    s = s.replace(jump_anchor, injection, 1)
-
-path.write_text(s)
-print(path)
+if __name__ == '__main__':
+    main()
