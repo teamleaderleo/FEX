@@ -62,6 +62,7 @@ print(f"extracted {len(names)} GL internal symbols")
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <string_view>
 #include <unordered_map>
@@ -90,6 +91,7 @@ uintptr_t FEXGLBridgeLookup(const char* name) {
 // GL's host thunk stores a GuestMalloc callback for process-long use. The
 // target as well as the unpacker therefore belong in the resident companion.
 static void* ResidentMalloc(size_t size) {
+  fprintf(stderr, "GL_BRIDGE_MALLOC size=%zu\n", size);
   return malloc(size);
 }
 
