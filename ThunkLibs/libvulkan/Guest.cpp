@@ -23,6 +23,7 @@ $end_info$
 #include "thunkgen_guest_libvulkan.inl"
 
 extern "C" uintptr_t FEXVulkanBridgeEnumerateInstanceVersionInvoker();
+extern "C" uintptr_t FEXVulkanBridgeXlibPresentationSupportInvoker();
 extern "C" uintptr_t FEXVulkanBridgeXSyncUnpacker();
 extern "C" uintptr_t FEXVulkanBridgeXGetVisualInfoUnpacker();
 extern "C" uintptr_t FEXVulkanBridgeXDisplayStringUnpacker();
@@ -35,10 +36,11 @@ const std::unordered_map<std::string_view, uintptr_t /* guest function address *
 #define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(GetCallerForHostFunction(name));
   std::unordered_map<std::string_view, uintptr_t> Ret;
   FOREACH_internal_SYMBOL(PAIR);
-  // This one signature is deliberately moved out of the unloadable wrapper for
-  // the generated split-bridge discriminator. Other dynamic Vulkan signatures
-  // remain wrapper-owned in this experiment.
+  // These selected signatures are deliberately moved out of the unloadable
+  // wrapper for the generated split-bridge discriminator. Other dynamic Vulkan
+  // signatures remain wrapper-owned in this experiment.
   Ret["vkEnumerateInstanceVersion"] = FEXVulkanBridgeEnumerateInstanceVersionInvoker();
+  Ret["vkGetPhysicalDeviceXlibPresentationSupportKHR"] = FEXVulkanBridgeXlibPresentationSupportInvoker();
   return Ret;
 #undef PAIR
 });
