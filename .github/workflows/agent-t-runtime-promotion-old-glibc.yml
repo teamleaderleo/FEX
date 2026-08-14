@@ -1,0 +1,83 @@
+name: Agent T runtime NODELETE promotion old glibc
+
+on:
+  push:
+    branches: [ci/agent-t-runtime-promotion-old-glibc-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  promotion-old-glibc:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu:20.04, ubuntu:22.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test promotion in ${{ matrix.image }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat >/tmp/run-in-container.sh <<'EOS'
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update >/dev/null
+          apt-get install -y --no-install-recommends gcc libc6-dev binutils >/dev/null
+          ldd --version | head -n1
+          cat >/tmp/promote.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <link.h>
+          static int value;
+          __attribute__((visibility("default"))) int probe(void){ return ++value; }
+          __attribute__((constructor)) static void init(void){
+            Dl_info info={0};
+            if(!dladdr((void*)&init,&info) || !info.dli_fname) return;
+            void*self=dlopen(info.dli_fname,RTLD_NOW|RTLD_NOLOAD);
+            if(!self) return;
+            Lmid_t lmid=(Lmid_t)-1;
+            if(dlinfo(self,RTLD_DI_LMID,&lmid)==0 && lmid==LM_ID_BASE){
+              void*pin=dlopen(info.dli_fname,RTLD_NOW|RTLD_NOLOAD|RTLD_NODELETE);
+              if(pin) dlclose(pin);
+            }
+            dlclose(self);
+          }
+          EOF
+          gcc -shared -fPIC -O2 /tmp/promote.c -ldl -o /tmp/libpromote.so
+          ! readelf -d /tmp/libpromote.so | grep -q NODELETE
+          cat >/tmp/test.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <link.h>
+          #include <stdio.h>
+          typedef int(*fn_t)(void);
+          int main(void){
+            void*h=dlopen("/tmp/libpromote.so",RTLD_NOW|RTLD_LOCAL); if(!h){puts(dlerror());return 2;}
+            fn_t f=(fn_t)dlsym(h,"probe"); if(!f)return 3;
+            if(f()!=1)return 4;
+            if(dlclose(h))return 5;
+            if(f()!=2)return 6;
+            void*noload=dlopen("/tmp/libpromote.so",RTLD_NOW|RTLD_NOLOAD); if(!noload)return 7; dlclose(noload);
+            int ok=0;
+            for(int i=0;i<24;i++){
+              void*n=dlmopen(LM_ID_NEWLM,"/tmp/libpromote.so",RTLD_NOW|RTLD_LOCAL);
+              if(!n){fprintf(stderr,"NEWLM_FAIL i=%d %s\n",i,dlerror());break;}
+              fn_t nf=(fn_t)dlsym(n,"probe"); if(!nf||nf()!=1)return 8;
+              ++ok; if(dlclose(n))return 9;
+            }
+            fprintf(stderr,"OLD_GLIBC_PROMOTION_OK newlm=%d\n",ok);
+            if(ok!=24)return 10;
+            return 0;
+          }
+          EOF
+          gcc -O2 -Wall -Wextra -Werror /tmp/test.c -ldl -o /tmp/test
+          /tmp/test
+          EOS
+          chmod +x /tmp/run-in-container.sh
+          docker run --rm --platform linux/arm64 \
+            -v /tmp/run-in-container.sh:/run.sh:ro \
+            '${{ matrix.image }}' bash /run.sh
