@@ -1,0 +1,46 @@
+name: Agent C replay validated Vulkan candidates on current main
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-replay-vulkan-candidates-current-main.yml]
+
+permissions:
+  contents: write
+
+env:
+  BASE_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+  TARGET_BRANCH: fix/vulkan-callback-routing-current-main
+  ROUTE_SHA: 28a3a5bfbd31662bfc4bd316ada39037aebf4165
+  AVAIL_SHA: c011366706eaf65a00380003989b3a10811212b6
+  PNEXT_SHA: 27bf25d9fd2f918c577e302cda56bb733cdd04dd
+
+jobs:
+  replay:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Replay exact validated commits
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          git config user.name 'Leo'
+          git config user.email 'cheerleaderleo@outlook.com'
+          git cherry-pick "$ROUTE_SHA"
+          git cherry-pick "$AVAIL_SHA"
+          git cherry-pick "$PNEXT_SHA"
+          git diff --check "$BASE_SHA"..HEAD
+          git diff --name-only "$BASE_SHA"..HEAD | tee /tmp/files.txt
+          test "$(wc -l < /tmp/files.txt)" -eq 2
+          grep -Fxq 'ThunkLibs/libvulkan/Guest.cpp' /tmp/files.txt
+          grep -Fxq 'ThunkLibs/libvulkan/Host.cpp' /tmp/files.txt
+          git log --oneline --decorate -4
+          git push origin HEAD:"$TARGET_BRANCH"
+          git rev-parse HEAD | tee /tmp/head.txt
