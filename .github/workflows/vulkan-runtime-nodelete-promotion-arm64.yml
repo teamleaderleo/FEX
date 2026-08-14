@@ -1,0 +1,157 @@
+name: Vulkan runtime NODELETE promotion
+
+on:
+  push:
+    branches: [diagnostic/vulkan-nodelete-promotion]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  promotion:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            mesa-vulkan-drivers binutils
+
+      - name: Build FEX and Vulkan thunks
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ >"$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" \
+            >"$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" >"$R/build-guest.log" 2>&1
+          readelf -d guest/libvulkan-guest.so | tee "$R/guest-dynamic.txt"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/guest-dynamic.txt"
+
+      - name: Build x86 rootfs and probe
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 >/dev/null
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void*d,int x){(void)d;(void)x;return 0;}
+          void *XGetVisualInfo(void*d,long m,void*t,int*c){(void)d;(void)m;(void)t;if(c)*c=0;return 0;}
+          char *XDisplayString(void*d){(void)d;return ":0";}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libX11.so.6 \
+            /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat >/tmp/probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <link.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          typedef void (*PFN)(void);
+          typedef PFN (*GIPA)(void*, const char*);
+          typedef int32_t (*ENUMVER)(uint32_t*);
+          static int mapped(void *p) {
+            FILE *f=fopen("/proc/self/maps","r"); char line[512]; uintptr_t x=(uintptr_t)p;
+            if(!f)return -1;
+            while(fgets(line,sizeof(line),f)){unsigned long a,b;if(sscanf(line,"%lx-%lx",&a,&b)==2&&x>=a&&x<b){fclose(f);return 1;}}
+            fclose(f);return 0;
+          }
+          int main(void) {
+            void *base=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);
+            if(!base){fprintf(stderr,"BASE_OPEN_FAIL %s\n",dlerror());return 2;}
+            GIPA g0=(GIPA)dlsym(base,"vkGetInstanceProcAddr");
+            ENUMVER p0=(ENUMVER)g0(0,"vkEnumerateInstanceVersion"); uint32_t v0=0,v1=0,v2=0;
+            if(!g0||!p0||p0(&v0)!=0)return 3;
+            fprintf(stderr,"BASE_OPEN gipa=%p H=%p version=%u\n",(void*)g0,(void*)p0,v0);
+            if(dlclose(base))return 4;
+            if(mapped((void*)g0)!=1||p0(&v1)!=0||v1!=v0)return 5;
+            fprintf(stderr,"BASE_PROMOTION_OK gipa_mapped=1 H=%p\n",(void*)p0);
+
+            void *ns=dlmopen(LM_ID_NEWLM,"libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);
+            if(!ns){fprintf(stderr,"NEWLM_OPEN_FAIL %s\n",dlerror());return 6;}
+            GIPA g1=(GIPA)dlsym(ns,"vkGetInstanceProcAddr");
+            ENUMVER p1=(ENUMVER)g1(0,"vkEnumerateInstanceVersion");
+            if(!g1||!p1||p1(&v2)!=0||v2!=v0)return 7;
+            fprintf(stderr,"NEWLM_OPEN gipa=%p H=%p same_H=%d\n",(void*)g1,(void*)p1,p1==p0);
+            if(dlclose(ns))return 8;
+            int ns_mapped=mapped((void*)g1);
+            fprintf(stderr,"NEWLM_AFTER_CLOSE gipa_mapped=%d\n",ns_mapped);
+            if(ns_mapped!=0)return 9;
+
+            fprintf(stderr,"BASE_RECALL_BEGIN H=%p\n",(void*)p0);
+            uint32_t after=0; int32_t r=p0(&after);
+            fprintf(stderr,"BASE_RECALL_RETURN result=%d version=%u\n",r,after);
+            if(r!=0||after!=v0)return 10;
+            fprintf(stderr,"BASE_RECALL_SURVIVED\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/probe.c -ldl -o "$ROOTFS/opt/fex-ci/probe"
+
+      - name: Run promotion adversary
+        run: |
+          set -uxo pipefail
+          LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" \
+            build/Bin/FEX /opt/fex-ci/probe >"$R/probe.out" 2>"$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          grep -q BASE_PROMOTION_OK "$R/probe.err"
+          grep -q 'NEWLM_AFTER_CLOSE gipa_mapped=0' "$R/probe.err"
+          if grep -q BASE_RECALL_SURVIVED "$R/probe.err"; then
+            echo PROMOTION_NEWLM_RESULT=survived | tee "$R/result.txt"
+            test "$rc" -eq 0
+          else
+            echo PROMOTION_NEWLM_RESULT=poisoned rc="$rc" | tee "$R/result.txt"
+            test "$rc" -ne 0
+          fi
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-runtime-nodelete-promotion-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
