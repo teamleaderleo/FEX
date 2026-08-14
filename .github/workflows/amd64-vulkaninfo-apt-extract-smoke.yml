@@ -1,0 +1,59 @@
+name: amd64 vulkaninfo apt extract smoke
+
+on:
+  push:
+    branches: [ci/thunk-callback-descriptor-20260814]
+    paths:
+      - .github/workflows/amd64-vulkaninfo-apt-extract-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve and download amd64 packages in isolated apt state
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates ubuntu-keyring file
+          rm -rf /tmp/apt-amd64 /tmp/rootfs-amd64
+          mkdir -p /tmp/apt-amd64/lists/partial /tmp/apt-amd64/cache/archives/partial /tmp/rootfs-amd64
+          : > /tmp/apt-amd64/status
+          cat >/tmp/apt-amd64/sources.list <<'EOF'
+          deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://archive.ubuntu.com/ubuntu noble main universe
+          deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://archive.ubuntu.com/ubuntu noble-updates main universe
+          deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://security.ubuntu.com/ubuntu noble-security main universe
+          EOF
+          APT_OPTS=(
+            -o APT::Architecture=amd64
+            -o APT::Architectures::=amd64
+            -o Dir::Etc::sourcelist=/tmp/apt-amd64/sources.list
+            -o Dir::Etc::sourceparts=-
+            -o Dir::State::lists=/tmp/apt-amd64/lists
+            -o Dir::State::status=/tmp/apt-amd64/status
+            -o Dir::Cache::archives=/tmp/apt-amd64/cache/archives
+            -o APT::Install-Recommends=false
+            -o APT::Install-Suggests=false
+          )
+          sudo apt-get "${APT_OPTS[@]}" update
+          sudo apt-get "${APT_OPTS[@]}" --download-only -y install vulkan-tools libx11-6 ca-certificates
+          find /tmp/apt-amd64/cache/archives -maxdepth 1 -name '*.deb' -printf '%f\n' | sort | tee /tmp/downloaded.txt
+          test -s /tmp/downloaded.txt
+      - name: Extract every resolved amd64 package without maintainer scripts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          for deb in /tmp/apt-amd64/cache/archives/*.deb; do
+            sudo dpkg-deb -x "$deb" /tmp/rootfs-amd64
+          done
+          file /tmp/rootfs-amd64/usr/bin/vulkaninfo
+          test -x /tmp/rootfs-amd64/usr/bin/vulkaninfo
+          test -x /tmp/rootfs-amd64/lib64/ld-linux-x86-64.so.2 -o -x /tmp/rootfs-amd64/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+          ls -l /tmp/rootfs-amd64/usr/bin/vulkaninfo
+          find /tmp/rootfs-amd64/usr/lib/x86_64-linux-gnu -maxdepth 1 \( -name 'libX11.so.6*' -o -name 'libvulkan.so.1*' -o -name 'libstdc++.so.6*' \) -print | sort
