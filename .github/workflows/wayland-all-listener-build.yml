@@ -1,0 +1,85 @@
+name: Wayland generalized resident listener bridge
+
+on:
+  push:
+    branches: [diagnostic/wayland-resident-listener-20260814]
+    paths:
+      - LinuxFieldwork/apply_wayland_resident_all_listeners.py
+      - .github/workflows/wayland-all-listener-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-all-listeners:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      R: ${{ github.workspace }}/wayland-all-receipts
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and transform
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev libwayland-dev binutils
+          python3 LinuxFieldwork/apply_wayland_resident_all_listeners.py | tee "$R/transform.txt"
+          git diff --check
+          git diff -- ThunkLibs/libwayland-client ThunkLibs/libwayland-client_bridge ThunkLibs/GuestLibs/CMakeLists.txt \
+            > "$R/product.diff"
+          grep -q 'applied to 40 typed allocation sites' "$R/transform.txt"
+
+      - name: Build thunkgen and Wayland pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" \
+            > "$R/build-thunkgen.log" 2>&1 || { tail -n 260 "$R/build-thunkgen.log"; exit 1; }
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target wayland-client-guest wayland-client_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 320 "$R/build-guest.log"; exit 1; }
+
+      - name: Inspect resident boundary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f guest/libwayland-client-guest.so
+          test -f guest/libfex-wayland-client-bridge.so
+          readelf -d guest/libwayland-client-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest/libfex-wayland-client-bridge.so | tee "$R/bridge.dynamic"
+          size guest/libwayland-client-guest.so guest/libfex-wayland-client-bridge.so | tee "$R/size.txt"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          grep -q 'NEEDED.*libfex-wayland-client-bridge.so' "$R/wrapper.dynamic"
+          echo WAYLAND_ALL_LISTENER_BRIDGE_BUILD_OK
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayland-all-listener-bridge-${{ github.run_id }}
+          path: wayland-all-receipts
+          retention-days: 30
