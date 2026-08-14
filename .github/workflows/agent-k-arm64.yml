@@ -51,6 +51,21 @@ jobs:
           readelf -d guest/liblifetime-guest.so > "$R/normal.dynamic.txt"
           if grep -q NODELETE "$R/normal.dynamic.txt"; then exit 41; fi
           make clean
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('guest/main.cpp')
+          lines = p.read_text().splitlines(keepends=True)
+          hits = [i for i, line in enumerate(lines) if 'old guest executable mapping survived dlclose' in line]
+          if len(hits) != 1:
+              raise SystemExit(f'expected one survival guard, found {len(hits)}')
+          i = hits[0]
+          lo = max(0, i - 3); hi = min(len(lines), i + 4)
+          Path('/home/runner/work/FEX/FEX/receipts/nodelete-guard-before.txt').write_text(''.join(lines[lo:hi]))
+          indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+          lines[i] = indent + '(void)0; // NODELETE diagnostic: mapping survival is expected; continue to retained-call probes.\n'
+          p.write_text(''.join(lines))
+          Path('/home/runner/work/FEX/FEX/receipts/nodelete-guard-after.txt').write_text(''.join(lines[lo:hi]))
+          PY
           make HOST_CXX=g++ GUEST_CXX='x86_64-linux-gnu-g++ -Wl,-z,nodelete'
           cp -a guest /tmp/nodelete/
           cp -a host /tmp/nodelete/
@@ -101,8 +116,8 @@ jobs:
           nodelete_rc=$?
           set -e
           printf 'normal=%s\nnodelete=%s\n' "$normal_rc" "$nodelete_rc" | tee "$R/exits.txt"
-          grep -E 'generation|after dlclose|mapped|unmapped|retained|callback|signal=|exit=' "$R/normal.stdout" > "$R/normal.key.txt" || true
-          grep -E 'generation|after dlclose|mapped|unmapped|retained|callback|signal=|exit=' "$R/nodelete.stdout" > "$R/nodelete.key.txt" || true
+          grep -E 'generation|after dlclose|mapped|unmapped|retained|stale|callback|signal=|exit=' "$R/normal.stdout" > "$R/normal.key.txt" || true
+          grep -E 'generation|after dlclose|mapped|unmapped|retained|stale|callback|signal=|exit=' "$R/nodelete.stdout" > "$R/nodelete.key.txt" || true
           echo '--- normal ---'; cat "$R/normal.key.txt"
           echo '--- nodelete ---'; cat "$R/nodelete.key.txt"
           exit 0
