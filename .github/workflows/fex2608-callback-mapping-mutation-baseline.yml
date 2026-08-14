@@ -64,6 +64,7 @@ jobs:
           mkdir -p /tmp/repro
           tar xf /tmp/repro.tar.gz -C /tmp/repro
           python3 .github/fieldwork/patch_callback_mapping_mutation_fixture.py /tmp/repro/fex-full-thunk-pair
+          sed -i '1{/^#define _GNU_SOURCE$/d;}' /tmp/repro/fex-full-thunk-pair/guest/callback_mapping_mutation.cpp
           (cd /tmp/repro/fex-full-thunk-pair && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) > "$R/build-fixture.log" 2>&1
           file /tmp/repro/fex-full-thunk-pair/guest/callback_mapping_mutation | tee "$R/fixture.file"
           grep -q 'ELF 64-bit.*x86-64' "$R/fixture.file"
