@@ -1,0 +1,336 @@
+name: Cross-library guest bridge runtime ARM64
+
+on:
+  push:
+    branches: [ci/crosslib-guest-bridge-runtime-20260814]
+    paths:
+      - .github/workflows/crosslib-guest-bridge-runtime-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  crosslib-bridge:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64-crosslib
+      R: ${{ github.workspace }}/receipts-crosslib
+      HOST: ${{ github.workspace }}/host-crosslib
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-customir-retirement
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and native controls
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST" bridge
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libglx-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers vulkan-tools \
+            xvfb x11-utils binutils
+          LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP"
+          echo "$LVP" > "$R/lvp.txt"
+          VK_DRIVER_FILES="$LVP" vulkaninfo --summary > "$R/native-vulkaninfo.out" 2> "$R/native-vulkaninfo.err"
+
+      - name: Build pristine FEX and host Vulkan plus GL thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEX FEXServer vulkan-host-64 GL-host-64 -- -j"$(nproc)" \
+            > "$R/build-host.log" 2>&1 || { tail -n 240 "$R/build-host.log"; exit 1; }
+          cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cp src/build/HostLibs_64/libGL-host.so "$HOST/libGL-host.so"
+
+      - name: Generate baseline Vulkan and GL guest thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S src/ThunkLibs/GuestLibs -B guest-baseline -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-baseline.log" 2>&1
+          cmake --build guest-baseline --target vulkan-guest GL-guest -- -j"$(nproc)" \
+            > "$R/build-baseline.log" 2>&1 || { tail -n 240 "$R/build-baseline.log"; exit 1; }
+          VGEN="$(find guest-baseline -name thunkgen_guest_libvulkan.inl -type f | head -n1)"
+          GGEN="$(find guest-baseline -name thunkgen_guest_libGL.inl -type f | head -n1)"
+          test -n "$VGEN"
+          test -n "$GGEN"
+          VGEN="$VGEN" GGEN="$GGEN" OUT="$R/crosslib-generated.inc" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          vlines = Path(os.environ['VGEN']).read_text().splitlines()
+          glines = Path(os.environ['GGEN']).read_text().splitlines()
+          vsig = 'unsigned int (struct VkPhysicalDevice_T *, unsigned int, struct _XDisplay *, unsigned long)'
+          gsig = 'unsigned int ()'
+          vm = [x for x in vlines if 'MAKE_CALLBACK_THUNK' in x and vsig in x]
+          gm = [x for x in glines if 'MAKE_CALLBACK_THUNK' in x and gsig in x]
+          if len(vm) != 1:
+              raise SystemExit(f'Vulkan Xlib-support generated thunk mismatch: {vm!r}')
+          if len(gm) != 1:
+              raise SystemExit(f'GL glGetError generated thunk mismatch: {gm!r}')
+          Path(os.environ['OUT']).write_text(vm[0] + '\n' + gm[0] + '\n')
+          print('VULKAN:', vm[0])
+          print('GL:', gm[0])
+          PY
+          cat "$R/crosslib-generated.inc"
+
+      - name: Build one process-resident guest bridge runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp "$R/crosslib-generated.inc" /tmp/crosslib-generated.inc
+          cat >/tmp/fex-guest-bridge.cpp <<'EOF'
+          #define VK_USE_64_BIT_PTR_DEFINES 0
+          #define VK_USE_PLATFORM_XLIB_XRANDR_EXT
+          #define VK_USE_PLATFORM_XLIB_KHR
+          #define VK_USE_PLATFORM_XCB_KHR
+          #define VK_USE_PLATFORM_WAYLAND_KHR
+          #define GL_GLEXT_PROTOTYPES 1
+          #define GLX_GLXEXT_PROTOTYPES 1
+          #include <vulkan/vulkan.h>
+          #include <GL/gl.h>
+          #include <GL/glx.h>
+          #include <X11/Xlib.h>
+          #include <X11/Xutil.h>
+          #include "common/Guest.h"
+          #include <cstdint>
+          #include "/tmp/crosslib-generated.inc"
+
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGuestBridgeVulkanXlibSupportInvoker() {
+            return reinterpret_cast<uintptr_t>(
+              GetCallerForHostFunction((PFN_vkGetPhysicalDeviceXlibPresentationSupportKHR)nullptr));
+          }
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGuestBridgeGLGetErrorInvoker() {
+            return reinterpret_cast<uintptr_t>(GetCallerForHostFunction((decltype(&glGetError))nullptr));
+          }
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGuestBridgeXSyncUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XSync)>::Unpack);
+          }
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGuestBridgeXGetVisualInfoUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
+          }
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGuestBridgeXDisplayStringUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XDisplayString)>::Unpack);
+          }
+          EOF
+          x86_64-linux-gnu-g++ -std=c++20 -shared -fPIC -O2 \
+            -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" \
+            -I"$GITHUB_WORKSPACE/src/External/Vulkan-Headers/include" \
+            -Wl,-z,nodelete -Wl,-soname,libfex-guest-bridge.so.1 \
+            /tmp/fex-guest-bridge.cpp -o bridge/libfex-guest-bridge.so.1 \
+            > "$R/bridge.compile.out" 2> "$R/bridge.compile.err" || { cat "$R/bridge.compile.err"; exit 1; }
+          file bridge/libfex-guest-bridge.so.1 | tee "$R/bridge.file"
+          readelf -d bridge/libfex-guest-bridge.so.1 | tee "$R/bridge.dynamic"
+          nm -D bridge/libfex-guest-bridge.so.1 | tee "$R/bridge.nm"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          grep -q FEXGuestBridgeVulkanXlibSupportInvoker "$R/bridge.nm"
+          grep -q FEXGuestBridgeGLGetErrorInvoker "$R/bridge.nm"
+          grep -q FEXGuestBridgeXSyncUnpacker "$R/bridge.nm"
+          grep -q FEXGuestBridgeXGetVisualInfoUnpacker "$R/bridge.nm"
+          grep -q FEXGuestBridgeXDisplayStringUnpacker "$R/bridge.nm"
+
+      - name: Patch Vulkan wrapper to use shared guest bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/ThunkLibs/libvulkan/Guest.cpp')
+          s = p.read_text()
+          anchor = 'extern "C" {\n\n// Maps Vulkan API function names'
+          replacement = '''extern "C" {\n\nstatic uintptr_t SharedBridgeVulkanXlibSupportInvoker;\nstatic uintptr_t SharedBridgeXSyncUnpacker;\nstatic uintptr_t SharedBridgeXGetVisualInfoUnpacker;\nstatic uintptr_t SharedBridgeXDisplayStringUnpacker;\n\n// Maps Vulkan API function names'''
+          if anchor not in s: raise SystemExit('Vulkan variable anchor missing')
+          s = s.replace(anchor, replacement, 1)
+
+          anchor = 'static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {\n  auto It = HostPtrInvokers.find(name);\n'
+          replacement = '''static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {\n  if (std::string_view {name} == "vkGetPhysicalDeviceXlibPresentationSupportKHR" && SharedBridgeVulkanXlibSupportInvoker) {\n    fprintf(stderr, "CROSSLIB_VK_PFN_LINK H=%p T=%#zx\\n", func, SharedBridgeVulkanXlibSupportInvoker);\n    LinkAddressToFunction((uintptr_t)func, SharedBridgeVulkanXlibSupportInvoker);\n    return func;\n  }\n  auto It = HostPtrInvokers.find(name);\n'''
+          if anchor not in s: raise SystemExit('Vulkan MakeGuestCallable anchor missing')
+          s = s.replace(anchor, replacement, 1)
+
+          old = '''void OnInit() {\n  // TODO: Load libX11 on-demand instead\n  void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);\n  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);\n  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);\n  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);\n}\n'''
+          new = '''void OnInit() {\n  void* bridge = dlopen("libfex-guest-bridge.so.1", RTLD_NOW | RTLD_LOCAL);\n  if (!bridge) { fprintf(stderr, "CROSSLIB_VK_BRIDGE_OPEN_FAILED %s\\n", dlerror()); __builtin_trap(); }\n  using GetAddressFn = uintptr_t (*)();\n  auto Resolve = [&](const char* symbol) -> uintptr_t {\n    auto fn = reinterpret_cast<GetAddressFn>(dlsym(bridge, symbol));\n    if (!fn) { fprintf(stderr, "CROSSLIB_VK_BRIDGE_SYMBOL_FAILED %s %s\\n", symbol, dlerror()); __builtin_trap(); }\n    return fn();\n  };\n  SharedBridgeVulkanXlibSupportInvoker = Resolve("FEXGuestBridgeVulkanXlibSupportInvoker");\n  SharedBridgeXSyncUnpacker = Resolve("FEXGuestBridgeXSyncUnpacker");\n  SharedBridgeXGetVisualInfoUnpacker = Resolve("FEXGuestBridgeXGetVisualInfoUnpacker");\n  SharedBridgeXDisplayStringUnpacker = Resolve("FEXGuestBridgeXDisplayStringUnpacker");\n  fprintf(stderr, "CROSSLIB_VK_BRIDGE_READY pfn=%#zx xsync=%#zx xgetvisual=%#zx xdisplay=%#zx\\n",\n          SharedBridgeVulkanXlibSupportInvoker, SharedBridgeXSyncUnpacker,\n          SharedBridgeXGetVisualInfoUnpacker, SharedBridgeXDisplayStringUnpacker);\n  dlclose(bridge);\n\n  // TODO: Load libX11 on-demand instead\n  void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);\n  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), SharedBridgeXSyncUnpacker);\n  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), SharedBridgeXGetVisualInfoUnpacker);\n  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), SharedBridgeXDisplayStringUnpacker);\n}\n'''
+          if old not in s: raise SystemExit('Vulkan OnInit anchor missing')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git -C src diff --check
+
+      - name: Patch GL wrapper to use the same shared guest bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/ThunkLibs/libGL/libGL_Guest.cpp')
+          s = p.read_text()
+          anchor = '''});\n\nextern "C" {\n'''
+          replacement = '''});\n\nstatic uintptr_t SharedBridgeGLGetErrorInvoker;\nstatic uintptr_t SharedBridgeXSyncUnpacker;\nstatic uintptr_t SharedBridgeXGetVisualInfoUnpacker;\nstatic uintptr_t SharedBridgeXDisplayStringUnpacker;\n\nextern "C" {\n'''
+          if anchor not in s: raise SystemExit('GL variable anchor missing')
+          s = s.replace(anchor, replacement, 1)
+
+          anchor = '''  if (!Ret) {\n    return nullptr;\n  }\n\n  auto TargetFuncIt = HostPtrInvokers.find(reinterpret_cast<const char*>(procname));\n'''
+          replacement = '''  if (!Ret) {\n    return nullptr;\n  }\n\n  if (std::string_view {reinterpret_cast<const char*>(procname)} == "glGetError" && SharedBridgeGLGetErrorInvoker) {\n    fprintf(stderr, "CROSSLIB_GL_PFN_LINK H=%p T=%#zx\\n", Ret, SharedBridgeGLGetErrorInvoker);\n    LinkAddressToFunction((uintptr_t)Ret, SharedBridgeGLGetErrorInvoker);\n    return Ret;\n  }\n\n  auto TargetFuncIt = HostPtrInvokers.find(reinterpret_cast<const char*>(procname));\n'''
+          if anchor not in s: raise SystemExit('GL glXGetProcAddress anchor missing')
+          s = s.replace(anchor, replacement, 1)
+
+          old = '''static void OnInit() {\n  fexfn_pack_GL_SetGuestMalloc((uintptr_t)malloc_wrapper, (uintptr_t)CallbackUnpack<decltype(malloc_wrapper)>::Unpack);\n  fexfn_pack_GL_SetGuestXSync((uintptr_t)XSync, (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);\n  fexfn_pack_GL_SetGuestXGetVisualInfo((uintptr_t)XGetVisualInfo, (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);\n  fexfn_pack_GL_SetGuestXDisplayString((uintptr_t)XDisplayString, (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);\n}\n'''
+          new = '''static void OnInit() {\n  void* bridge = dlopen("libfex-guest-bridge.so.1", RTLD_NOW | RTLD_LOCAL);\n  if (!bridge) { fprintf(stderr, "CROSSLIB_GL_BRIDGE_OPEN_FAILED %s\\n", dlerror()); __builtin_trap(); }\n  using GetAddressFn = uintptr_t (*)();\n  auto Resolve = [&](const char* symbol) -> uintptr_t {\n    auto fn = reinterpret_cast<GetAddressFn>(dlsym(bridge, symbol));\n    if (!fn) { fprintf(stderr, "CROSSLIB_GL_BRIDGE_SYMBOL_FAILED %s %s\\n", symbol, dlerror()); __builtin_trap(); }\n    return fn();\n  };\n  SharedBridgeGLGetErrorInvoker = Resolve("FEXGuestBridgeGLGetErrorInvoker");\n  SharedBridgeXSyncUnpacker = Resolve("FEXGuestBridgeXSyncUnpacker");\n  SharedBridgeXGetVisualInfoUnpacker = Resolve("FEXGuestBridgeXGetVisualInfoUnpacker");\n  SharedBridgeXDisplayStringUnpacker = Resolve("FEXGuestBridgeXDisplayStringUnpacker");\n  fprintf(stderr, "CROSSLIB_GL_BRIDGE_READY pfn=%#zx xsync=%#zx xgetvisual=%#zx xdisplay=%#zx\\n",\n          SharedBridgeGLGetErrorInvoker, SharedBridgeXSyncUnpacker,\n          SharedBridgeXGetVisualInfoUnpacker, SharedBridgeXDisplayStringUnpacker);\n  dlclose(bridge);\n\n  fexfn_pack_GL_SetGuestMalloc((uintptr_t)malloc_wrapper, (uintptr_t)CallbackUnpack<decltype(malloc_wrapper)>::Unpack);\n  fexfn_pack_GL_SetGuestXSync((uintptr_t)XSync, SharedBridgeXSyncUnpacker);\n  fexfn_pack_GL_SetGuestXGetVisualInfo((uintptr_t)XGetVisualInfo, SharedBridgeXGetVisualInfoUnpacker);\n  fexfn_pack_GL_SetGuestXDisplayString((uintptr_t)XDisplayString, SharedBridgeXDisplayStringUnpacker);\n}\n'''
+          if old not in s: raise SystemExit('GL OnInit anchor missing')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git -C src diff --check
+          git -C src diff -- ThunkLibs/libvulkan/Guest.cpp ThunkLibs/libGL/libGL_Guest.cpp | tee "$R/wrappers.diff"
+
+      - name: Build ordinary unloadable Vulkan and GL wrappers
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S src/ThunkLibs/GuestLibs -B guest-crosslib -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-crosslib.log" 2>&1
+          cmake --build guest-crosslib --target vulkan-guest GL-guest -- -j"$(nproc)" \
+            > "$R/build-crosslib.log" 2>&1 || { tail -n 260 "$R/build-crosslib.log"; exit 1; }
+          readelf -d guest-crosslib/libvulkan-guest.so | tee "$R/vulkan-wrapper.dynamic"
+          readelf -d guest-crosslib/libGL-guest.so | tee "$R/gl-wrapper.dynamic"
+          if grep -q 'FLAGS_1.*NODELETE' "$R/vulkan-wrapper.dynamic"; then exit 1; fi
+          if grep -q 'FLAGS_1.*NODELETE' "$R/gl-wrapper.dynamic"; then exit 1; fi
+          echo CROSSLIB_BOTH_WRAPPERS_UNLOADABLE
+
+      - name: Prepare rootfs, shared X11 target library, and probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-crosslib/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp guest-crosslib/libGL-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libGL.so.1"
+          cp bridge/libfex-guest-bridge.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-guest-bridge.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          #include <stdio.h>
+          typedef int (*XErrorHandler)(void *, void *);
+          int XSync(void *display, int discard) {
+            fprintf(stderr, "GUEST_XSYNC display=%p discard=%d\n", display, discard);
+            return 0;
+          }
+          void *XGetVisualInfo(void *display, long mask, void *templ, int *count) {
+            fprintf(stderr, "GUEST_XGETVISUALINFO display=%p mask=%ld\n", display, mask);
+            (void)templ;
+            if (count) *count = 0;
+            return 0;
+          }
+          char *XDisplayString(void *display) {
+            fprintf(stderr, "GUEST_XDISPLAYSTRING display=%p\n", display);
+            return ":99";
+          }
+          XErrorHandler XSetErrorHandler(XErrorHandler handler) {
+            fprintf(stderr, "GUEST_XSETERRORHANDLER handler=%p\n", (void *)handler);
+            return handler;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_crosslib_bridge_runtime_probe.c \
+            -ldl -o "$ROOTFS/opt/fex-ci/crosslib-probe"
+
+      - name: Run shared bridge across real Vulkan and GL thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          Xvfb :99 -screen 0 640x480x24 > "$R/xvfb.log" 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 50); do
+            if DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then break; fi
+            sleep 0.1
+          done
+          DISPLAY=:99 xdpyinfo >/dev/null
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP="$(cat "$R/lvp.txt")"
+          set +e
+          DISPLAY=:99 VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+            timeout 30s "$FEX" /opt/fex-ci/crosslib-probe \
+            > "$R/probe.out" 2> "$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          test "$rc" -eq 0
+          grep -q 'PROBE Vulkan after-close wrapper-maps=0 bridge-maps=' "$R/probe.err"
+          grep -q 'PROBE GL after-close wrapper-maps=0 bridge-maps=' "$R/probe.err"
+          grep -q 'CROSSLIB_GL_RETAINED_PFN_PASS' "$R/probe.err"
+          grep -q 'CROSSLIB_SHARED_BRIDGE_PASS' "$R/probe.err"
+          RDIR="$R" python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = Path(os.environ['RDIR'], 'probe.err').read_text()
+          vk = re.search(r'CROSSLIB_VK_BRIDGE_READY pfn=(\S+) xsync=(\S+) xgetvisual=(\S+) xdisplay=(\S+)', text)
+          gl = re.search(r'CROSSLIB_GL_BRIDGE_READY pfn=(\S+) xsync=(\S+) xgetvisual=(\S+) xdisplay=(\S+)', text)
+          if not vk or not gl:
+              raise SystemExit('missing bridge-ready lines')
+          if vk.groups()[1:] != gl.groups()[1:]:
+              raise SystemExit(f'X11 unpacker addresses differ across libraries: vk={vk.groups()} gl={gl.groups()}')
+          out = (
+              f'vulkan_pfn_adapter={vk.group(1)}\n'
+              f'gl_pfn_adapter={gl.group(1)}\n'
+              f'shared_xsync={vk.group(2)}\n'
+              f'shared_xgetvisual={vk.group(3)}\n'
+              f'shared_xdisplay={vk.group(4)}\n'
+              'cross_library_unpacker_identity=PASS\n'
+          )
+          Path(os.environ['RDIR'], 'bridge-identity.txt').write_text(out)
+          print(out, end='')
+          PY
+          echo CROSSLIB_SHARED_SIGNATURE_RUNTIME_OK
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosslib-guest-bridge-${{ github.run_id }}
+          path: receipts-crosslib
+          retention-days: 30
