@@ -1,0 +1,35 @@
+name: Export lifetime fixture source
+
+on:
+  push:
+    branches: [ci/thunk-callback-descriptor-20260814]
+    paths: [.github/workflows/export-lifetime-fixture-source.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: investigation/fex-vulkan-thunk-lifecycle
+          path: fieldwork
+          fetch-depth: 1
+      - name: Decode retained source
+        run: |
+          set -euxo pipefail
+          mkdir fixture
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          tar xf /tmp/repro.tar.gz -C fixture
+          find fixture -type f -maxdepth 4 -print -exec sed -n '1,260p' {} \; > fixture/source-dump.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: retained-lifetime-fixture-source-${{ github.run_id }}
+          path: fixture
+          retention-days: 7
