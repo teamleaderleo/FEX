@@ -1,0 +1,97 @@
+name: Agent C Vulkan instance pNext type inventory
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-instance-pnext-type-inventory.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - name: Inventory regular non-beta VkInstanceCreateInfo pNext types
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import collections, json, xml.etree.ElementTree as ET
+          root=ET.parse('src/External/Vulkan-Headers/registry/vk.xml').getroot()
+
+          # Identify types exposed by regular non-provisional Vulkan providers.
+          provider_types=collections.defaultdict(list)
+          nonbeta=set()
+          beta=set()
+          for feature in root.findall('./feature'):
+            if 'vulkan' not in set((feature.get('api') or '').split(',')): continue
+            label='CORE_'+(feature.get('number') or feature.get('name') or '?')
+            for req in feature.findall('./require'):
+              if 'vulkan' not in set((req.get('api') or 'vulkan').split(',')): continue
+              for t in req.findall('type'):
+                n=t.get('name')
+                if n: nonbeta.add(n); provider_types[n].append((label,False))
+          for ext in root.findall('./extensions/extension'):
+            if 'vulkan' not in set((ext.get('supported') or '').split(',')): continue
+            is_beta=ext.get('provisional') == 'true'
+            label=ext.get('name') or 'UNKNOWN_EXTENSION'
+            for req in ext.findall('./require'):
+              req_api=req.get('api')
+              if req_api and 'vulkan' not in set(req_api.split(',')): continue
+              for t in req.findall('type'):
+                n=t.get('name')
+                if not n: continue
+                (beta if is_beta else nonbeta).add(n)
+                provider_types[n].append((label,is_beta))
+
+          aliases={}
+          types={}
+          for t in root.findall('./types/type'):
+            name=t.get('name') or t.findtext('name')
+            if not name: continue
+            types[name]=t
+            if t.get('alias'): aliases[name]=t.get('alias')
+          def canon(n):
+            seen=set()
+            while n in aliases and n not in seen:
+              seen.add(n); n=aliases[n]
+            return n
+
+          rows=[]
+          for name,t in types.items():
+            exts=set((t.get('structextends') or '').split(','))
+            if 'VkInstanceCreateInfo' not in exts: continue
+            # Keep a spelling/type if it has any regular non-beta provider.
+            if name not in nonbeta: continue
+            stype=None
+            for m in t.findall('member'):
+              if m.findtext('name') == 'sType':
+                stype=m.get('values')
+                break
+            rows.append({
+              'name':name,
+              'canonical':canon(name),
+              'stype':stype,
+              'providers':[p for p,b in provider_types[name] if not b],
+              'alias':name in aliases,
+            })
+          rows=sorted(rows,key=lambda r:r['name'])
+          canonical=sorted({r['canonical'] for r in rows})
+          print(json.dumps({'spellings':len(rows),'canonical':len(canonical),'rows':rows},indent=2))
+          print('TEMPLATE_MAP')
+          for r in rows:
+            if r['stype']:
+              print(f'  {{{r["stype"]}, &ClonePNextNode<{r["canonical"]}>}},')
+          PY
