@@ -1,0 +1,170 @@
+name: Split resident bridge real Vulkan v2
+
+on:
+  push:
+    branches: [diagnostic/split-real-vulkan-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  split-real-vulkan-v2:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts-v2
+      H: ${{ github.workspace }}/host-v2
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and CMake split target
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools binutils
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s=p.read_text()
+          generic='''  if (TARGET_TYPE STREQUAL "SHARED")\n    target_link_options(${NAME}-guest PRIVATE "LINKER:-z,nodelete")\n  endif()\n'''
+          if s.count(generic)!=1: raise SystemExit(f'NODELETE block count {s.count(generic)}')
+          s=s.replace(generic,'',1)
+          anchor='  add_guest_lib(vulkan "libvulkan.so.1")\n'
+          split='''  add_guest_lib(vulkan "libvulkan.so.1")\n  add_library(vulkan-lifetime-bridge ${TARGET_TYPE} ../libvulkan/ResidentBridge.cpp ${GEN_libvulkan})\n  target_include_directories(vulkan-lifetime-bridge PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen/")\n  target_compile_definitions(vulkan-lifetime-bridge PRIVATE GUEST_THUNK_LIBRARY)\n  target_link_libraries(vulkan-lifetime-bridge PRIVATE libvulkan-guest-deps)\n  target_compile_options(vulkan-lifetime-bridge PRIVATE -fwrapv)\n  if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)\n    target_compile_options(vulkan-lifetime-bridge PRIVATE -msse2 -mfpmath=sse)\n  endif()\n  if (TARGET_TYPE STREQUAL "SHARED")\n    target_link_options(vulkan-lifetime-bridge PRIVATE "LINKER:-z,nodelete" "LINKER:-soname,libfex-vulkan-bridge.so")\n    set_target_properties(vulkan-lifetime-bridge PROPERTIES OUTPUT_NAME "fex-vulkan-bridge" NO_SONAME ON)\n  endif()\n  target_link_libraries(vulkan-guest PRIVATE vulkan-lifetime-bridge)\n'''
+          if s.count(anchor)!=1: raise SystemExit('vulkan anchor mismatch')
+          p.write_text(s.replace(anchor,split,1))
+          PY
+          git diff --check
+          git diff -- ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/cmake-split.diff"
+          git rev-parse HEAD | tee "$R/fex-sha.txt"
+
+      - name: Build runtime and split Vulkan thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1 || { tail -n 300 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest vulkan-lifetime-bridge -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1 || { tail -n 400 "$R/build-guest.log"; exit 1; }
+          readelf -d guest/libvulkan-guest.so | tee "$R/wrapper-dynamic.txt"
+          readelf -d guest/libfex-vulkan-bridge.so | tee "$R/bridge-dynamic.txt"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper-dynamic.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge-dynamic.txt"
+          grep -Fq 'Shared library: [libfex-vulkan-bridge.so]' "$R/wrapper-dynamic.txt"
+
+      - name: Rootfs and corrected moved-reload probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp guest/libfex-vulkan-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-vulkan-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat > /tmp/x11stub.c <<'EOF'
+          int XSync(void *d,int x){(void)d;(void)x;return 0;}
+          void *XGetVisualInfo(void *d,long m,void *t,int *c){(void)d;(void)m;(void)t;if(c)*c=0;return 0;}
+          const char *XDisplayString(void *d){(void)d;return ":0";}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat > /tmp/splitprobe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mman.h>
+          typedef int32_t VkResult;
+          typedef void (*PFN_vkVoidFunction)(void);
+          typedef PFN_vkVoidFunction (*PFN_GIPA)(void*,const char*);
+          typedef VkResult (*PFN_ENUM)(uint32_t*);
+          typedef uintptr_t (*PFN_GETT)(void);
+          struct span{uintptr_t a,b;}; static struct span old[16]; static unsigned oldn;
+
+          static int map_has(void *p,const char *needle,int verbose){
+            FILE*f=fopen("/proc/self/maps","r"); char line[1024]; uintptr_t x=(uintptr_t)p; if(!f)return -1;
+            while(fgets(line,sizeof line,f)){unsigned long a,b;if(sscanf(line,"%lx-%lx",&a,&b)==2&&x>=a&&x<b){if(verbose)fprintf(stderr,"MAP %p %s",p,line);int ok=strstr(line,needle)!=0;fclose(f);return ok;}}
+            fclose(f);if(verbose)fprintf(stderr,"UNMAPPED %p\n",p);return 0;
+          }
+          static void capture_guest_wrapper(void){
+            FILE*f=fopen("/proc/self/maps","r");char line[1024];if(!f)exit(70);oldn=0;
+            while(fgets(line,sizeof line,f)){unsigned long a,b;if(strstr(line,"/usr/lib/x86_64-linux-gnu/libvulkan.so.1")&&sscanf(line,"%lx-%lx",&a,&b)==2&&oldn<16){old[oldn++]=(struct span){a,b};fprintf(stderr,"OLD_GUEST_RANGE %lx-%lx %s",a,b,line);}}
+            fclose(f);if(!oldn)exit(71);
+          }
+          static void reserve_guest_wrapper(void){
+            for(unsigned i=0;i<oldn;i++){size_t n=old[i].b-old[i].a;void*r=mmap((void*)old[i].a,n,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);if(r==MAP_FAILED){fprintf(stderr,"RESERVE_FAIL %lx-%lx errno=%d %s\n",old[i].a,old[i].b,errno,strerror(errno));exit(72);}fprintf(stderr,"RESERVED %p len=%zu\n",r,n);}
+          }
+          int main(void){
+            void*h=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);if(!h){fprintf(stderr,"DLOPEN_FAIL %s\n",dlerror());return 2;}
+            void*bh=dlopen("libfex-vulkan-bridge.so",RTLD_NOW|RTLD_NOLOAD);if(!bh){fprintf(stderr,"BRIDGE_NOLOAD_FAIL %s\n",dlerror());return 3;}
+            PFN_GETT gett=(PFN_GETT)dlsym(bh,"fex_vulkan_bridge_enumerate_invoker");if(!gett)return 4;void*t=(void*)gett();
+            PFN_GIPA g0=(PFN_GIPA)dlsym(h,"vkGetInstanceProcAddr");if(!g0)return 5;PFN_ENUM p0=(PFN_ENUM)g0(NULL,"vkEnumerateInstanceVersion");if(!p0)return 6;
+            uint32_t v0=0;VkResult r0=p0(&v0);fprintf(stderr,"GEN1 gipa=%p pfn=%p T=%p result=%d version=%u\n",(void*)g0,(void*)p0,t,r0,v0);if(r0)return 7;
+            if(map_has(t,"/libfex-vulkan-bridge.so",1)!=1)return 8;capture_guest_wrapper();dlclose(bh);if(dlclose(h))return 9;
+            if(map_has((void*)g0,"/usr/lib/x86_64-linux-gnu/libvulkan.so.1",1)!=0)return 10;
+            if(map_has(t,"/libfex-vulkan-bridge.so",1)!=1)return 11;
+            uint32_t vr=0;VkResult rr=p0(&vr);fprintf(stderr,"RETAINED_AFTER_CLOSE result=%d version=%u\n",rr,vr);if(rr||vr!=v0)return 12;
+            reserve_guest_wrapper();
+            void*h2=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);if(!h2){fprintf(stderr,"RELOAD_FAIL %s\n",dlerror());return 13;}
+            PFN_GIPA g1=(PFN_GIPA)dlsym(h2,"vkGetInstanceProcAddr");PFN_ENUM p1=(PFN_ENUM)g1(NULL,"vkEnumerateInstanceVersion");
+            fprintf(stderr,"GEN2 gipa_old=%p gipa_new=%p moved=%d pfn_old=%p pfn_new=%p same_pfn=%d T=%p\n",(void*)g0,(void*)g1,g0!=g1,(void*)p0,(void*)p1,p0==p1,t);
+            if(g0==g1||p0!=p1)return 14;uint32_t v1=0;VkResult r1=p1(&v1);fprintf(stderr,"GEN2_CALL result=%d version=%u\n",r1,v1);if(r1||v1!=v0)return 15;
+            if(dlclose(h2))return 16;uint32_t vf=0;VkResult rf=p0(&vf);fprintf(stderr,"FINAL_RETAINED result=%d version=%u\n",rf,vf);if(rf||vf!=v0)return 17;
+            fprintf(stderr,"SPLIT_REAL_VULKAN_V2_OK\n");return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/splitprobe.c -ldl -o "$ROOTFS/opt/fex-ci/splitprobe"
+
+      - name: Run corrected real Vulkan split probe
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"; LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json'|head -1)"
+          set +e
+          VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" "$FEX" /opt/fex-ci/splitprobe > "$R/split.out" 2> "$R/split.err"
+          rc=$?; set -e; echo "$rc"|tee "$R/split.exit"; cat "$R/split.err"
+          test "$rc" -eq 0
+          grep -q 'SPLIT_REAL_VULKAN_V2_OK' "$R/split.err"
+          grep -q 'moved=1' "$R/split.err"
+          grep -q 'same_pfn=1' "$R/split.err"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: split-real-vulkan-v2-${{ github.run_id }}
+          path: receipts-v2
+          retention-days: 30
