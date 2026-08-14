@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
-    paths: [LINUX_FIELDWORK_DEBUG_UTILS_PNEXT_DUMMY.patch, .github/workflows/linux-fieldwork-vulkan-pnext-dummy.yml]
+    paths: [LINUX_FIELDWORK_DEBUG_UTILS_PNEXT_DUMMY.py, .github/workflows/linux-fieldwork-vulkan-pnext-dummy.yml]
 permissions:
   contents: read
 jobs:
@@ -27,8 +27,7 @@ jobs:
         run: |
           set -euxo pipefail
           git apply LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
-          git apply --check LINUX_FIELDWORK_DEBUG_UTILS_PNEXT_DUMMY.patch
-          git apply LINUX_FIELDWORK_DEBUG_UTILS_PNEXT_DUMMY.patch
+          python3 LINUX_FIELDWORK_DEBUG_UTILS_PNEXT_DUMMY.py
           git diff --check
       - name: Build FEX
         run: |
