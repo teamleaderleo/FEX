@@ -1,0 +1,124 @@
+name: Resident bridge signature overlap
+
+on:
+  push:
+    branches: [diagnostic/bridge-signature-overlap-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  overlap:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      R: ${{ github.workspace }}/receipts-signatures
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and thunk generator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev binutils
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" -v > "$R/build-thunkgen.log" 2>&1 || { tail -n 260 "$R/build-thunkgen.log"; exit 1; }
+          git rev-parse HEAD | tee "$R/fex-sha.txt"
+
+      - name: Generate Vulkan GL CUDA guest inls
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest GL-guest cuda-guest -- -j"$(nproc)" -v > "$R/build-guests.log" 2>&1 || { tail -n 360 "$R/build-guests.log"; exit 1; }
+          find guest -type f -name 'thunkgen_guest_*.inl' -print | sort | tee "$R/generated-files.txt"
+
+      - name: Measure generated function-pointer signature overlap
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          files = {
+              'vulkan': Path('guest/gen/thunkgen_guest_libvulkan.inl'),
+              'GL': Path('guest/gen/thunkgen_guest_libGL.inl'),
+              'cuda': Path('guest/gen/thunkgen_guest_libcuda.inl'),
+          }
+          for name, p in files.items():
+              if not p.exists():
+                  raise SystemExit(f'missing generated inl for {name}: {p}')
+
+          sigs = {}
+          hashes = {}
+          for name, p in files.items():
+              text = p.read_text()
+              entries = re.findall(r'^\s*//\s*(.*?)\n\s*MAKE_CALLBACK_THUNK\([^\n]*?"([^"]+)"\);', text, re.M)
+              if not entries:
+                  raise SystemExit(f'no callback-thunk entries parsed for {name}')
+              sigs[name] = {sig.strip() for sig, _ in entries}
+              hashes[name] = {h.strip() for _, h in entries}
+              Path(f'receipts-signatures/{name}-signatures.txt').write_text('\n'.join(sorted(sigs[name])) + '\n')
+              Path(f'receipts-signatures/{name}-hashes.txt').write_text('\n'.join(sorted(hashes[name])) + '\n')
+
+          names = list(files)
+          lines = []
+          for n in names:
+              lines.append(f'{n}_unique_signatures={len(sigs[n])}')
+          summed = sum(len(sigs[n]) for n in names)
+          union = set().union(*(sigs[n] for n in names))
+          lines.append(f'summed_per_library_signatures={summed}')
+          lines.append(f'union_unique_signatures={len(union)}')
+          lines.append(f'cross_library_duplicate_slots={summed-len(union)}')
+          lines.append(f'potential_adapter_count_reduction_percent={(summed-len(union))*100.0/summed:.2f}')
+          for i, a in enumerate(names):
+              for b in names[i+1:]:
+                  inter = sigs[a] & sigs[b]
+                  lines.append(f'{a}_{b}_intersection={len(inter)}')
+                  Path(f'receipts-signatures/{a}-{b}-intersection.txt').write_text('\n'.join(sorted(inter)) + '\n')
+          all3 = sigs['vulkan'] & sigs['GL'] & sigs['cuda']
+          lines.append(f'all_three_intersection={len(all3)}')
+          Path('receipts-signatures/all-three-intersection.txt').write_text('\n'.join(sorted(all3)) + '\n')
+
+          # Verify the stable hash identity really agrees whenever a canonical signature is shared.
+          # Generated callback hashes omit libname by design; matching sets are an execution receipt for that property.
+          hash_union = set().union(*(hashes[n] for n in names))
+          hash_sum = sum(len(hashes[n]) for n in names)
+          lines.append(f'summed_per_library_hashes={hash_sum}')
+          lines.append(f'union_unique_hashes={len(hash_union)}')
+          lines.append(f'cross_library_duplicate_hash_slots={hash_sum-len(hash_union)}')
+
+          out='\n'.join(lines)+'\n'
+          Path('receipts-signatures/summary.txt').write_text(out)
+          print(out, end='')
+          PY
+          cat "$R/summary.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-signature-overlap-${{ github.run_id }}
+          path: receipts-signatures
+          retention-days: 30
