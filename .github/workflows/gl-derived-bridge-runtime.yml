@@ -38,7 +38,6 @@ jobs:
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev
           git rev-parse HEAD | tee "$R/carrier-sha.txt"
-          git merge-base HEAD 71afe476751deac24adabd1adb575fd2337b6e0a | tee "$R/merge-base.txt"
 
       - name: Build FEX and stock GL host thunk
         shell: bash
