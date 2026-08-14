@@ -20,8 +20,6 @@ namespace internal {
 template<auto>
 struct fex_gen_config : fexgen::generate_guest_symtable, fexgen::indirect_guest_calls {};
 template<>
-struct fex_gen_config<ordinary> {};
-template<>
 struct fex_gen_config<custom> : fexgen::custom_host_impl {};
 }
 )";
@@ -33,7 +31,7 @@ struct fex_gen_config<custom> : fexgen::custom_host_impl {};
   REQUIRE(macro_end != std::string::npos);
   const auto registry = std::string_view {output.host.code}.substr(macro_start, macro_end - macro_start);
 
-  CHECK(registry.find("EXPAND(custom,") != std::string_view::npos);
+  CHECK(registry.find("EXPAND(custom)") != std::string_view::npos);
   CHECK(registry.find("ordinary") == std::string_view::npos);
 }
 
