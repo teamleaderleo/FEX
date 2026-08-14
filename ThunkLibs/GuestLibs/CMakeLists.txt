@@ -132,6 +132,9 @@ function(add_guest_lib NAME SONAME)
   target_include_directories(${NAME}-guest PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen/")
   target_compile_definitions(${NAME}-guest PRIVATE GUEST_THUNK_LIBRARY)
   target_link_libraries(${NAME}-guest PRIVATE lib${NAME}-guest-deps)
+  if (TARGET_TYPE STREQUAL "SHARED")
+    target_link_options(${NAME}-guest PRIVATE "LINKER:-z,nodelete")
+  endif()
 
   ## Make signed overflow well defined 2's complement overflow
   target_compile_options(${NAME}-guest PRIVATE -fwrapv)
