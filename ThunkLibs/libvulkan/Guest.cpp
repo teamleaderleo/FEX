@@ -20,14 +20,24 @@ $end_info$
 #include <string_view>
 #include <unordered_map>
 
+#include "thunkgen_guest_libvulkan_bridge_accessors.inl"
+
+// Generated callback parameters must publish the resident bridge's unpacker,
+// rather than instantiating CallbackUnpack in the unloadable Vulkan wrapper.
+#define AllocateHostTrampolineForGuestFunction FEXAllocateResidentHostTrampolineForGuestFunction
 #include "thunkgen_guest_libvulkan.inl"
+#undef AllocateHostTrampolineForGuestFunction
+
+extern "C" uintptr_t FEXVulkanBridgeXSyncUnpacker();
+extern "C" uintptr_t FEXVulkanBridgeXGetVisualInfoUnpacker();
+extern "C" uintptr_t FEXVulkanBridgeXDisplayStringUnpacker();
 
 extern "C" {
 
-// Maps Vulkan API function names to the address of a guest function which is
-// linked to the corresponding host function pointer
+// Maps Vulkan API function names to process-resident guest bridge functions
+// linked to the corresponding native host function pointer.
 const std::unordered_map<std::string_view, uintptr_t /* guest function address */> HostPtrInvokers = std::invoke([]() {
-#define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(GetCallerForHostFunction(name));
+#define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(FEXGetResidentCallerForHostFunction(name));
   std::unordered_map<std::string_view, uintptr_t> Ret;
   FOREACH_internal_SYMBOL(PAIR);
   return Ret;
@@ -58,7 +68,7 @@ static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFuncti
     }
     return nullptr;
   }
-  fprintf(stderr, "Linking address %p to host invoker %#zx\n", func, It->second);
+  fprintf(stderr, "Linking address %p to resident host invoker %#zx\n", func, It->second);
   LinkAddressToFunction((uintptr_t)func, It->second);
   return func;
 }
@@ -87,9 +97,9 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
 void OnInit() {
   // TODO: Load libX11 on-demand instead
   void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);
-  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
-  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
-  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), FEXVulkanBridgeXSyncUnpacker());
+  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), FEXVulkanBridgeXGetVisualInfoUnpacker());
+  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), FEXVulkanBridgeXDisplayStringUnpacker());
 }
 
 LOAD_LIB_INIT(libvulkan, OnInit)
