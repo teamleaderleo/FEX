@@ -54,25 +54,41 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           p = Path('guest/main.cpp')
-          s = p.read_text()
-          old = '''    if (executable(old_invoker) || executable(old_target) || executable(old_unpacker)) {
-              std::fprintf(stderr, "FAIL: old guest executable mapping survived dlclose\\n");
-              return 14;
-            }
-            std::printf("proof: all embedded guest executable addresses lost mappings\\n");'''
-          new = '''    if (executable(old_invoker) || executable(old_target) || executable(old_unpacker)) {
-              std::printf("NODELETE proof: all embedded guest executable addresses remain mapped; continuing retained-call probes\\n");
-            } else {
-              std::fprintf(stderr, "FAIL: NODELETE guest executable mappings disappeared after dlclose\\n");
-              return 14;
-            }'''
-          if old not in s:
-              raise SystemExit('full survival guard block missing')
-          start = s.index(old)
-          Path('/home/runner/work/FEX/FEX/receipts/nodelete-guard-before.txt').write_text(s[start:start+len(old)])
-          s = s.replace(old, new, 1)
-          p.write_text(s)
-          Path('/home/runner/work/FEX/FEX/receipts/nodelete-guard-after.txt').write_text(new)
+          lines = p.read_text().splitlines(keepends=True)
+          hits = [i for i, line in enumerate(lines) if 'old guest executable mapping survived dlclose' in line]
+          if len(hits) != 1:
+              raise SystemExit(f'expected one survival diagnostic, found {len(hits)}')
+          msg = hits[0]
+          if_idx = msg - 1
+          if if_idx < 0 or 'if (executable(old_invoker)' not in lines[if_idx]:
+              raise SystemExit('survival guard if-line missing')
+          end = if_idx
+          depth = 0
+          started = False
+          while end < len(lines):
+              depth += lines[end].count('{')
+              depth -= lines[end].count('}')
+              if '{' in lines[end]:
+                  started = True
+              end += 1
+              if started and depth == 0:
+                  break
+          if end >= len(lines) or 'proof: all embedded guest executable addresses lost mappings' not in lines[end]:
+              raise SystemExit('survival proof line missing after guard')
+          replace_end = end + 1
+          before = ''.join(lines[if_idx:replace_end])
+          replacement = [
+              '  if (executable(old_invoker) || executable(old_target) || executable(old_unpacker)) {\n',
+              '    std::printf("NODELETE proof: all embedded guest executable addresses remain mapped; continuing retained-call probes\\n");\n',
+              '  } else {\n',
+              '    std::fprintf(stderr, "FAIL: NODELETE guest executable mappings disappeared after dlclose\\n");\n',
+              '    return 14;\n',
+              '  }\n',
+          ]
+          Path('/home/runner/work/FEX/FEX/receipts/nodelete-guard-before.txt').write_text(before)
+          Path('/home/runner/work/FEX/FEX/receipts/nodelete-guard-after.txt').write_text(''.join(replacement))
+          lines[if_idx:replace_end] = replacement
+          p.write_text(''.join(lines))
           PY
           make HOST_CXX=g++ GUEST_CXX='x86_64-linux-gnu-g++ -Wl,-z,nodelete'
           cp -a guest /tmp/nodelete/
