@@ -1,0 +1,167 @@
+name: Vulkan runtime promotion X11 NEWLM adversary
+
+on:
+  push:
+    branches: [diagnostic/vulkan-nodelete-promotion]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  promotion-x11-newlm:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts-x11-newlm
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers xvfb x11-utils binutils
+
+      - name: Build FEX and ordinary Vulkan wrapper with base-only promotion
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ >"$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" >"$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" >"$R/build-guest.log" 2>&1
+          readelf -d guest/libvulkan-guest.so | tee "$R/guest.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/guest.dynamic"
+
+      - name: Build x86 rootfs and NEWLM callback adversary
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 >/dev/null
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          #include <stdio.h>
+          int XSync(void *display, int discard) { fprintf(stderr,"GUEST_XSYNC display=%p discard=%d\n",display,discard); return 0; }
+          void *XGetVisualInfo(void *display,long mask,void *templ,int *count) { fprintf(stderr,"GUEST_XGETVISUALINFO display=%p mask=%ld\n",display,mask); (void)templ; if(count)*count=0; return 0; }
+          char *XDisplayString(void *display) { fprintf(stderr,"GUEST_XDISPLAYSTRING display=%p\n",display); return ":99"; }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat >/tmp/probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #define VK_USE_PLATFORM_XLIB_KHR
+          #include <vulkan/vulkan.h>
+          #include <dlfcn.h>
+          #include <link.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+
+          static int mapped(void *p) {
+            FILE*f=fopen("/proc/self/maps","r");char line[512];uintptr_t x=(uintptr_t)p;if(!f)return -1;
+            while(fgets(line,sizeof(line),f)){unsigned long a,b;if(sscanf(line,"%lx-%lx",&a,&b)==2&&x>=a&&x<b){fclose(f);return 1;}}
+            fclose(f);return 0;
+          }
+          static void die(const char *s,int c){fprintf(stderr,"FAIL %s\n",s);exit(c);}
+          int main(void) {
+            void *base=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL); if(!base){fprintf(stderr,"BASE %s\n",dlerror());return 2;}
+            PFN_vkGetInstanceProcAddr g0=(PFN_vkGetInstanceProcAddr)dlsym(base,"vkGetInstanceProcAddr"); if(!g0)return 3;
+            PFN_vkCreateInstance create=(PFN_vkCreateInstance)g0(VK_NULL_HANDLE,"vkCreateInstance"); if(!create)return 4;
+            const char *exts[]={VK_KHR_SURFACE_EXTENSION_NAME,VK_KHR_XLIB_SURFACE_EXTENSION_NAME};
+            VkApplicationInfo ai={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName="promotion-newlm",.apiVersion=VK_API_VERSION_1_0};
+            VkInstanceCreateInfo ci={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&ai,.enabledExtensionCount=2,.ppEnabledExtensionNames=exts};
+            VkInstance instance=VK_NULL_HANDLE; if(create(&ci,0,&instance)!=VK_SUCCESS)return 5;
+            PFN_vkEnumeratePhysicalDevices enumerate=(PFN_vkEnumeratePhysicalDevices)g0(instance,"vkEnumeratePhysicalDevices");
+            PFN_vkGetPhysicalDeviceXlibPresentationSupportKHR xlib=(PFN_vkGetPhysicalDeviceXlibPresentationSupportKHR)g0(instance,"vkGetPhysicalDeviceXlibPresentationSupportKHR");
+            if(!enumerate||!xlib)return 6;
+            uint32_t n=0;if(enumerate(instance,&n,0)!=VK_SUCCESS||!n)return 7;VkPhysicalDevice *pd=calloc(n,sizeof(*pd));if(!pd)return 8;
+            if(enumerate(instance,&n,pd)!=VK_SUCCESS||!n)return 9;
+            Display *d0=(Display*)(uintptr_t)0x12345000;
+            Display *d1=(Display*)(uintptr_t)0x12346000;
+            Display *d2=(Display*)(uintptr_t)0x12347000;
+            fprintf(stderr,"BASE_CALLBACK_BEGIN xlib=%p\n",(void*)xlib);
+            (void)xlib(pd[0],0,d0,0);
+            if(dlclose(base))return 10;
+            if(mapped((void*)g0)!=1)die("base promotion",11);
+            fprintf(stderr,"BASE_PROMOTED_CALLBACK_BEGIN\n");
+            (void)xlib(pd[0],0,d1,0);
+
+            void *ns=dlmopen(LM_ID_NEWLM,"libvulkan.so.1",RTLD_NOW|RTLD_LOCAL); if(!ns){fprintf(stderr,"NEWLM %s\n",dlerror());return 12;}
+            PFN_vkGetInstanceProcAddr g1=(PFN_vkGetInstanceProcAddr)dlsym(ns,"vkGetInstanceProcAddr"); if(!g1)return 13;
+            fprintf(stderr,"NEWLM_CONSTRUCTOR_DONE gipa=%p\n",(void*)g1);
+            if(dlclose(ns))return 14;
+            int gm=mapped((void*)g1); fprintf(stderr,"NEWLM_AFTER_CLOSE gipa_mapped=%d\n",gm); if(gm!=0)return 15;
+
+            fprintf(stderr,"BASE_CALLBACK_AFTER_NEWLM_CLOSE_BEGIN\n");
+            VkBool32 r=xlib(pd[0],0,d2,0);
+            fprintf(stderr,"BASE_CALLBACK_AFTER_NEWLM_CLOSE_RETURN result=%u\n",r);
+            fprintf(stderr,"PROMOTION_NEWLM_X11_SURVIVED\n");
+            free(pd); return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/probe.c -ldl -o "$ROOTFS/opt/fex-ci/probe"
+
+      - name: Run NEWLM callback adversary
+        run: |
+          set -uxo pipefail
+          Xvfb :99 -screen 0 640x480x24 >"$R/xvfb.log" 2>&1 &
+          xp=$!
+          trap 'kill "$xp" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 50); do DISPLAY=:99 xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+          DISPLAY=:99 xdpyinfo >/dev/null
+          LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          DISPLAY=:99 VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" \
+            build/Bin/FEX /opt/fex-ci/probe >"$R/probe.out" 2>"$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          grep -q 'NEWLM_AFTER_CLOSE gipa_mapped=0' "$R/probe.err"
+          if grep -q PROMOTION_NEWLM_X11_SURVIVED "$R/probe.err"; then
+            echo PROMOTION_NEWLM_X11_RESULT=survived | tee "$R/result.txt"
+            test "$rc" -eq 0
+          else
+            echo PROMOTION_NEWLM_X11_RESULT=poisoned rc="$rc" | tee "$R/result.txt"
+            test "$rc" -ne 0
+          fi
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: promotion-newlm-x11-${{ github.run_id }}
+          path: receipts-x11-newlm
+          retention-days: 30
