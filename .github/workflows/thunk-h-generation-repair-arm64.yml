@@ -1,0 +1,210 @@
+name: Thunk H-generation repair ARM64
+
+on:
+  push:
+    branches: [ci/thunk-h-generation-repair-20260814]
+    paths:
+      - diagnostics/thunk-inflight-race/**
+      - diagnostics/thunk-inflight-dontunmap/**
+      - .github/fieldwork/add_thunk_h_generation_token.py
+      - .github/fieldwork/add_inflight_selected_pause.py
+      - .github/workflows/thunk-h-generation-repair-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: thunk-h-generation-repair-20260814
+  cancel-in-progress: true
+
+jobs:
+  h-generation:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-h-generation
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang lld pkg-config libcap-dev \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'carrier=%s\nfex=%s\nhelper=%s\nkernel=%s\n' \
+            "$GITHUB_SHA" "$(git -C src rev-parse HEAD)" "$(git -C retirement-helper rev-parse HEAD)" "$(uname -a)" \
+            > "$R/identity.txt"
+
+      - name: Apply lifetime candidate and deterministic old-H barrier
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/merge_callback_tombstone.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          python3 .github/fieldwork/pre_map_fixed_retire.py src
+          python3 .github/fieldwork/add_map_fixed_rollback_transaction.py src
+          python3 .github/fieldwork/add_vma_owner_id.py src
+          python3 .github/fieldwork/add_owner_claim_identity.py src
+          python3 .github/fieldwork/add_mremap_fixed_lifetime_transaction.py src
+          python3 .github/fieldwork/extend_mremap_dontunmap_lifetime_transaction.py src
+          python3 .github/fieldwork/extend_mremap_general_lifetime_transaction.py src
+          python3 .github/fieldwork/add_inflight_selected_pause.py src
+          git -C src diff --check
+          git -C src diff > "$R/baseline.diff"
+
+      - name: Build baseline FEX and probes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang CXX=clang++ cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-baseline.log" 2>&1
+          x86_64-linux-gnu-g++ -std=c++20 -O2 -g -Wall -Wextra -Wpedantic -Werror -pthread \
+            -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" \
+            diagnostics/thunk-inflight-race/thunk_inflight_race.cpp \
+            -o "$R/thunk-inflight-race"
+          x86_64-linux-gnu-g++ -std=c++20 -O2 -g -Wall -Wextra -Wpedantic -Werror -pthread \
+            -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" \
+            diagnostics/thunk-inflight-dontunmap/thunk_inflight_dontunmap.cpp \
+            -o "$R/thunk-inflight-dontunmap"
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci" "$ROOTFS/usr/lib/x86_64-linux-gnu"
+          cp "$R/thunk-inflight-race" "$ROOTFS/opt/fex-ci/"
+          cp "$R/thunk-inflight-dontunmap" "$ROOTFS/opt/fex-ci/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+
+      - name: Reproduce numeric-target generation crossings
+        shell: bash
+        run: |
+          set -uxo pipefail
+          run_case() {
+            name="$1"; bin="$2"; shift 2
+            set +e
+            FEX_ROOTFS="$ROOTFS" FEX_DIAG_INFLIGHT_SELECT=1 timeout 30s \
+              "$GITHUB_WORKSPACE/src/build/Bin/FEX" "/opt/fex-ci/$bin" "$@" \
+              > "$R/$name.stdout" 2> "$R/$name.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            echo "===== $name rc=$rc ====="
+            grep -E 'INFLIGHT|DIAG_INFLIGHT_|DIAG_OWNER_|DIAG_MULTI|DIAG_REVOKED_H|DIAG_MREMAP_|DIAG_ROLLBACK' \
+              "$R/$name.stderr" | tee "$R/$name.key" || true
+          }
+          set -e
+          run_case baseline-fixed thunk-inflight-race
+          run_case baseline-dontunmap thunk-inflight-dontunmap
+          run_case baseline-dontunmap-reregister thunk-inflight-dontunmap --reregister
+          printf 'fixed=%s\ndontunmap=%s\ndontunmap-reregister=%s\n' \
+            "$(cat "$R/baseline-fixed.exit")" "$(cat "$R/baseline-dontunmap.exit")" \
+            "$(cat "$R/baseline-dontunmap-reregister.exit")" | tee "$R/baseline-matrix.txt"
+
+      - name: Apply per-H generation token
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/add_thunk_h_generation_token.py src
+          git -C src diff --check
+          git -C src diff > "$R/generation-repair.diff"
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-generation.log" 2>&1
+
+      - name: Execute repaired generation matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          run_case() {
+            name="$1"; bin="$2"; shift 2
+            set +e
+            FEX_ROOTFS="$ROOTFS" FEX_DIAG_INFLIGHT_SELECT=1 timeout 30s \
+              "$GITHUB_WORKSPACE/src/build/Bin/FEX" "/opt/fex-ci/$bin" "$@" \
+              > "$R/$name.stdout" 2> "$R/$name.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            echo "===== $name rc=$rc ====="
+            grep -E 'INFLIGHT|DIAG_INFLIGHT_|DIAG_HGEN_|DIAG_OWNER_|DIAG_MULTI|DIAG_REVOKED_H|DIAG_MREMAP_|DIAG_ROLLBACK' \
+              "$R/$name.stderr" | tee "$R/$name.key" || true
+          }
+          set -e
+          run_case fixed-no-reregister thunk-inflight-race
+          run_case fixed-reregister thunk-inflight-race --reregister
+          run_case dontunmap-no-reregister thunk-inflight-dontunmap
+          run_case dontunmap-reregister thunk-inflight-dontunmap --reregister
+          printf 'fixed-no-reregister=%s\nfixed-reregister=%s\ndontunmap-no-reregister=%s\ndontunmap-reregister=%s\n' \
+            "$(cat "$R/fixed-no-reregister.exit")" "$(cat "$R/fixed-reregister.exit")" \
+            "$(cat "$R/dontunmap-no-reregister.exit")" "$(cat "$R/dontunmap-reregister.exit")" \
+            | tee "$R/repair-matrix.txt"
+
+      - name: Assert per-H generation causal repair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(cat "$R/baseline-fixed.exit")" = 0
+          test "$(cat "$R/baseline-dontunmap.exit")" = 0
+          test "$(cat "$R/baseline-dontunmap-reregister.exit")" = 20
+          grep -q 'INFLIGHT final worker-value=222 reregister=0' "$R/baseline-fixed.stderr"
+          grep -q 'DONTUNMAP_INFLIGHT final worker-value=222 reregister=0' "$R/baseline-dontunmap.stderr"
+          grep -q 'DONTUNMAP_INFLIGHT final worker-value=222 reregister=1' "$R/baseline-dontunmap-reregister.stderr"
+
+          test "$(cat "$R/fixed-no-reregister.exit")" = 139
+          test "$(cat "$R/fixed-reregister.exit")" = 0
+          test "$(cat "$R/dontunmap-no-reregister.exit")" = 139
+          test "$(cat "$R/dontunmap-reregister.exit")" = 0
+
+          grep -q 'DIAG_HGEN_REJECT H=0x700000020000 .*expected=0x1 current=0x2' "$R/fixed-no-reregister.stderr"
+          grep -q 'DIAG_HGEN_REJECT H=0x700000020000 .*expected=0x1 current=0x3' "$R/fixed-reregister.stderr"
+          grep -q 'INFLIGHT final worker-value=222 reregister=1' "$R/fixed-reregister.stderr"
+
+          grep -q 'DONTUNMAP_INFLIGHT moved .*old-now=222 moved-value=111 reregister=0' "$R/dontunmap-no-reregister.stderr"
+          grep -q 'DIAG_HGEN_REJECT H=0x700000020000 .*expected=0x1 current=0x2' "$R/dontunmap-no-reregister.stderr"
+          grep -q 'DONTUNMAP_INFLIGHT moved .*old-now=222 moved-value=111 reregister=1' "$R/dontunmap-reregister.stderr"
+          grep -q 'DIAG_HGEN_REJECT H=0x700000020000 .*expected=0x1 current=0x3' "$R/dontunmap-reregister.stderr"
+          grep -q 'DONTUNMAP_INFLIGHT final worker-value=111 reregister=1' "$R/dontunmap-reregister.stderr"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunk-h-generation-${{ github.run_id }}
+          path: receipts-h-generation
+          retention-days: 30
