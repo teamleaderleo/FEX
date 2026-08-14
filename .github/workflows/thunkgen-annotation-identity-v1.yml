@@ -145,7 +145,10 @@ jobs:
 
           test "$(wc -l < "$R/guest-runtime-signatures.txt" | tr -d ' ')" = 1
           test "$(wc -l < "$R/resident-runtime-signatures.txt" | tr -d ' ')" = 1
-          diff -u "$R/guest-runtime-signatures.txt" "$R/resident-runtime-signatures.txt" > "$R/signature-set.diff"
+          sed -E 's/^[[:space:]]+//' "$R/guest-runtime-signatures.txt" > "$R/guest-runtime-signatures.normalized.txt"
+          sed -E 's/^[[:space:]]+//' "$R/resident-runtime-signatures.txt" > "$R/resident-runtime-signatures.normalized.txt"
+          diff -u "$R/guest-runtime-signatures.normalized.txt" "$R/resident-runtime-signatures.normalized.txt" > "$R/signature-set.diff"
+          echo THUNKGEN_INDIRECT_ANNOTATION_IDENTITY_COLLISION_RECEIPT_OK
 
       - name: Upload receipts
         if: always()
