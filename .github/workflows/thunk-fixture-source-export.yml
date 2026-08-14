@@ -1,8 +1,6 @@
 name: Export retained thunk fixture source
 
 on:
-  push:
-    branches: [ci/thunk-lifetime-race-20260814]
   workflow_dispatch:
 
 permissions:
