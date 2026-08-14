@@ -1,0 +1,179 @@
+name: Thunk callback self-drain A-B ARM64
+
+on:
+  push:
+    branches: [ci/thunk-callback-selfdrain-20260814]
+    paths:
+      - .github/fieldwork/patch_callback_inflight_fixture.py
+      - .github/fieldwork/patch_callback_selfdrain_fixture.py
+      - .github/fieldwork/add_callback_descriptor.py
+      - .github/fieldwork/add_callback_descriptor_drain.py
+      - .github/workflows/thunk-callback-selfdrain-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  callback-selfdrain:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-selfdrain
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout retirement helpers
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Checkout retained fixture
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_REF }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and self-drain fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 .github/fieldwork/patch_callback_inflight_fixture.py /tmp/repro/fex-full-thunk-pair
+          python3 .github/fieldwork/patch_callback_selfdrain_fixture.py /tmp/repro/fex-full-thunk-pair
+          (cd /tmp/repro/fex-full-thunk-pair && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) \
+            > "$R/build-fixture.log" 2>&1
+          file /tmp/repro/fex-full-thunk-pair/guest/callback_selfdrain | tee "$R/callback-selfdrain.file"
+          grep -q 'ELF 64-bit.*x86-64' "$R/callback-selfdrain.file"
+
+      - name: Apply descriptor baseline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          python3 .github/fieldwork/add_callback_descriptor.py src
+          git -C src diff --check
+          git -C src diff > "$R/descriptor-baseline.diff"
+
+      - name: Build descriptor-only FEX
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B build-baseline -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-baseline.log" 2>&1
+          cmake --build build-baseline --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-baseline.log" 2>&1
+
+      - name: Add drain and build candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/add_callback_descriptor_drain.py src
+          git -C src diff --check
+          git -C src diff > "$R/descriptor-drain.diff"
+          CC=clang-18 CXX=clang++-18 cmake -S src -B build-drain -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-drain.log" 2>&1
+          cmake --build build-drain --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-drain.log" 2>&1
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute self-close A-B
+        shell: bash
+        run: |
+          set -uxo pipefail
+          HOST="/tmp/repro/fex-full-thunk-pair/host"
+          run_case() {
+            name="$1"; fex="$2"
+            set +e
+            (cd "$ROOTFS/opt/fex-ci" && \
+              FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 8s \
+              "$fex" /opt/fex-ci/guest/callback_selfdrain) \
+              > "$R/$name.stdout" 2> "$R/$name.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            echo "===== $name rc=$rc ====="
+            grep -E 'SELF_DRAIN|DIAG_CALLBACK_DESCRIPTOR' "$R/$name.stdout" "$R/$name.stderr" || true
+          }
+          set -e
+          run_case baseline "$GITHUB_WORKSPACE/build-baseline/Bin/FEX"
+          run_case drain "$GITHUB_WORKSPACE/build-drain/Bin/FEX"
+          baseline_rc="$(cat "$R/baseline.exit")"
+          drain_rc="$(cat "$R/drain.exit")"
+          printf 'baseline=%s\ndrain=%s\n' "$baseline_rc" "$drain_rc" | tee "$R/matrix.txt"
+
+          test "$baseline_rc" != 0
+          test "$baseline_rc" != 124
+          test "$drain_rc" = 124
+          grep -q 'SELF_DRAIN configured' "$R/baseline.stderr"
+          grep -q 'SELF_DRAIN invoke' "$R/baseline.stderr"
+          grep -q 'SELF_DRAIN configured' "$R/drain.stderr"
+          grep -q 'SELF_DRAIN invoke' "$R/drain.stderr"
+          grep -Eq 'DIAG_CALLBACK_DESCRIPTOR_ACQUIRE .*active=1' "$R/drain.stderr"
+          grep -Eq 'DIAG_CALLBACK_DESCRIPTOR_DRAIN_BEGIN .*active=1' "$R/drain.stderr"
+          grep -Eq 'DIAG_CALLBACK_DESCRIPTOR_DRAIN_WAIT .*active=1' "$R/drain.stderr"
+          if grep -q 'DIAG_CALLBACK_DESCRIPTOR_DRAIN_COMPLETE' "$R/drain.stderr"; then
+            echo 'drain unexpectedly completed' >&2
+            exit 1
+          fi
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunk-callback-selfdrain-${{ github.run_id }}
+          path: receipts-selfdrain
+          retention-days: 30
