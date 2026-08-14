@@ -80,70 +80,41 @@ jobs:
           cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
           file src/build/Bin/FEX src/build/Bin/FEXServer "$HOST/libvulkan-host.so" guest/libvulkan-guest.so >"$R/artifacts.file.txt"
 
-      - name: Bootstrap normal amd64 Ubuntu rootfs through FEX
+      - name: Build package-resolved amd64 Ubuntu rootfs without guest execution
         shell: bash
         run: |
           set -euxo pipefail
-          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
 
-          # First stage only downloads/extracts amd64 base packages on the ARM host.
+          # Foreign debootstrap resolves/downloads the amd64 package closure and extracts
+          # the base runtime, without executing amd64 maintainer scripts on the ARM host.
           sudo debootstrap \
             --arch=amd64 \
             --foreign \
             --variant=minbase \
             --components=main,universe \
+            --include=vulkan-tools,libvulkan1,libx11-6 \
             noble "$ROOTFS" http://archive.ubuntu.com/ubuntu \
-            >"$R/debootstrap-first-stage.log" 2>&1
+            >"$R/debootstrap.log" 2>&1
 
-          # Debootstrap/dpkg expect ordinary chroot pseudo-filesystems. The prior run
-          # failed specifically because /proc/self/fd did not exist in the guest rootfs.
-          sudo mkdir -p "$ROOTFS/proc" "$ROOTFS/dev" "$ROOTFS/sys"
-          sudo mount -t proc proc "$ROOTFS/proc"
-          sudo mount --rbind /dev "$ROOTFS/dev"
-          sudo mount --make-rslave "$ROOTFS/dev"
-          sudo mount --rbind /sys "$ROOTFS/sys"
-          sudo mount --make-rslave "$ROOTFS/sys"
-          mount | grep -E " on $ROOTFS/(proc|dev|sys) " | tee "$R/rootfs-mounts.txt"
-
-          # Give the guest userspace working DNS, then finish its normal package setup by
-          # executing the amd64 second stage under the exact FEX candidate itself.
-          sudo cp --remove-destination /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
-          sudo env \
-            DEBIAN_FRONTEND=noninteractive \
-            FEX_ROOTFS="$ROOTFS" \
-            FEX_THUNKHOSTLIBS="$HOST" \
-            FEX_PORTABLE=1 \
-            "$FEX" /bin/sh /debootstrap/debootstrap --second-stage \
-            >"$R/debootstrap-second-stage.out" 2>"$R/debootstrap-second-stage.err"
-
-          # Install a real distro vulkaninfo and real guest X11 runtime through amd64 apt.
-          sudo env \
-            DEBIAN_FRONTEND=noninteractive \
-            FEX_ROOTFS="$ROOTFS" \
-            FEX_THUNKHOSTLIBS="$HOST" \
-            FEX_PORTABLE=1 \
-            "$FEX" /usr/bin/apt-get update \
-            >"$R/guest-apt-update.out" 2>"$R/guest-apt-update.err"
-          sudo env \
-            DEBIAN_FRONTEND=noninteractive \
-            FEX_ROOTFS="$ROOTFS" \
-            FEX_THUNKHOSTLIBS="$HOST" \
-            FEX_PORTABLE=1 \
-            "$FEX" /usr/bin/apt-get install -y --no-install-recommends \
-              vulkan-tools libvulkan1 libx11-6 \
-            >"$R/guest-apt-install.out" 2>"$R/guest-apt-install.err"
+          # Included packages are downloaded for the second stage. Extract every retained
+          # amd64 .deb payload natively so the guest gets the real distro binary/library
+          # closure without needing dpkg/apt execution or procfs emulation.
+          find "$ROOTFS" -type f -name '*.deb' -print | sort | tee "$R/rootfs-debs.txt"
+          test -s "$R/rootfs-debs.txt"
+          while IFS= read -r deb; do
+            sudo dpkg-deb -x "$deb" "$ROOTFS"
+          done < "$R/rootfs-debs.txt"
 
           cat "$ROOTFS/etc/os-release" | tee "$R/rootfs-os-release.txt"
           file "$ROOTFS/usr/bin/vulkaninfo" | tee "$R/guest-vulkaninfo.file.txt"
           test -x "$ROOTFS/usr/bin/vulkaninfo"
           test -e "$ROOTFS/lib64/ld-linux-x86-64.so.2" -o -e "$ROOTFS/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
 
-          # Replace only the guest Vulkan loader with the generated thunk after package setup.
-          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu"
+          # Replace only the guest Vulkan loader with the generated thunk.
           sudo cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
           sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
 
-          # Verify the real amd64 X11 runtime supplies the three constructor helpers.
+          # Verify the real distro X11 runtime supplies the Vulkan thunk constructor helpers.
           X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
           test -e "$X11"
           x86_64-linux-gnu-readelf -Ws "$X11" | grep -E ' XSync(@|$)' | head -1
@@ -151,7 +122,8 @@ jobs:
           x86_64-linux-gnu-readelf -Ws "$X11" | grep -E ' XDisplayString(@|$)' | head -1
 
           {
-            echo 'rootfs_builder=debootstrap amd64 foreign + proc/dev/sys + second-stage under FEX + apt under FEX'
+            echo 'rootfs_builder=debootstrap amd64 foreign package resolution + host dpkg-deb extraction'
+            echo 'guest_execution_during_rootfs_build=none'
             echo 'guest_vulkaninfo=/usr/bin/vulkaninfo'
             sha256sum "$ROOTFS/usr/bin/vulkaninfo" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1" "$X11"
           } | tee "$R/rootfs-receipt.txt"
@@ -198,13 +170,3 @@ jobs:
           path: receipts
           if-no-files-found: warn
           retention-days: 30
-
-      - name: Cleanup rootfs mounts
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          sudo umount -R "$ROOTFS/dev" 2>/dev/null
-          sudo umount -R "$ROOTFS/sys" 2>/dev/null
-          sudo umount "$ROOTFS/proc" 2>/dev/null
-          exit 0
