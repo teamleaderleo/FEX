@@ -1,0 +1,105 @@
+name: Agent C package callback field restoration experiment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-package-callback-field-experiment.yml]
+
+permissions:
+  contents: write
+
+env:
+  BASE_SHA: 8eba4127292690a861da72d8b6089f9fd3a8e253
+  TARGET_BRANCH: experiment/vulkan-instance-callback-fields-current-main
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.TARGET_BRANCH }}
+          path: src
+          fetch-depth: 0
+
+      - name: Apply callback-field substitution candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git -C src rev-parse HEAD)" = "$BASE_SHA"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/ThunkLibs/libvulkan/Host.cpp')
+          s=p.read_text()
+          fn=s.index('static VkResult FEXFN_IMPL(vkCreateInstance)')
+          start=s.index('static VkResult FEXFN_IMPL(vkCreateInstance)', fn)
+          end=s.index('\n\nstatic VkResult FEXFN_IMPL(vkCreateDevice)', start)
+          old=s[start:end]
+          new='''extern "C" VkBool32 DummyVkDebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
+                                                       const VkDebugUtilsMessengerCallbackDataEXT*, void*);
+
+static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, const VkAllocationCallbacks* a_1, guest_layout<VkInstance*> a_2) {
+  struct DebugReportRestore {
+    VkDebugReportCallbackCreateInfoEXT* CreateInfo;
+    PFN_vkDebugReportCallbackEXT Callback;
+  };
+  struct DebugUtilsRestore {
+    VkDebugUtilsMessengerCreateInfoEXT* CreateInfo;
+    PFN_vkDebugUtilsMessengerCallbackEXT Callback;
+  };
+
+  std::vector<DebugReportRestore> report_restore;
+  std::vector<DebugUtilsRestore> utils_restore;
+
+  for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(a_0->pNext); vk_struct;
+       vk_struct = vk_struct->pNext) {
+    if (vk_struct->sType == VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT) {
+      auto* create_info = const_cast<VkDebugReportCallbackCreateInfoEXT*>(
+        reinterpret_cast<const VkDebugReportCallbackCreateInfoEXT*>(vk_struct));
+      report_restore.push_back({create_info, create_info->pfnCallback});
+      create_info->pfnCallback = DummyVkDebugReportCallback;
+    } else if (vk_struct->sType == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT) {
+      auto* create_info = const_cast<VkDebugUtilsMessengerCreateInfoEXT*>(
+        reinterpret_cast<const VkDebugUtilsMessengerCreateInfoEXT*>(vk_struct));
+      utils_restore.push_back({create_info, create_info->pfnUserCallback});
+      create_info->pfnUserCallback = DummyVkDebugUtilsMessengerCallback;
+    }
+  }
+
+  VkInstance out;
+  auto ret = LDR_PTR(vkCreateInstance)(a_0, nullptr, &out);
+
+  for (auto it = utils_restore.rbegin(); it != utils_restore.rend(); ++it) {
+    it->CreateInfo->pfnUserCallback = it->Callback;
+  }
+  for (auto it = report_restore.rbegin(); it != report_restore.rend(); ++it) {
+    it->CreateInfo->pfnCallback = it->Callback;
+  }
+
+  *a_2.get_pointer() = to_guest(to_host_layout(out));
+  return ret;
+}'''
+          p.write_text(s[:start]+new+s[end:])
+          PY
+          git -C src diff --check
+          git -C src diff -- ThunkLibs/libvulkan/Host.cpp | tee /tmp/candidate.diff
+          grep -q 'pfnCallback = DummyVkDebugReportCallback' /tmp/candidate.diff
+          grep -q 'pfnUserCallback = DummyVkDebugUtilsMessengerCallback' /tmp/candidate.diff
+          grep -q 'it->CreateInfo->pfnCallback = it->Callback' /tmp/candidate.diff
+          grep -q 'it->CreateInfo->pfnUserCallback = it->Callback' /tmp/candidate.diff
+          ! grep -q 'mutable_struct->pNext' /tmp/candidate.diff
+          test "$(git -C src status --short | wc -l)" -eq 1
+          git -C src status --short | grep -q '^ M ThunkLibs/libvulkan/Host.cpp$'
+
+      - name: Commit and push experiment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git -C src config user.name 'Leo'
+          git -C src config user.email 'cheerleaderleo@outlook.com'
+          git -C src add ThunkLibs/libvulkan/Host.cpp
+          git -C src commit -m 'ThunkLibs/vulkan: restore temporary instance callbacks'
+          git -C src push origin HEAD:"$TARGET_BRANCH"
+          git -C src rev-parse HEAD
