@@ -27,25 +27,26 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           p = Path('ThunkLibs/libvulkan/Host.cpp')
-          s = p.read_text()
-          bad = '''  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {
-          return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;
-          } else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {
-          return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;
-          } else if (a_1 == "vkCreateDebugUtilsMessengerEXT"sv) {
-          return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugUtilsMessengerEXT;
-          } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {'''
-          # YAML removes the common block indentation above, yielding exactly the malformed source block.
-          good = '''  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {
-              return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;
-            } else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {
-              return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;
-            } else if (a_1 == "vkCreateDebugUtilsMessengerEXT"sv) {
-              return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugUtilsMessengerEXT;
-            } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {'''
-          if s.count(bad) != 1:
-              raise SystemExit(f'expected one malformed callback block, found {s.count(bad)}')
-          p.write_text(s.replace(bad, good, 1))
+          lines = p.read_text().splitlines()
+          replacements = {
+              '  return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;': '    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;',
+              '} else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {': '  } else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {',
+              '  return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;': '    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;',
+              '} else if (a_1 == "vkCreateDebugUtilsMessengerEXT"sv) {': '  } else if (a_1 == "vkCreateDebugUtilsMessengerEXT"sv) {',
+              '  return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugUtilsMessengerEXT;': '    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugUtilsMessengerEXT;',
+              '} else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {': '  } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {',
+          }
+          seen = {k: 0 for k in replacements}
+          out = []
+          for line in lines:
+              if line in replacements:
+                  seen[line] += 1
+                  line = replacements[line]
+              out.append(line)
+          missing = {k: v for k, v in seen.items() if v != 1}
+          if missing:
+              raise SystemExit(f'unexpected callback formatting matches: {missing}')
+          p.write_text('\n'.join(out) + '\n')
           PY
           git diff --check
           git diff -- ThunkLibs/libvulkan/Host.cpp
