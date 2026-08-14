@@ -1,0 +1,85 @@
+name: Native dlclose in-flight baseline
+
+on:
+  push:
+    branches: [ci/native-dlclose-inflight-baseline-20260814]
+    paths:
+      - diagnostics/native-dlclose-inflight/**
+      - .github/workflows/native-dlclose-inflight-baseline.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-baseline:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      R: ${{ github.workspace }}/receipts-${{ matrix.arch }}
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Build native owner and race fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" build-native
+          c++ -std=c++20 -O2 -g -fPIC -shared -Wall -Wextra -Wpedantic -Werror \
+            diagnostics/native-dlclose-inflight/owner.cpp \
+            -o build-native/libnative-inflight-owner.so
+          c++ -std=c++20 -O2 -g -Wall -Wextra -Wpedantic -Werror -pthread \
+            diagnostics/native-dlclose-inflight/main.cpp -ldl \
+            -o build-native/native-dlclose-inflight
+          file build-native/native-dlclose-inflight build-native/libnative-inflight-owner.so | tee "$R/file.txt"
+
+      - name: Run pin control and unload race
+        shell: bash
+        run: |
+          set -uxo pipefail
+          run_case() {
+            local name="$1"; shift
+            set +e
+            (cd build-native && timeout 10s ./native-dlclose-inflight "$@") \
+              > "$R/$name.stdout" 2> "$R/$name.stderr"
+            local rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            cat "$R/$name.stdout"
+            cat "$R/$name.stderr"
+            echo "$name=$rc"
+          }
+          set -e
+          run_case pin --pin
+          run_case unmap
+          printf 'arch=%s\npin=%s\nunmap=%s\n' \
+            '${{ matrix.arch }}' "$(cat "$R/pin.exit")" "$(cat "$R/unmap.exit")" | tee "$R/matrix.txt"
+
+      - name: Assert native lifetime discriminator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(cat "$R/pin.exit")" = 0
+          test "$(cat "$R/unmap.exit")" = 139
+          grep -q 'NATIVE_INFLIGHT owner-pinned mapped=1' "$R/pin.stdout"
+          grep -q 'NATIVE_INFLIGHT worker-return value=1023' "$R/pin.stdout"
+          grep -q 'NATIVE_INFLIGHT owner-closed mapped=0' "$R/unmap.stdout"
+          grep -q 'NATIVE_INFLIGHT resume target=' "$R/unmap.stdout"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-dlclose-inflight-${{ matrix.arch }}-${{ github.run_id }}
+          path: ${{ env.R }}
+          retention-days: 30
