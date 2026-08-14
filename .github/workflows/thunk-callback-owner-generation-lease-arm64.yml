@@ -5,6 +5,8 @@ on:
     branches: [ci/callback-owner-generation-lease-20260814]
     paths:
       - .github/fieldwork/add_callback_owner_generation_lease.py
+      - .github/fieldwork/add_callback_descriptor_after_tombstone.py
+      - .github/fieldwork/relax_owner_generation_registry_anchor.py
       - .github/workflows/thunk-callback-owner-generation-lease-arm64.yml
   workflow_dispatch:
 
@@ -98,11 +100,15 @@ jobs:
           set -euxo pipefail
           python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
           python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 owner-helper/.github/fieldwork/merge_callback_tombstone.py src
           python3 .github/fieldwork/fix_retirement_lock_order.py src
           python3 .github/fieldwork/add_revoked_h_state.py src
+          python3 owner-helper/.github/fieldwork/pre_map_fixed_retire.py src
+          python3 owner-helper/.github/fieldwork/add_map_fixed_rollback_transaction.py src
           python3 owner-helper/.github/fieldwork/add_vma_owner_id.py src
           python3 owner-helper/.github/fieldwork/add_owner_claim_identity.py src
-          python3 .github/fieldwork/add_callback_descriptor.py src
+          python3 .github/fieldwork/add_callback_descriptor_after_tombstone.py src
+          python3 .github/fieldwork/relax_owner_generation_registry_anchor.py
           python3 .github/fieldwork/add_callback_owner_generation_lease.py src
           git -C src diff --check
           git -C src diff > "$R/owner-generation.diff"
