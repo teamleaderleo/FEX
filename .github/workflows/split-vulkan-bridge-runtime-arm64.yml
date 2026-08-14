@@ -1,0 +1,238 @@
+name: Split resident Vulkan bridge runtime ARM64
+
+on:
+  push:
+    branches: [ci/split-vulkan-bridge-runtime-20260814]
+    paths:
+      - .github/workflows/split-vulkan-bridge-runtime-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  split-vulkan-bridge:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-split
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact pristine FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout retained Vulkan PFN probe
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-customir-retirement
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" bridge
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers binutils
+
+      - name: Build pristine FEX runtime, host thunk, and baseline Vulkan guest generation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" \
+            > "$R/build-host.log" 2>&1
+          cmake -S src/ThunkLibs/GuestLibs -B guest-baseline -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-baseline-guest.log" 2>&1
+          cmake --build guest-baseline --target vulkan-guest -- -j"$(nproc)" \
+            > "$R/build-baseline-guest.log" 2>&1
+          GEN="$(find guest-baseline -name thunkgen_guest_libvulkan.inl -type f | head -n1)"
+          test -n "$GEN"
+          realpath "$GEN" | tee "$R/generated-guest-path.txt"
+          grep 'MAKE_CALLBACK_THUNK' "$GEN" | tee "$R/generated-callback-thunks.inc"
+          test -s "$R/generated-callback-thunks.inc"
+
+      - name: Build one-signature resident bridge DSO from generated special thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp "$R/generated-callback-thunks.inc" /tmp/generated-callback-thunks.inc
+          cat >/tmp/fex-vulkan-bridge.cpp <<'EOF'
+          #define VK_USE_64_BIT_PTR_DEFINES 0
+          #define VK_USE_PLATFORM_XLIB_XRANDR_EXT
+          #define VK_USE_PLATFORM_XLIB_KHR
+          #define VK_USE_PLATFORM_XCB_KHR
+          #define VK_USE_PLATFORM_WAYLAND_KHR
+          #include <vulkan/vulkan.h>
+          #include "common/Guest.h"
+          #include <cstdint>
+          #include "/tmp/generated-callback-thunks.inc"
+
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXVulkanBridgeEnumerateVersionInvoker() {
+            auto caller = GetCallerForHostFunction((PFN_vkEnumerateInstanceVersion)nullptr);
+            return reinterpret_cast<uintptr_t>(caller);
+          }
+          EOF
+          x86_64-linux-gnu-g++ -std=c++20 -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" \
+            -I"$GITHUB_WORKSPACE/src/External/Vulkan-Headers/include" \
+            -Wl,-z,nodelete -Wl,-soname,libfex-vulkan-bridge.so.1 \
+            /tmp/fex-vulkan-bridge.cpp -o bridge/libfex-vulkan-bridge.so.1
+          file bridge/libfex-vulkan-bridge.so.1 | tee "$R/bridge.file"
+          readelf -d bridge/libfex-vulkan-bridge.so.1 | tee "$R/bridge.dynamic"
+          nm -D bridge/libfex-vulkan-bridge.so.1 | tee "$R/bridge.nm"
+          grep -q 'ELF 64-bit.*x86-64' "$R/bridge.file"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          grep -q 'SONAME.*libfex-vulkan-bridge.so.1' "$R/bridge.dynamic"
+          grep -q 'FEXVulkanBridgeEnumerateVersionInvoker' "$R/bridge.nm"
+
+      - name: Patch only vkEnumerateInstanceVersion to use the resident bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/ThunkLibs/libvulkan/Guest.cpp')
+          s = p.read_text()
+          anchor = 'extern "C" {\n\n// Maps Vulkan API function names'
+          repl = 'extern "C" {\n\nstatic uintptr_t SplitBridgeEnumerateVersionInvoker;\n\n// Maps Vulkan API function names'
+          if anchor not in s:
+              raise SystemExit('split bridge variable anchor missing')
+          s = s.replace(anchor, repl, 1)
+
+          anchor = 'static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {\n  auto It = HostPtrInvokers.find(name);\n'
+          repl = '''static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {\n  if (name == std::string_view {"vkEnumerateInstanceVersion"} && SplitBridgeEnumerateVersionInvoker) {\n    fprintf(stderr, "SPLIT_BRIDGE_LINK H=%p T=%#zx\\n", func, SplitBridgeEnumerateVersionInvoker);\n    LinkAddressToFunction((uintptr_t)func, SplitBridgeEnumerateVersionInvoker);\n    return func;\n  }\n  auto It = HostPtrInvokers.find(name);\n'''
+          if anchor not in s:
+              raise SystemExit('MakeGuestCallable anchor missing')
+          s = s.replace(anchor, repl, 1)
+
+          anchor = '''void OnInit() {\n  // TODO: Load libX11 on-demand instead\n'''
+          repl = '''void OnInit() {\n  void* bridge = dlopen("libfex-vulkan-bridge.so.1", RTLD_NOW | RTLD_LOCAL);\n  if (!bridge) {\n    fprintf(stderr, "SPLIT_BRIDGE_DLOPEN_FAILED: %s\\n", dlerror());\n    __builtin_trap();\n  }\n  using GetInvokerFn = uintptr_t (*)();\n  auto GetInvoker = reinterpret_cast<GetInvokerFn>(dlsym(bridge, "FEXVulkanBridgeEnumerateVersionInvoker"));\n  if (!GetInvoker) {\n    fprintf(stderr, "SPLIT_BRIDGE_DLSYM_FAILED: %s\\n", dlerror());\n    __builtin_trap();\n  }\n  SplitBridgeEnumerateVersionInvoker = GetInvoker();\n  fprintf(stderr, "SPLIT_BRIDGE_READY T=%#zx\\n", SplitBridgeEnumerateVersionInvoker);\n  dlclose(bridge);\n\n  // TODO: Load libX11 on-demand instead\n'''
+          if anchor not in s:
+              raise SystemExit('OnInit anchor missing')
+          p.write_text(s.replace(anchor, repl, 1))
+          PY
+          git -C src diff --check
+          git -C src diff -- ThunkLibs/libvulkan/Guest.cpp | tee "$R/split-wrapper.diff"
+
+      - name: Build ordinary unloadable Vulkan wrapper with bridge routing
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S src/ThunkLibs/GuestLibs -B guest-split -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-split-guest.log" 2>&1
+          cmake --build guest-split --target vulkan-guest -- -j"$(nproc)" \
+            > "$R/build-split-guest.log" 2>&1 || { tail -n 240 "$R/build-split-guest.log"; exit 1; }
+          file guest-split/libvulkan-guest.so | tee "$R/split-wrapper.file"
+          readelf -d guest-split/libvulkan-guest.so | tee "$R/split-wrapper.dynamic"
+          if grep -q 'FLAGS_1.*NODELETE' "$R/split-wrapper.dynamic"; then
+            echo 'wrapper unexpectedly NODELETE' >&2
+            exit 1
+          fi
+          sha256sum guest-baseline/libvulkan-guest.so guest-split/libvulkan-guest.so bridge/libfex-vulkan-bridge.so.1 \
+            | tee "$R/split-sha256.txt"
+
+      - name: Prepare rootfs and moved-generation probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-split/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp bridge/libfex-vulkan-bridge.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-vulkan-bridge.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_pfn_unload_probe.c \
+            -ldl -o "$ROOTFS/opt/fex-ci/vulkan-pfn-probe"
+
+      - name: Run split-runtime close and moved-reload matrix on pristine FEX
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          HOST="$GITHUB_WORKSPACE/src/build/HostLibs_64"
+          run_case() {
+            mode="$1"
+            set +e
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+              "$FEX" /opt/fex-ci/vulkan-pfn-probe "$mode" \
+              > "$R/split-${mode}.stdout" 2> "$R/split-${mode}.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/split-${mode}.exit"
+            echo "===== split-${mode} rc=$rc ====="
+            grep -E 'PROBE |SPLIT_BRIDGE' "$R/split-${mode}.stderr" || true
+          }
+          set -e
+          run_case close
+          run_case reload
+
+          printf 'split_close=%s\nsplit_reload=%s\n' \
+            "$(cat "$R/split-close.exit")" "$(cat "$R/split-reload.exit")" | tee "$R/matrix.txt"
+
+          test "$(cat "$R/split-close.exit")" = 0
+          test "$(cat "$R/split-reload.exit")" = 0
+          grep -q 'PROBE return where=after-real-close result=0' "$R/split-close.stderr"
+          grep -q 'PROBE reserved-old-generation-ranges=' "$R/split-reload.stderr"
+          grep -q 'PROBE acquired generation=2' "$R/split-reload.stderr"
+          grep -q 'PROBE return where=after-reload-new-pfn result=0' "$R/split-reload.stderr"
+
+          mapfile -t bridge_targets < <(grep 'SPLIT_BRIDGE_LINK' "$R/split-reload.stderr" | sed -E 's/.*T=([^ ]+).*/\1/')
+          test "${#bridge_targets[@]}" -ge 2
+          test "${bridge_targets[0]}" = "${bridge_targets[1]}"
+          echo "SPLIT_BRIDGE_STABLE_TARGET=${bridge_targets[0]}" | tee -a "$R/matrix.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: split-vulkan-bridge-runtime-${{ github.run_id }}
+          path: receipts-split
+          retention-days: 30
