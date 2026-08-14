@@ -1,8 +1,8 @@
-name: NODELETE real Vulkan PFN lifetime
+name: NODELETE Vulkan LoadLib count
 
 on:
   push:
-    branches: [ci/nodelete-guest-thunk-policy-20260814]
+    branches: [diagnostic/nodelete-loadlib-count-20260814]
   workflow_dispatch:
 
 permissions:
@@ -41,7 +41,23 @@ jobs:
           echo "$LVP" > "$R/lvp.txt"
           VK_DRIVER_FILES="$LVP" vulkaninfo --summary > "$R/native-vulkaninfo.out" 2> "$R/native-vulkaninfo.err"
           git rev-parse HEAD | tee "$R/fex-candidate-sha.txt"
+
+      - name: Instrument guest-constructor LoadLib edge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Source/Tools/LinuxEmulation/Thunks.cpp')
+          s = p.read_text()
+          old = '  LogMan::Msg::DFmt("LoadLib: {} -> {}", Name, SOName);\n'
+          new = '  LogMan::Msg::IFmt("FIELDWORK_LOADLIB name={} path={}", Name, SOName);\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one LoadLib log anchor, found {s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+          PY
           git diff --check
+          git diff -- Source/Tools/LinuxEmulation/Thunks.cpp | tee "$R/loadlib-instrumentation.diff"
 
       - name: Build FEX runtime and Vulkan host thunk
         shell: bash
@@ -106,100 +122,46 @@ jobs:
           #include <dlfcn.h>
           #include <stdint.h>
           #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <unistd.h>
 
           typedef int32_t VkResult;
           typedef void (*PFN_vkVoidFunction)(void);
           typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(void *, const char *);
           typedef VkResult (*PFN_vkEnumerateInstanceVersion)(uint32_t *);
 
-          static int mapped(void *p, int verbose) {
-            FILE *f = fopen("/proc/self/maps", "r");
-            char line[512];
-            uintptr_t x = (uintptr_t)p;
-            if (!f) return -1;
-            while (fgets(line, sizeof(line), f)) {
-              unsigned long a, b;
-              if (sscanf(line, "%lx-%lx", &a, &b) == 2 && x >= a && x < b) {
-                if (verbose) fprintf(stderr, "MAP %p %s", p, line);
-                fclose(f);
-                return 1;
-              }
-            }
-            fclose(f);
-            if (verbose) fprintf(stderr, "UNMAPPED %p\n", p);
-            return 0;
-          }
-
           int main(void) {
             enum { CYCLES = 256 };
             void *vulkan = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-            if (!vulkan) { fprintf(stderr, "DLERROR %s\n", dlerror()); return 2; }
+            if (!vulkan) return 2;
             PFN_vkGetInstanceProcAddr gipa0 = (PFN_vkGetInstanceProcAddr)dlsym(vulkan, "vkGetInstanceProcAddr");
             if (!gipa0) return 3;
             PFN_vkEnumerateInstanceVersion pfn0 = (PFN_vkEnumerateInstanceVersion)gipa0(NULL, "vkEnumerateInstanceVersion");
             if (!pfn0) return 4;
-            uint32_t expected = 0, after = 0;
-            VkResult r1 = pfn0(&expected);
-            fprintf(stderr, "BEFORE_CLOSE gipa=%p pfn=%p result=%d version=%u\n", (void *)gipa0, (void *)pfn0, r1, expected);
-            mapped((void *)gipa0, 1);
-            if (r1 != 0) return 5;
-            if (dlclose(vulkan) != 0) { fprintf(stderr, "DLCLOSE_ERROR %s\n", dlerror()); return 6; }
-            fprintf(stderr, "AFTER_DLCLOSE\n");
-            if (mapped((void *)gipa0, 1) != 1) return 7;
-            VkResult r2 = pfn0(&after);
-            fprintf(stderr, "AFTER_CLOSE_CALL pfn=%p result=%d version=%u\n", (void *)pfn0, r2, after);
-            if (r2 != 0 || after != expected) return 8;
+            uint32_t expected = 0;
+            if (pfn0(&expected) != 0) return 5;
+            if (dlclose(vulkan) != 0) return 6;
 
             for (unsigned i = 0; i < CYCLES; ++i) {
               void *again = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-              if (!again) { fprintf(stderr, "REOPEN_DLERROR cycle=%u %s\n", i, dlerror()); return 20; }
+              if (!again) return 20;
               PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(again, "vkGetInstanceProcAddr");
-              if (!gipa) return 21;
+              if (gipa != gipa0) return 21;
               PFN_vkEnumerateInstanceVersion pfn = (PFN_vkEnumerateInstanceVersion)gipa(NULL, "vkEnumerateInstanceVersion");
-              if (!pfn) return 22;
-              if (gipa != gipa0) {
-                fprintf(stderr, "GIPA_DRIFT cycle=%u old=%p new=%p\n", i, (void *)gipa0, (void *)gipa);
-                return 23;
-              }
-              if (pfn != pfn0) {
-                fprintf(stderr, "PFN_DRIFT cycle=%u old=%p new=%p\n", i, (void *)pfn0, (void *)pfn);
-                return 24;
-              }
-              uint32_t reopened = 0;
-              VkResult rr = pfn(&reopened);
-              if (rr != 0 || reopened != expected) {
-                fprintf(stderr, "REOPEN_CALL_FAIL cycle=%u result=%d version=%u expected=%u\n", i, rr, reopened, expected);
-                return 25;
-              }
-              if (dlclose(again) != 0) {
-                fprintf(stderr, "REOPEN_DLCLOSE_ERROR cycle=%u %s\n", i, dlerror());
-                return 26;
-              }
-              uint32_t retained = 0;
-              VkResult rp = pfn0(&retained);
-              if (rp != 0 || retained != expected) {
-                fprintf(stderr, "RETAINED_CALL_FAIL cycle=%u result=%d version=%u expected=%u\n", i, rp, retained, expected);
-                return 27;
-              }
-              if ((i % 32) == 0) {
-                if (mapped((void *)gipa0, 1) != 1) return 28;
-                fprintf(stderr, "STRESS_PROGRESS cycle=%u gipa=%p pfn=%p version=%u\n", i, (void *)gipa, (void *)pfn, retained);
-              }
+              if (pfn != pfn0) return 22;
+              uint32_t version = 0;
+              if (pfn(&version) != 0 || version != expected) return 23;
+              if (dlclose(again) != 0) return 24;
+              version = 0;
+              if (pfn0(&version) != 0 || version != expected) return 25;
             }
 
-            if (mapped((void *)gipa0, 1) != 1) return 29;
             fprintf(stderr, "STRESS_CYCLES=%u\n", (unsigned)CYCLES);
-            fprintf(stderr, "REAL_NODELETE_VULKAN_PFN_STRESS_OK\n");
+            fprintf(stderr, "NODELETE_LOADLIB_COUNT_PROBE_OK\n");
             return 0;
           }
           EOF
           x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/pfn.c -ldl -o "$ROOTFS/opt/fex-ci/pfn"
-          file "$ROOTFS/opt/fex-ci/pfn" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1" > "$R/x86-files.txt"
 
-      - name: Run real retained PFN lifecycle stress
+      - name: Run and count guest constructor to host LoadLib calls
         shell: bash
         run: |
           set -uxo pipefail
@@ -214,12 +176,15 @@ jobs:
           cat "$R/pfn.err"
           test "$rc" -eq 0
           grep -q 'STRESS_CYCLES=256' "$R/pfn.err"
-          grep -q 'REAL_NODELETE_VULKAN_PFN_STRESS_OK' "$R/pfn.err"
+          grep -q 'NODELETE_LOADLIB_COUNT_PROBE_OK' "$R/pfn.err"
+          count="$(grep -c '^FIELDWORK_LOADLIB name=vulkan ' "$R/pfn.err" || true)"
+          echo "VULKAN_LOADLIB_COUNT=$count" | tee "$R/loadlib-count.txt"
+          test "$count" -eq 1
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nodelete-real-vulkan-pfn-${{ github.run_id }}
+          name: nodelete-loadlib-count-${{ github.run_id }}
           path: receipts
           retention-days: 30
