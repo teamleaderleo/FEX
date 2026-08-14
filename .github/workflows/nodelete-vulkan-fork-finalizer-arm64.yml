@@ -1,0 +1,202 @@
+name: NODELETE Vulkan fork and finalizer
+
+on:
+  push:
+    branches: [diagnostic/nodelete-vulkan-fork-finalizer-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fork-finalizer:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and instrumentation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers binutils
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/libvulkan/Guest.cpp')
+          s=p.read_text()
+          if '#include <unistd.h>' not in s:
+              s=s.replace('#include <unordered_map>\n', '#include <unordered_map>\n#include <unistd.h>\n', 1)
+          anchor='void OnInit() {\n'
+          repl='void OnInit() {\n  fprintf(stderr, "FIELDWORK_VULKAN_ONINIT pid=%d\\n", getpid());\n'
+          if s.count(anchor) != 1: raise SystemExit('OnInit anchor mismatch')
+          s=s.replace(anchor,repl,1)
+          tail='\nLOAD_LIB_INIT(libvulkan, OnInit)'
+          add='''\n__attribute__((destructor)) static void FieldworkVulkanFini() {\n  fprintf(stderr, "FIELDWORK_VULKAN_FINI pid=%d\\n", getpid());\n}\n\nLOAD_LIB_INIT(libvulkan, OnInit)'''
+          if s.count(tail) != 1: raise SystemExit('LOAD_LIB_INIT anchor mismatch')
+          s=s.replace(tail,add,1)
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff -- ThunkLibs/libvulkan/Guest.cpp | tee "$R/instrumentation.diff"
+          git rev-parse HEAD | tee "$R/fex-sha.txt"
+
+      - name: Build FEX runtime and Vulkan thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1 || { tail -n 300 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1 || { tail -n 300 "$R/build-guest.log"; exit 1; }
+          readelf -d guest/libvulkan-guest.so | tee "$R/guest-dynamic.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/guest-dynamic.txt"
+
+      - name: Create rootfs and fork probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat > /tmp/x11stub.c <<'EOF'
+          int XSync(void *display, int discard) { (void)display; (void)discard; return 0; }
+          void *XGetVisualInfo(void *display, long mask, void *templ, int *count) { (void)display; (void)mask; (void)templ; if (count) *count=0; return 0; }
+          const char *XDisplayString(void *display) { (void)display; return ":0"; }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat > /tmp/forkprobe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <sys/wait.h>
+          #include <unistd.h>
+
+          typedef int32_t VkResult;
+          typedef void (*PFN_vkVoidFunction)(void);
+          typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(void *, const char *);
+          typedef VkResult (*PFN_vkEnumerateInstanceVersion)(uint32_t *);
+
+          static int verify(PFN_vkGetInstanceProcAddr gipa0, PFN_vkEnumerateInstanceVersion pfn0, uint32_t expected, const char *who) {
+            uint32_t v=0;
+            VkResult r=pfn0(&v);
+            fprintf(stderr, "%s retained-call pid=%d pfn=%p result=%d version=%u\n", who, getpid(), (void*)pfn0, r, v);
+            if (r != 0 || v != expected) return 1;
+            void *h=dlopen("libvulkan.so.1", RTLD_NOW|RTLD_LOCAL);
+            if (!h) { fprintf(stderr, "%s reopen-fail %s\n", who, dlerror()); return 2; }
+            PFN_vkGetInstanceProcAddr g=(PFN_vkGetInstanceProcAddr)dlsym(h,"vkGetInstanceProcAddr");
+            PFN_vkEnumerateInstanceVersion p=(PFN_vkEnumerateInstanceVersion)g(NULL,"vkEnumerateInstanceVersion");
+            fprintf(stderr, "%s reopen pid=%d gipa=%p same_gipa=%d pfn=%p same_pfn=%d\n", who, getpid(), (void*)g, g==gipa0, (void*)p, p==pfn0);
+            if (g != gipa0 || p != pfn0) return 3;
+            v=0; r=p(&v);
+            if (r != 0 || v != expected) return 4;
+            if (dlclose(h) != 0) return 5;
+            return 0;
+          }
+
+          int main(void) {
+            void *h=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);
+            if (!h) { fprintf(stderr,"initial dlopen fail %s\n",dlerror()); return 2; }
+            PFN_vkGetInstanceProcAddr gipa=(PFN_vkGetInstanceProcAddr)dlsym(h,"vkGetInstanceProcAddr");
+            if (!gipa) return 3;
+            PFN_vkEnumerateInstanceVersion pfn=(PFN_vkEnumerateInstanceVersion)gipa(NULL,"vkEnumerateInstanceVersion");
+            if (!pfn) return 4;
+            uint32_t expected=0;
+            if (pfn(&expected) != 0) return 5;
+            fprintf(stderr,"INITIAL pid=%d gipa=%p pfn=%p version=%u\n",getpid(),(void*)gipa,(void*)pfn,expected);
+            if (dlclose(h) != 0) return 6;
+            if (verify(gipa,pfn,expected,"PRE_FORK") != 0) return 7;
+
+            pid_t child=fork();
+            if (child < 0) { perror("fork"); return 8; }
+            if (child == 0) {
+              int rc=verify(gipa,pfn,expected,"CHILD");
+              fprintf(stderr,"CHILD_OK pid=%d rc=%d\n",getpid(),rc);
+              fflush(stderr);
+              return rc ? 20+rc : 0;
+            }
+
+            int status=0;
+            if (waitpid(child,&status,0) != child) return 9;
+            fprintf(stderr,"PARENT child-status pid=%d status=%d exited=%d code=%d\n",getpid(),status,WIFEXITED(status),WIFEXITED(status)?WEXITSTATUS(status):-1);
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 10;
+            int prc=verify(gipa,pfn,expected,"PARENT");
+            fprintf(stderr,"PARENT_OK pid=%d rc=%d\n",getpid(),prc);
+            if (prc) return 30+prc;
+            fprintf(stderr,"NODELETE_FORK_PROBE_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/forkprobe.c -ldl -o "$ROOTFS/opt/fex-ci/forkprobe"
+
+      - name: Run fork and finalizer probe
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" \
+            "$FEX" /opt/fex-ci/forkprobe > "$R/fork.out" 2> "$R/fork.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/fork.exit"
+          cat "$R/fork.err"
+          test "$rc" -eq 0
+          grep -q 'NODELETE_FORK_PROBE_OK' "$R/fork.err"
+          grep -q 'CHILD_OK .* rc=0' "$R/fork.err"
+          grep -q 'PARENT_OK .* rc=0' "$R/fork.err"
+          oninit="$(grep -c '^FIELDWORK_VULKAN_ONINIT ' "$R/fork.err" || true)"
+          fini="$(grep -c '^FIELDWORK_VULKAN_FINI ' "$R/fork.err" || true)"
+          echo "VULKAN_ONINIT_TOTAL=$oninit" | tee "$R/lifetime-counts.txt"
+          echo "VULKAN_FINI_TOTAL=$fini" | tee -a "$R/lifetime-counts.txt"
+          test "$oninit" -eq 1
+          test "$fini" -eq 2
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodelete-vulkan-fork-finalizer-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
