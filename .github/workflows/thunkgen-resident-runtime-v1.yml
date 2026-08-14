@@ -7,6 +7,7 @@ on:
       - .github/workflows/thunkgen-resident-runtime-v1.yml
       - ThunkLibs/Generator/apply_resident_output_candidate.py
       - ThunkLibs/Generator/apply_resident_output_candidate_fixups.py
+      - ThunkLibs/Generator/apply_resident_direction_candidate.py
       - ThunkLibs/libGL/**
       - ThunkLibs/libGL_bridge/**
   workflow_dispatch:
@@ -43,17 +44,23 @@ jobs:
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev xvfb
           git rev-parse HEAD | tee "$R/carrier-sha.txt"
 
-      - name: Apply first-class resident generator candidate
+      - name: Apply first-class direction-aware resident generator candidate
         shell: bash
         run: |
           set -euxo pipefail
           python3 ThunkLibs/Generator/apply_resident_output_candidate.py
           python3 ThunkLibs/Generator/apply_resident_output_candidate_fixups.py
+          python3 ThunkLibs/Generator/apply_resident_direction_candidate.py
           git diff --check
-          git diff -- ThunkLibs/Generator/interface.h ThunkLibs/Generator/main.cpp ThunkLibs/Generator/gen.cpp ThunkLibs/GuestLibs/CMakeLists.txt \
+          git diff -- ThunkLibs/Generator/analysis.h ThunkLibs/Generator/analysis.cpp ThunkLibs/Generator/interface.h \
+            ThunkLibs/Generator/main.cpp ThunkLibs/Generator/gen.cpp ThunkLibs/GuestLibs/CMakeLists.txt \
             | tee "$R/first-class-resident-output.diff"
           grep -q -- '-guest-resident' ThunkLibs/Generator/main.cpp
           grep -q 'RESIDENT_BRIDGE' ThunkLibs/GuestLibs/CMakeLists.txt
+          grep -q 'host_to_guest_callback_funcptrs' ThunkLibs/Generator/analysis.cpp
+          grep -q 'used_as_callback' ThunkLibs/Generator/gen.cpp
+          ! grep -q 'FEXResidentBridgeCanUnpack' ThunkLibs/Generator/gen.cpp
+          ! grep -q 'sizeof...(Args) <= 19' ThunkLibs/Generator/gen.cpp
           rm ThunkLibs/Generator/extract_guest_bridge.py
           test ! -e ThunkLibs/Generator/extract_guest_bridge.py
 
@@ -104,6 +111,14 @@ jobs:
           diff -u <(grep -E '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libGL.inl | sed -E 's/^[[:space:]]+//') \
                   <(grep -E '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libGL_bridge.inl | sed -E 's/^[[:space:]]+//') \
                   > "$R/callback-set.diff"
+          awk '/^extern "C" uintptr_t fex_bridge_libGL_unpacker_/{n++} END{print n+0}' \
+            guest/gen/thunkgen_guest_libGL_bridge.inl | tee "$R/resident-unpacker-count.txt"
+          awk '/^template<> struct FEXResidentBridgeUnpacker</{n++} END{print n+0}' \
+            guest/gen/thunkgen_guest_libGL_bridge_accessors.inl | tee "$R/accessor-unpacker-count.txt"
+          test "$(cat "$R/resident-unpacker-count.txt")" = 0
+          test "$(cat "$R/accessor-unpacker-count.txt")" = 0
+          ! grep -q 'FEXResidentBridgeCanUnpack' guest/gen/thunkgen_guest_libGL_bridge.inl
+          ! grep -q 'FEXResidentBridgeCanUnpack' guest/gen/thunkgen_guest_libGL_bridge_accessors.inl
           stat -c 'bridge_file_bytes=%s' guest/libfex-GL-bridge.so | tee "$R/bridge-size.txt"
 
       - name: Create amd64 rootfs and moved-reload probe
