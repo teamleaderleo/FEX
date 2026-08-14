@@ -22,6 +22,11 @@ $end_info$
 
 #include "thunkgen_guest_libvulkan.inl"
 
+extern "C" uintptr_t fex_vulkan_bridge_enumerate_invoker();
+extern "C" uintptr_t fex_vulkan_bridge_xsync_unpacker();
+extern "C" uintptr_t fex_vulkan_bridge_xgetvisualinfo_unpacker();
+extern "C" uintptr_t fex_vulkan_bridge_xdisplaystring_unpacker();
+
 extern "C" {
 
 // Maps Vulkan API function names to the address of a guest function which is
@@ -30,6 +35,9 @@ const std::unordered_map<std::string_view, uintptr_t /* guest function address *
 #define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(GetCallerForHostFunction(name));
   std::unordered_map<std::string_view, uintptr_t> Ret;
   FOREACH_internal_SYMBOL(PAIR);
+  // Fieldwork split-lifetime experiment: keep one real dynamic-PFN adapter in
+  // a process-resident sidecar while leaving the Vulkan wrapper unloadable.
+  Ret["vkEnumerateInstanceVersion"] = fex_vulkan_bridge_enumerate_invoker();
   return Ret;
 #undef PAIR
 });
@@ -87,9 +95,9 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
 void OnInit() {
   // TODO: Load libX11 on-demand instead
   void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);
-  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
-  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
-  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), fex_vulkan_bridge_xsync_unpacker());
+  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), fex_vulkan_bridge_xgetvisualinfo_unpacker());
+  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), fex_vulkan_bridge_xdisplaystring_unpacker());
 }
 
 LOAD_LIB_INIT(libvulkan, OnInit)
