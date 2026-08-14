@@ -28,21 +28,17 @@ jobs:
           from pathlib import Path
           p = Path('ThunkLibs/libvulkan/Host.cpp')
           s = p.read_text()
-          old = '''  } else if (a_1 == "vkFreeMemory"sv) {
-            return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkFreeMemory;
-          } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {'''
-          new = '''  } else if (a_1 == "vkFreeMemory"sv) {
-            return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkFreeMemory;
-          } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {
+          anchor = '  } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {'
+          insertion = '''  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {
             return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;
           } else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {
             return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;
           } else if (a_1 == "vkCreateDebugUtilsMessengerEXT"sv) {
             return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugUtilsMessengerEXT;
           } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {'''
-          if s.count(old) != 1:
-              raise SystemExit(f'expected one routing anchor, found {s.count(old)}')
-          p.write_text(s.replace(old, new, 1))
+          if s.count(anchor) != 1:
+              raise SystemExit(f'expected one routing anchor, found {s.count(anchor)}')
+          p.write_text(s.replace(anchor, insertion, 1))
           PY
           git diff --check
           git diff -- ThunkLibs/libvulkan/Host.cpp
