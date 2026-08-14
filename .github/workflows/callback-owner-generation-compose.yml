@@ -42,6 +42,8 @@ jobs:
         run: python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
       - name: Apply multiowner promotion
         run: python3 .github/fieldwork/promote_multiowner_claims.py src
+      - name: Merge callback tombstone
+        run: python3 owner-helper/.github/fieldwork/merge_callback_tombstone.py src
       - name: Apply retirement lock-order fix
         run: python3 .github/fieldwork/fix_retirement_lock_order.py src
       - name: Apply revoked-H state
