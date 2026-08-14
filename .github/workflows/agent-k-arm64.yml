@@ -82,8 +82,8 @@ jobs:
           docker rm "$cid"
           trap - EXIT
           mkdir -p "$ROOTFS/opt/fex-ci/normal" "$ROOTFS/opt/fex-ci/nodelete"
-          cp -a /tmp/normal/guest/. "$ROOTFS/opt/fex-ci/normal/"
-          cp -a /tmp/nodelete/guest/. "$ROOTFS/opt/fex-ci/nodelete/"
+          cp -a /tmp/normal/guest "$ROOTFS/opt/fex-ci/normal/"
+          cp -a /tmp/nodelete/guest "$ROOTFS/opt/fex-ci/nodelete/"
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
 
@@ -94,10 +94,10 @@ jobs:
           FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
           set +e
           (cd "$ROOTFS/opt/fex-ci/normal" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS=/tmp/normal/host timeout 30s \
-            "$FEX" /opt/fex-ci/normal/fex_full_lifetime --call-stale) > "$R/normal.stdout" 2> "$R/normal.stderr"
+            "$FEX" /opt/fex-ci/normal/guest/fex_full_lifetime --call-stale) > "$R/normal.stdout" 2> "$R/normal.stderr"
           normal_rc=$?
           (cd "$ROOTFS/opt/fex-ci/nodelete" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS=/tmp/nodelete/host timeout 30s \
-            "$FEX" /opt/fex-ci/nodelete/fex_full_lifetime --call-stale) > "$R/nodelete.stdout" 2> "$R/nodelete.stderr"
+            "$FEX" /opt/fex-ci/nodelete/guest/fex_full_lifetime --call-stale) > "$R/nodelete.stdout" 2> "$R/nodelete.stderr"
           nodelete_rc=$?
           set -e
           printf 'normal=%s\nnodelete=%s\n' "$normal_rc" "$nodelete_rc" | tee "$R/exits.txt"
