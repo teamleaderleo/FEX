@@ -230,6 +230,7 @@ jobs:
 
           sudo cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
           sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
+          sudo mkdir -p "$ROOTFS/usr/local/bin"
           sudo install -m755 /tmp/vulkan-lifecycle "$ROOTFS/usr/local/bin/vulkan-lifecycle"
 
           X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
@@ -268,8 +269,6 @@ jobs:
 
           cat "$R/matrix.txt"
 
-          # This is an investigation matrix, not an assumption that Finding B must reproduce.
-          # Require only that every case reached a classified process exit rather than timeout.
           if grep -q '=124$' "$R/matrix.txt"; then
             echo 'unexpected timeout in lifecycle matrix' >&2
             exit 1
