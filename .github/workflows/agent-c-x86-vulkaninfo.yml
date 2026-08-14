@@ -80,29 +80,60 @@ jobs:
           cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
           file src/build/Bin/FEX src/build/Bin/FEXServer "$HOST/libvulkan-host.so" guest/libvulkan-guest.so >"$R/artifacts.file.txt"
 
-      - name: Build normal amd64 Ubuntu rootfs without executing guest code
+      - name: Bootstrap normal amd64 Ubuntu rootfs through FEX
         shell: bash
         run: |
           set -euxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+
+          # First stage only downloads/extracts amd64 base packages on the ARM host.
           sudo debootstrap \
             --arch=amd64 \
             --foreign \
             --variant=minbase \
             --components=main,universe \
-            --include=vulkan-tools,libvulkan1,libx11-6 \
             noble "$ROOTFS" http://archive.ubuntu.com/ubuntu \
-            >"$R/debootstrap.log" 2>&1
+            >"$R/debootstrap-first-stage.log" 2>&1
+
+          # Give the guest userspace working DNS, then finish its normal package setup by
+          # executing the amd64 second stage under the exact FEX candidate itself.
+          sudo cp --remove-destination /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
+          sudo env \
+            DEBIAN_FRONTEND=noninteractive \
+            FEX_ROOTFS="$ROOTFS" \
+            FEX_THUNKHOSTLIBS="$HOST" \
+            FEX_PORTABLE=1 \
+            "$FEX" /bin/sh /debootstrap/debootstrap --second-stage \
+            >"$R/debootstrap-second-stage.out" 2>"$R/debootstrap-second-stage.err"
+
+          # Install a real distro vulkaninfo and real guest X11 runtime through amd64 apt.
+          sudo env \
+            DEBIAN_FRONTEND=noninteractive \
+            FEX_ROOTFS="$ROOTFS" \
+            FEX_THUNKHOSTLIBS="$HOST" \
+            FEX_PORTABLE=1 \
+            "$FEX" /usr/bin/apt-get update \
+            >"$R/guest-apt-update.out" 2>"$R/guest-apt-update.err"
+          sudo env \
+            DEBIAN_FRONTEND=noninteractive \
+            FEX_ROOTFS="$ROOTFS" \
+            FEX_THUNKHOSTLIBS="$HOST" \
+            FEX_PORTABLE=1 \
+            "$FEX" /usr/bin/apt-get install -y --no-install-recommends \
+              vulkan-tools libvulkan1 libx11-6 \
+            >"$R/guest-apt-install.out" 2>"$R/guest-apt-install.err"
+
           cat "$ROOTFS/etc/os-release" | tee "$R/rootfs-os-release.txt"
           file "$ROOTFS/usr/bin/vulkaninfo" | tee "$R/guest-vulkaninfo.file.txt"
           test -x "$ROOTFS/usr/bin/vulkaninfo"
           test -e "$ROOTFS/lib64/ld-linux-x86-64.so.2" -o -e "$ROOTFS/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
 
+          # Replace only the guest Vulkan loader with the generated thunk after package setup.
           mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu"
-          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
-          ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
+          sudo cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
 
-          # Vulkan guest thunk initialization needs these guest X11 helper symbols.
-          # Prefer the real amd64 libX11 from debootstrap; verify the symbols are present.
+          # Verify the real amd64 X11 runtime supplies the three constructor helpers.
           X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
           test -e "$X11"
           x86_64-linux-gnu-readelf -Ws "$X11" | grep -E ' XSync(@|$)' | head -1
@@ -110,7 +141,7 @@ jobs:
           x86_64-linux-gnu-readelf -Ws "$X11" | grep -E ' XDisplayString(@|$)' | head -1
 
           {
-            echo 'rootfs_builder=debootstrap --arch=amd64 --foreign'
+            echo 'rootfs_builder=debootstrap amd64 foreign + second-stage under FEX + apt under FEX'
             echo 'guest_vulkaninfo=/usr/bin/vulkaninfo'
             sha256sum "$ROOTFS/usr/bin/vulkaninfo" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1" "$X11"
           } | tee "$R/rootfs-receipt.txt"
@@ -143,8 +174,8 @@ jobs:
           sed -n '1,240p' "$R/fex-vulkaninfo.out"
           sed -n '1,240p' "$R/fex-vulkaninfo.err"
 
-          # Integration success is defined as reaching real Vulkan enumeration.
-          # Exit is recorded separately because Finding B may still own teardown.
+          # Integration success means the real x86 tool reached Vulkan enumeration.
+          # Exit remains a separate receipt because Finding B may still own teardown.
           grep -E 'deviceName|driverName|GPU|llvmpipe|lavapipe|Vulkan Instance Version' \
             "$R/fex-vulkaninfo.out" | tee "$R/fex-vulkaninfo-enumeration.txt"
           test -s "$R/fex-vulkaninfo-enumeration.txt"
