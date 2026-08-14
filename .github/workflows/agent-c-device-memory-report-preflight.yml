@@ -1,0 +1,31 @@
+name: Agent C Vulkan device-memory-report preflight
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-device-memory-report-preflight.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check Lavapipe device extension support
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers vulkan-tools
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          VK_DRIVER_FILES="$LVP_ICD" vulkaninfo > /tmp/vulkaninfo.txt 2>/tmp/vulkaninfo.err
+          if grep -Fq 'VK_EXT_device_memory_report' /tmp/vulkaninfo.txt; then
+            echo 'device_memory_report=1'
+            grep -F 'VK_EXT_device_memory_report' /tmp/vulkaninfo.txt | head -20
+          else
+            echo 'device_memory_report=0'
+          fi
+          grep -E 'deviceName|driverName|driverInfo' /tmp/vulkaninfo.txt | head -20 || true
