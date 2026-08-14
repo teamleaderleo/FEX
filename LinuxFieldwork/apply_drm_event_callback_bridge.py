@@ -3,7 +3,7 @@ from pathlib import Path
 iface = Path('ThunkLibs/libdrm/libdrm_interface.cpp')
 s = iface.read_text()
 old = 'template<>\nstruct fex_gen_config<drmHandleEvent> {};'
-new = 'template<>\nstruct fex_gen_config<drmHandleEvent> : fexgen::custom_guest_entrypoint {};'
+new = 'template<>\nstruct fex_gen_config<drmHandleEvent> : fexgen::custom_host_impl, fexgen::custom_guest_entrypoint {};'
 assert s.count(old) == 1, s.count(old)
 iface.write_text(s.replace(old, new, 1))
 
@@ -11,7 +11,7 @@ guest = Path('ThunkLibs/libdrm/Guest.cpp')
 s = guest.read_text()
 needle = 'extern "C" {\n'
 assert s.count(needle) == 1, s.count(needle)
-wrapper = r'''extern "C" int drmHandleEvent(int fd, drmEventContextPtr evctx) {
+wrapper = r'''int drmHandleEvent(int fd, drmEventContextPtr evctx) {
   if (!evctx) {
     return fexfn_pack_drmHandleEvent(fd, evctx);
   }
@@ -32,3 +32,26 @@ wrapper = r'''extern "C" int drmHandleEvent(int fd, drmEventContextPtr evctx) {
 
 '''
 guest.write_text(s.replace(needle, needle + wrapper, 1))
+
+host = Path('ThunkLibs/libdrm/Host.cpp')
+s = host.read_text()
+needle = '#include "thunkgen_host_libdrm.inl"\n\n'
+assert s.count(needle) == 1, s.count(needle)
+impl = r'''static int fexfn_impl_libdrm_drmHandleEvent(int fd, drmEventContextPtr evctx) {
+  if (evctx) {
+    FinalizeHostTrampolineForGuestFunction(evctx->vblank_handler);
+    if (evctx->version >= 2) {
+      FinalizeHostTrampolineForGuestFunction(evctx->page_flip_handler);
+    }
+    if (evctx->version >= 3) {
+      FinalizeHostTrampolineForGuestFunction(evctx->page_flip_handler2);
+    }
+    if (evctx->version >= 4) {
+      FinalizeHostTrampolineForGuestFunction(evctx->sequence_handler);
+    }
+  }
+  return fexldr_ptr_libdrm_drmHandleEvent(fd, evctx);
+}
+
+'''
+host.write_text(s.replace(needle, needle + impl, 1))
