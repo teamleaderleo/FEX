@@ -20,7 +20,7 @@ guest/liblifetime-bridge.so: guest/bridge_dso.cpp
 	$(GUEST_CXX) $(GUEST_CXXFLAGS) -fPIC -shared -Wl,--build-id=none -Wl,-z,nodelete -Wl,-soname,liblifetime-bridge.so -o $@ $<
 
 guest/liblifetime-guest.so: guest/guest_dso.cpp guest/liblifetime-bridge.so
-	$(GUEST_CXX) $(GUEST_CXXFLAGS) -fPIC -shared -Wl,--build-id=none -Lguest -Wl,-rpath,'$$ORIGIN' -o $@ $< -l:lifetime-bridge.so
+	$(GUEST_CXX) $(GUEST_CXXFLAGS) -fPIC -shared -Wl,--build-id=none -Wl,-rpath,'$$ORIGIN' -o $@ $< guest/liblifetime-bridge.so
 
 guest/fex_full_lifetime: guest/main.cpp
 	$(GUEST_CXX) $(GUEST_CXXFLAGS) -rdynamic -o $@ $< -ldl
