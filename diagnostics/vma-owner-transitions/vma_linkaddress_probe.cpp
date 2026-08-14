@@ -63,8 +63,11 @@ int ChildCall(Fn Function) {
 
 int main(int argc, char** argv) {
   setvbuf(stderr, nullptr, _IONBF, 0);
-  if (argc != 2 || (std::strcmp(argv[1], "map-fixed") != 0 && std::strcmp(argv[1], "mprotect") != 0)) {
-    std::fprintf(stderr, "usage: %s map-fixed|mprotect\n", argv[0]);
+  const bool MapFixed = argc == 2 && std::strcmp(argv[1], "map-fixed") == 0;
+  const bool MapFixedReregister = argc == 2 && std::strcmp(argv[1], "map-fixed-reregister") == 0;
+  const bool Mprotect = argc == 2 && std::strcmp(argv[1], "mprotect") == 0;
+  if (!MapFixed && !MapFixedReregister && !Mprotect) {
+    std::fprintf(stderr, "usage: %s map-fixed|map-fixed-reregister|mprotect\n", argv[0]);
     return 64;
   }
 
@@ -93,7 +96,7 @@ int main(int argc, char** argv) {
     return 5;
   }
 
-  if (std::strcmp(argv[1], "map-fixed") == 0) {
+  if (MapFixed || MapFixedReregister) {
     void* Replacement = ::mmap(Target, PageSize, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (Replacement == MAP_FAILED || Replacement != Target) {
@@ -107,8 +110,15 @@ int main(int argc, char** argv) {
 
     std::fprintf(stderr, "VMA replaced-same-address H=%p T=%p generation=2 sentinel=222\n",
                  reinterpret_cast<void*>(SyntheticH), Target);
+
+    if (MapFixedReregister) {
+      std::fprintf(stderr, "VMA explicit-reregister H=%p T=%p generation=2\n",
+                   reinterpret_cast<void*>(SyntheticH), Target);
+      LinkAddressToFunction(SyntheticH, reinterpret_cast<uintptr_t>(Target));
+    }
+
     const int Second = Linked();
-    std::fprintf(stderr, "VMA after-map-fixed value=%d\n", Second);
+    std::fprintf(stderr, "VMA after-map-fixed value=%d reregister=%d\n", Second, MapFixedReregister ? 1 : 0);
     return Second == 222 ? 0 : 8;
   }
 
@@ -132,8 +142,5 @@ int main(int argc, char** argv) {
   const int Restored = Linked();
   std::fprintf(stderr, "VMA after-mprotect-reuse value=%d\n", Restored);
 
-  // We expect the current address-based ownership implementation to survive
-  // the permission transition and silently follow the replacement code. The
-  // child fault demonstrates the gap while PROT_NONE is active.
   return (DeadCall >= 128 && Restored == 333) ? 0 : 12;
 }
