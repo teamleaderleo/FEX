@@ -68,7 +68,7 @@ static void fexfn_impl_libvulkan_Vulkan_SetGuestAllocatorUnpackers(uintptr_t All
 }
 
 void fex_custom_repack_entry(host_layout<VkAllocationCallbacks>& into, const guest_layout<VkAllocationCallbacks>& from) {
-  into.data.pUserData = from.data.pUserData.force_get_host_pointer();
+  into.data.pUserData = const_cast<void*>(from.data.pUserData.force_get_host_pointer());
 
   if (from.data.pfnAllocation.data) {
     MakeHostTrampolineForGuestFunctionAt(from.data.pfnAllocation.data, allocator_guest_unpackers.Allocation, &into.data.pfnAllocation);
