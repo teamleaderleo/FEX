@@ -1,0 +1,74 @@
+name: Validate DRM resident in-flight receipt
+
+on:
+  push:
+    branches: [diagnostic/callback-inflight-current-clean-20260814]
+    paths:
+      - .github/workflows/drm-resident-inflight-receipt-validate.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_RUN: '31819276326'
+      ARTIFACT_NAME: drm-resident-inflight-guest-thread-31819276326
+    steps:
+      - name: Download exact runtime receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: receipt
+          github-token: ${{ github.token }}
+          repository: teamleaderleo/FEX
+          run-id: ${{ env.SOURCE_RUN }}
+
+      - name: Validate semantic receipt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat receipt/probe.err
+          test "$(cat receipt/probe.exit)" = 0
+          grep -q 'DRM_RESIDENT_GUEST_ADDR handle=' receipt/probe.err
+          grep -q 'HOST_DRM_SYNC_ENTER call=2' receipt/probe.err
+          grep -q 'DIAG_CALLBACK_INFLIGHT_SELECTED entry=2' receipt/probe.err
+          grep -q 'DRM_RESIDENT_GUEST_DLCLOSE_BEGIN callbacks=1' receipt/probe.err
+          grep -q 'DRM_RESIDENT_GUEST_DLCLOSE_RETURN callbacks=1' receipt/probe.err
+          grep -q 'UNMAPPED 0x' receipt/probe.err
+          grep -q '/libfex-drm-bridge.so' receipt/probe.err
+          grep -q '/opt/fex-ci/drm-resident-guest-thread' receipt/probe.err
+          grep -q 'DIAG_CALLBACK_INFLIGHT_PIN_TIMEOUT_RESUME' receipt/probe.err
+          grep -q 'DRM_RESIDENT_GUEST_CALLBACK count=2 fd=77 seq=51 tv=52.53 user=0x33334444' receipt/probe.err
+          grep -q 'DRM_RESIDENT_SECOND_TARGET_ENTERED' receipt/probe.err
+          grep -q 'DRM_RESIDENT_GUEST_INFLIGHT_WRAPPER_CLOSE_OK callbacks=2' receipt/probe.err
+          ! grep -q 'DIAG_CALLBACK_POST_UNMAP_RELEASE' receipt/probe.err
+
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('receipt/probe.err').read_text()
+          ordered = [
+              'DIAG_CALLBACK_INFLIGHT_SELECTED entry=2',
+              'DRM_RESIDENT_GUEST_DLCLOSE_BEGIN callbacks=1',
+              'DRM_RESIDENT_GUEST_DLCLOSE_RETURN callbacks=1',
+              'DIAG_CALLBACK_INFLIGHT_PIN_TIMEOUT_RESUME',
+              'DRM_RESIDENT_GUEST_CALLBACK count=2 fd=77 seq=51 tv=52.53 user=0x33334444',
+              'DRM_RESIDENT_GUEST_INFLIGHT_WRAPPER_CLOSE_OK callbacks=2',
+          ]
+          pos = [text.find(k) for k in ordered]
+          print(list(zip(ordered, pos)))
+          if any(p < 0 for p in pos) or pos != sorted(pos):
+              raise SystemExit(1)
+
+          selected = text.find('DIAG_CALLBACK_INFLIGHT_SELECTED entry=2')
+          unmapped = text.find('UNMAPPED 0x', selected)
+          bridge_after = text.find('/libfex-drm-bridge.so', unmapped)
+          target_after = text.find('/opt/fex-ci/drm-resident-guest-thread', unmapped)
+          resume = text.find('DIAG_CALLBACK_INFLIGHT_PIN_TIMEOUT_RESUME')
+          if not (selected < unmapped < bridge_after < resume and selected < unmapped < target_after < resume):
+              raise SystemExit(2)
+          PY
+          echo DRM_RESIDENT_INFLIGHT_RECEIPT_VALIDATED
