@@ -1,0 +1,104 @@
+name: Agent C regular Vulkan proc corpus inventory
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-proc-corpus-inventory.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - name: Generate regular Vulkan command-name corpus
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p receipts
+          python3 - <<'PY'
+          import collections, json, pathlib, xml.etree.ElementTree as ET
+          xml=ET.parse('src/External/Vulkan-Headers/registry/vk.xml').getroot()
+          commands={}
+          aliases={}
+          first_param={}
+          for c in xml.findall('./commands/command'):
+            if c.get('alias'):
+              name=c.get('name'); aliases[name]=c.get('alias'); commands[name]=c
+              continue
+            proto=c.find('proto')
+            if proto is None: continue
+            name=proto.findtext('name')
+            if not name: continue
+            commands[name]=c
+            p=c.find('param')
+            first_param[name]=p.findtext('type') if p is not None else None
+          def canon(n):
+            seen=set()
+            while n in aliases and n not in seen:
+              seen.add(n); n=aliases[n]
+            return n
+          providers=collections.defaultdict(set)
+          regular=set()
+          for f in xml.findall('./feature'):
+            apis=set((f.get('api') or '').split(','))
+            if 'vulkan' not in apis: continue
+            label='CORE_'+(f.get('number') or f.get('name') or '?')
+            for req in f.findall('./require'):
+              req_apis=set((req.get('api') or 'vulkan').split(','))
+              if 'vulkan' not in req_apis: continue
+              for cmd in req.findall('command'):
+                n=cmd.get('name')
+                if n:
+                  regular.add(n); providers[n].add(label)
+          for ext in xml.findall('./extensions/extension'):
+            supported=set((ext.get('supported') or '').split(','))
+            if 'vulkan' not in supported: continue
+            label=ext.get('name') or 'UNKNOWN_EXTENSION'
+            for req in ext.findall('./require'):
+              req_api=req.get('api')
+              if req_api and 'vulkan' not in set(req_api.split(',')): continue
+              for cmd in req.findall('command'):
+                n=cmd.get('name')
+                if n:
+                  regular.add(n); providers[n].add(label)
+          # Include alias spellings only when that spelling itself is exposed by a regular feature/extension.
+          rows=[]
+          dispatch_counts=collections.Counter()
+          for n in sorted(regular):
+            base=canon(n)
+            fp=first_param.get(base)
+            if fp is None: scope='global'
+            elif fp in ('VkInstance','VkPhysicalDevice'): scope='instance'
+            elif fp in ('VkDevice','VkQueue','VkCommandBuffer'): scope='device'
+            else: scope='other'
+            dispatch_counts[scope]+=1
+            rows.append({'name':n,'canonical':base,'alias':n!=base,'first_param':fp,'dispatch_class':scope,'providers':sorted(providers[n])})
+          summary={
+            'regular_command_spellings':len(rows),
+            'alias_spellings':sum(r['alias'] for r in rows),
+            'canonical_commands':len({r['canonical'] for r in rows}),
+            'dispatch_counts':dict(dispatch_counts),
+          }
+          pathlib.Path('receipts/corpus.json').write_text(json.dumps({'summary':summary,'rows':rows},indent=2)+'\n')
+          pathlib.Path('receipts/commands.txt').write_text(''.join(r['name']+'\n' for r in rows))
+          print(json.dumps(summary,indent=2))
+          for r in rows: print(r['name'],r['canonical'],int(r['alias']),r['first_param'],r['dispatch_class'],','.join(r['providers']),sep='\t')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-proc-corpus-inventory-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
