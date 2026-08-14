@@ -1,0 +1,159 @@
+name: Agent C x86 vulkaninfo integration
+
+on:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths:
+      - .github/workflows/agent-c-x86-vulkaninfo.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vulkaninfo:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+      DEBIAN_FRONTEND: noninteractive
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      HOST: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Identity and dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          {
+            echo "fex_sha=$(git -C src rev-parse HEAD)"
+            uname -a
+            uname -m
+          } | tee "$R/identity.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools \
+            debootstrap
+
+      - name: Native Lavapipe control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" > "$R/lvp-icd.txt"
+          VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
+
+      - name: Build exact candidate and focused Vulkan thunk pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF \
+            -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v >"$R/build-host.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
+          file src/build/Bin/FEX src/build/Bin/FEXServer "$HOST/libvulkan-host.so" guest/libvulkan-guest.so >"$R/artifacts.file.txt"
+
+      - name: Build normal amd64 Ubuntu rootfs without executing guest code
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo debootstrap \
+            --arch=amd64 \
+            --foreign \
+            --variant=minbase \
+            --components=main,universe \
+            --include=vulkan-tools,libvulkan1,libx11-6 \
+            noble "$ROOTFS" http://archive.ubuntu.com/ubuntu \
+            >"$R/debootstrap.log" 2>&1
+          cat "$ROOTFS/etc/os-release" | tee "$R/rootfs-os-release.txt"
+          file "$ROOTFS/usr/bin/vulkaninfo" | tee "$R/guest-vulkaninfo.file.txt"
+          test -x "$ROOTFS/usr/bin/vulkaninfo"
+          test -e "$ROOTFS/lib64/ld-linux-x86-64.so.2" -o -e "$ROOTFS/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu"
+          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
+
+          # Vulkan guest thunk initialization needs these guest X11 helper symbols.
+          # Prefer the real amd64 libX11 from debootstrap; verify the symbols are present.
+          X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          test -e "$X11"
+          x86_64-linux-gnu-readelf -Ws "$X11" | grep -E ' XSync(@|$)' | head -1
+          x86_64-linux-gnu-readelf -Ws "$X11" | grep -E ' XGetVisualInfo(@|$)' | head -1
+          x86_64-linux-gnu-readelf -Ws "$X11" | grep -E ' XDisplayString(@|$)' | head -1
+
+          {
+            echo 'rootfs_builder=debootstrap --arch=amd64 --foreign'
+            echo 'guest_vulkaninfo=/usr/bin/vulkaninfo'
+            sha256sum "$ROOTFS/usr/bin/vulkaninfo" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1" "$X11"
+          } | tee "$R/rootfs-receipt.txt"
+
+      - name: FEX runtime smoke
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" "$FEX" /bin/true \
+            >"$R/fex-true.out" 2>"$R/fex-true.err"
+
+      - name: Run real x86 vulkaninfo through FEX
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          set +e
+          timeout 90s env \
+            VK_DRIVER_FILES="$LVP_ICD" \
+            VK_LOADER_DEBUG=error,warn \
+            FEX_ROOTFS="$ROOTFS" \
+            FEX_THUNKHOSTLIBS="$HOST" \
+            "$FEX" /usr/bin/vulkaninfo --summary \
+            >"$R/fex-vulkaninfo.out" 2>"$R/fex-vulkaninfo.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/fex-vulkaninfo.exit"
+          sed -n '1,240p' "$R/fex-vulkaninfo.out"
+          sed -n '1,240p' "$R/fex-vulkaninfo.err"
+
+          # Integration success is defined as reaching real Vulkan enumeration.
+          # Exit is recorded separately because Finding B may still own teardown.
+          grep -E 'deviceName|driverName|GPU|llvmpipe|lavapipe|Vulkan Instance Version' \
+            "$R/fex-vulkaninfo.out" | tee "$R/fex-vulkaninfo-enumeration.txt"
+          test -s "$R/fex-vulkaninfo-enumeration.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-x86-vulkaninfo-${{ github.run_id }}
+          path: receipts
+          if-no-files-found: warn
+          retention-days: 30
