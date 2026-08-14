@@ -1,0 +1,154 @@
+name: Materialize per-library resident bridge source
+
+on:
+  push:
+    branches: [diagnostic/per-library-bridge-helper-f3ab-20260814]
+    paths:
+      - LinuxFieldwork/apply_per_library_guest_bridge_helper.py
+      - LinuxFieldwork/apply_nested_callback_member_generator.py
+      - LinuxFieldwork/apply_cuda_direct_role_bridge.py
+      - LinuxFieldwork/apply_vulkan_helper_direct_bridge.py
+      - LinuxFieldwork/apply_wayland_resident_all_listeners_helper.py
+      - .github/fieldwork/apply_thunkgen_guest_bridge_output.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles_compat.py
+      - .github/workflows/materialize-per-library-resident-bridges.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-materialize:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 80
+    env:
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      OUTPUT_BRANCH: integration/per-library-resident-bridges-f3ab-20260814
+      R: ${{ github.workspace }}/materialize-receipts
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Exact-product provenance and dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-transform-product-diff.txt"
+          test ! -s "$R/pre-transform-product-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config python3 \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers libwayland-dev binutils
+
+      - name: Apply validated source transforms
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_per_library_guest_bridge_helper.py
+          python3 LinuxFieldwork/apply_nested_callback_member_generator.py
+          # Keep the generic callback_member generator capability, but do not fold
+          # the separate DRM library experiment into this first source tranche.
+          git checkout "$PRODUCT_SHA" -- ThunkLibs/libdrm/libdrm_interface.cpp
+          python3 .github/fieldwork/apply_thunkgen_guest_bridge_output.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles_compat.py .
+          python3 LinuxFieldwork/apply_cuda_direct_role_bridge.py
+          python3 LinuxFieldwork/apply_vulkan_helper_direct_bridge.py
+          python3 LinuxFieldwork/apply_wayland_resident_all_listeners_helper.py
+          git diff --check
+          git diff -- ThunkLibs > "$R/source.diff"
+          test -s "$R/source.diff"
+          test -z "$(git diff --name-only "$PRODUCT_SHA" -- FEXCore Source)"
+          grep -q 'add_guest_bridge(cuda_bridge "libfex-cuda-bridge.so"' ThunkLibs/GuestLibs/CMakeLists.txt
+          grep -q 'add_guest_bridge(vulkan_bridge "libfex-vulkan-bridge.so"' ThunkLibs/GuestLibs/CMakeLists.txt
+          grep -q 'add_guest_bridge(wayland-client_bridge "libfex-wayland-client-bridge.so"' ThunkLibs/GuestLibs/CMakeLists.txt
+
+      - name: Build combined host and guest targets
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target thunkgen vulkan-host-64 cuda-host-64 wayland-client-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 360 "$R/build-host.log"; exit 1; }
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target \
+            vulkan-guest vulkan_bridge-guest \
+            cuda-guest cuda_bridge-guest \
+            wayland-client-guest wayland-client_bridge-guest \
+            -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1 \
+            || { tail -n 420 "$R/build-guest.log"; exit 1; }
+
+      - name: Verify ELF ownership boundary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          for pair in \
+            'vulkan libvulkan-guest.so libfex-vulkan-bridge.so' \
+            'cuda libcuda-guest.so libfex-cuda-bridge.so' \
+            'wayland libwayland-client-guest.so libfex-wayland-client-bridge.so'; do
+            set -- $pair
+            name="$1"; wrapper="guest/$2"; bridge="guest/$3"
+            readelf -d "$wrapper" > "$R/${name}-wrapper.dynamic"
+            readelf -d "$bridge" > "$R/${name}-bridge.dynamic"
+            ! grep -q 'FLAGS_1.*NODELETE' "$R/${name}-wrapper.dynamic"
+            grep -q 'NEEDED.*libfex-' "$R/${name}-wrapper.dynamic"
+            grep -q 'RUNPATH.*\$ORIGIN' "$R/${name}-wrapper.dynamic"
+            grep -q 'FLAGS_1.*NODELETE' "$R/${name}-bridge.dynamic"
+          done
+          size \
+            guest/libvulkan-guest.so guest/libfex-vulkan-bridge.so \
+            guest/libcuda-guest.so guest/libfex-cuda-bridge.so \
+            guest/libwayland-client-guest.so guest/libfex-wayland-client-bridge.so \
+            | tee "$R/size.txt"
+
+      - name: Create clean source-only commit and push integration branch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git add ThunkLibs
+          git diff --cached --check
+          test -n "$(git diff --cached --name-only)"
+          test -z "$(git diff --cached --name-only | grep -v '^ThunkLibs/' || true)"
+          git diff --cached --binary > /tmp/per-library-resident-bridges.patch
+          cp /tmp/per-library-resident-bridges.patch "$R/source-only.patch"
+
+          git reset --hard "$PRODUCT_SHA"
+          git checkout -B "$OUTPUT_BRANCH" "$PRODUCT_SHA"
+          git apply --index /tmp/per-library-resident-bridges.patch
+          git diff --cached --check
+          test -z "$(git diff --cached --name-only | grep -v '^ThunkLibs/' || true)"
+
+          git config user.name Leo
+          git config user.email cheerleaderleo@outlook.com
+          git commit -m 'Research: integrate per-library resident guest bridges'
+          git rev-parse HEAD | tee "$R/integration-commit.txt"
+          git diff --name-only "$PRODUCT_SHA"..HEAD | tee "$R/integration-files.txt"
+          git push origin "HEAD:refs/heads/$OUTPUT_BRANCH"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: materialized-per-library-resident-bridges-${{ github.run_id }}
+          path: materialize-receipts
+          retention-days: 30
