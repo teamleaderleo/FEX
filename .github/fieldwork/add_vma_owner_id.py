@@ -123,6 +123,9 @@ def main() -> None:
                                                             Current->OwnerID}''',
         'DeleteVMARange split owner',
     )
+    # ChangeProtectionFlags has three original-protection split insertions in
+    # two indentation shapes: merge strategies 4 and 3 share one; strategy 2
+    # uses the shorter initializer indentation.
     replace_all(
         cpp,
         '''.Flags = CurrentFlags,
@@ -130,8 +133,17 @@ def main() -> None:
         '''.Flags = CurrentFlags,
                                                           .Prot = CurrentProt,
                                                           .OwnerID = Current->OwnerID});''',
-        3,
-        'mprotect original-protection split owners',
+        2,
+        'mprotect original-protection split owners wide',
+    )
+    repl(
+        cpp,
+        '''.Flags = CurrentFlags,
+                                                        .Prot = CurrentProt});''',
+        '''.Flags = CurrentFlags,
+                                                        .Prot = CurrentProt,
+                                                        .OwnerID = Current->OwnerID});''',
+        'mprotect original-protection split owner strategy2',
     )
     repl(
         cpp,
