@@ -1,8 +1,8 @@
-name: MAP_FIXED thunk owner retirement A-B-C ARM64
+name: Failed MAP_FIXED thunk retirement rollback ARM64
 
 on:
   push:
-    branches: [ci/map-fixed-pre-retire-20260814]
+    branches: [ci/map-fixed-failure-rollback-20260814]
     paths:
       - diagnostics/vma-owner-transitions/vma_linkaddress_probe.cpp
       - .github/workflows/vma-owner-transitions-arm64.yml
@@ -17,13 +17,13 @@ permissions:
   contents: read
 
 jobs:
-  map-fixed-retirement:
+  rollback-discriminator:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 70
+    timeout-minutes: 65
     env:
       FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
       ROOTFS: ${{ github.workspace }}/rootfs-amd64
-      R: ${{ github.workspace }}/receipts-map-fixed
+      R: ${{ github.workspace }}/receipts-map-fixed-failure
       FEX_PORTABLE: 1
       DEBIAN_FRONTEND: noninteractive
 
@@ -61,7 +61,7 @@ jobs:
             "$GITHUB_SHA" "$(git -C src rev-parse HEAD)" "$(git -C retirement-helper rev-parse HEAD)" \
             > "$R/identity.txt"
 
-      - name: Build stock FEX runtime
+      - name: Build base FEX runtime
         shell: bash
         run: |
           set -euxo pipefail
@@ -69,13 +69,10 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
             -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
             -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
-            > "$R/cmake-stock.log" 2>&1
-          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" \
-            > "$R/build-stock.log" 2>&1
-          mkdir -p /tmp/fex-stock
-          cp src/build/Bin/FEX src/build/Bin/FEXServer /tmp/fex-stock/
+            > "$R/cmake-base.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-base.log" 2>&1
 
-      - name: Prepare amd64 rootfs and MAP_FIXED probe
+      - name: Prepare amd64 rootfs and failed-MAP_FIXED probe
         shell: bash
         run: |
           set -euxo pipefail
@@ -96,28 +93,7 @@ jobs:
             -o "$ROOTFS/opt/fex-ci/vma-linkaddress-probe"
           file "$ROOTFS/opt/fex-ci/vma-linkaddress-probe" > "$R/probe.file"
 
-      - name: Run stock MAP_FIXED controls
-        shell: bash
-        run: |
-          set -uxo pipefail
-          run_case() {
-            mode="$1"; name="stock-$mode"
-            set +e
-            FEX_ROOTFS="$ROOTFS" timeout 30s /tmp/fex-stock/FEX /opt/fex-ci/vma-linkaddress-probe "$mode" \
-              > "$R/$name.stdout" 2> "$R/$name.stderr"
-            rc=$?
-            set -e
-            echo "$rc" > "$R/$name.exit"
-            printf '%s=%s\n' "$name" "$rc" | tee -a "$R/stock-matrix.txt"
-            grep -E 'VMA |Input address for AddThunkTrampoline' "$R/$name.stderr" > "$R/$name.key-lines" || true
-            cat "$R/$name.key-lines"
-          }
-          set -e
-          : > "$R/stock-matrix.txt"
-          run_case map-fixed
-          run_case map-fixed-reregister
-
-      - name: Apply current lifetime candidate and rebuild runtime
+      - name: Apply current lifetime candidate and rebuild
         shell: bash
         run: |
           set -euxo pipefail
@@ -132,27 +108,20 @@ jobs:
           mkdir -p /tmp/fex-current
           cp src/build/Bin/FEX src/build/Bin/FEXServer /tmp/fex-current/
 
-      - name: Run current lifetime candidate controls
+      - name: Run current candidate failed MAP_FIXED control
         shell: bash
         run: |
-          set -uxo pipefail
-          run_case() {
-            mode="$1"; name="current-$mode"
-            set +e
-            FEX_ROOTFS="$ROOTFS" timeout 30s /tmp/fex-current/FEX /opt/fex-ci/vma-linkaddress-probe "$mode" \
-              > "$R/$name.stdout" 2> "$R/$name.stderr"
-            rc=$?
-            set -e
-            echo "$rc" > "$R/$name.exit"
-            printf '%s=%s\n' "$name" "$rc" | tee -a "$R/current-matrix.txt"
-            grep -E 'VMA |DIAG_REVOKED_H|DIAG_LOCKED|DIAG_MULTI|DIAG_INTEGRATED' "$R/$name.stderr" \
-              > "$R/$name.key-lines" || true
-            cat "$R/$name.key-lines"
-          }
+          set +e
+          FEX_ROOTFS="$ROOTFS" timeout 30s /tmp/fex-current/FEX \
+            /opt/fex-ci/vma-linkaddress-probe map-fixed-fail \
+            > "$R/current-fail.stdout" 2> "$R/current-fail.stderr"
+          rc=$?
           set -e
-          : > "$R/current-matrix.txt"
-          run_case map-fixed
-          run_case map-fixed-reregister
+          echo "$rc" > "$R/current-fail.exit"
+          printf 'current-fail=%s\n' "$rc" | tee "$R/current-matrix.txt"
+          grep -E 'VMA |DIAG_REVOKED_H|DIAG_LOCKED|DIAG_MULTI' "$R/current-fail.stderr" \
+            > "$R/current-fail.key-lines" || true
+          cat "$R/current-fail.key-lines"
 
       - name: Add pre-MAP_FIXED retirement hook and rebuild
         shell: bash
@@ -160,36 +129,29 @@ jobs:
           set -euxo pipefail
           python3 .github/fieldwork/pre_map_fixed_retire.py src
           git -C src diff --check
-          git -C src diff > "$R/pre-map-fixed-candidate.diff"
-          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-pre-map-fixed.log" 2>&1
+          git -C src diff > "$R/pre-retire-no-rollback.diff"
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-pre-retire.log" 2>&1
 
-      - name: Run pre-MAP_FIXED retirement controls
+      - name: Run no-rollback failed MAP_FIXED discriminator
         shell: bash
         run: |
-          set -uxo pipefail
-          run_case() {
-            mode="$1"; name="pre-retire-$mode"
-            set +e
-            FEX_ROOTFS="$ROOTFS" timeout 30s "$GITHUB_WORKSPACE/src/build/Bin/FEX" /opt/fex-ci/vma-linkaddress-probe "$mode" \
-              > "$R/$name.stdout" 2> "$R/$name.stderr"
-            rc=$?
-            set -e
-            echo "$rc" > "$R/$name.exit"
-            printf '%s=%s\n' "$name" "$rc" | tee -a "$R/pre-retire-matrix.txt"
-            grep -E 'VMA |DIAG_MAP_FIXED|DIAG_REVOKED_H|DIAG_LOCKED|DIAG_MULTI|DIAG_INTEGRATED' "$R/$name.stderr" \
-              > "$R/$name.key-lines" || true
-            cat "$R/$name.key-lines"
-          }
+          set +e
+          FEX_ROOTFS="$ROOTFS" timeout 30s "$GITHUB_WORKSPACE/src/build/Bin/FEX" \
+            /opt/fex-ci/vma-linkaddress-probe map-fixed-fail \
+            > "$R/pre-retire-fail.stdout" 2> "$R/pre-retire-fail.stderr"
+          rc=$?
           set -e
-          : > "$R/pre-retire-matrix.txt"
-          run_case map-fixed
-          run_case map-fixed-reregister
-          cat "$R/stock-matrix.txt" "$R/current-matrix.txt" "$R/pre-retire-matrix.txt" | tee "$R/matrix.txt"
+          echo "$rc" > "$R/pre-retire-fail.exit"
+          printf 'pre-retire-no-rollback-fail=%s\n' "$rc" | tee "$R/pre-retire-matrix.txt"
+          grep -E 'VMA |DIAG_MAP_FIXED|DIAG_REVOKED_H|DIAG_LOCKED|DIAG_MULTI' "$R/pre-retire-fail.stderr" \
+            > "$R/pre-retire-fail.key-lines" || true
+          cat "$R/pre-retire-fail.key-lines"
+          cat "$R/current-matrix.txt" "$R/pre-retire-matrix.txt" | tee "$R/matrix.txt"
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: map-fixed-pre-retire-${{ github.run_id }}
-          path: receipts-map-fixed
+          name: map-fixed-failure-rollback-${{ github.run_id }}
+          path: receipts-map-fixed-failure
           retention-days: 30
