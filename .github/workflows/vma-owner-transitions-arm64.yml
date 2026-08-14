@@ -1,11 +1,12 @@
-name: MAP_FIXED retirement commit-rollback transaction ARM64
+name: VMA mapping-generation owner ID ARM64
 
 on:
   push:
-    branches: [ci/map-fixed-rollback-transaction-20260814]
+    branches: [ci/vma-owner-id-20260814]
     paths:
       - diagnostics/vma-owner-transitions/vma_linkaddress_probe.cpp
       - .github/workflows/vma-owner-transitions-arm64.yml
+      - .github/fieldwork/add_vma_owner_id.py
       - .github/fieldwork/pre_map_fixed_retire.py
       - .github/fieldwork/add_map_fixed_rollback_transaction.py
       - .github/fieldwork/add_revoked_h_state.py
@@ -18,13 +19,13 @@ permissions:
   contents: read
 
 jobs:
-  rollback-transaction:
+  owner-id:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 65
+    timeout-minutes: 70
     env:
       FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
       ROOTFS: ${{ github.workspace }}/rootfs-amd64
-      R: ${{ github.workspace }}/receipts-map-fixed-rollback
+      R: ${{ github.workspace }}/receipts-owner-id
       FEX_PORTABLE: 1
       DEBIAN_FRONTEND: noninteractive
 
@@ -73,7 +74,7 @@ jobs:
             > "$R/cmake-base.log" 2>&1
           cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-base.log" 2>&1
 
-      - name: Prepare amd64 rootfs and MAP_FIXED probe
+      - name: Prepare amd64 rootfs and owner probe
         shell: bash
         run: |
           set -euxo pipefail
@@ -94,7 +95,7 @@ jobs:
             -o "$ROOTFS/opt/fex-ci/vma-linkaddress-probe"
           file "$ROOTFS/opt/fex-ci/vma-linkaddress-probe" > "$R/probe.file"
 
-      - name: Apply lifetime candidate plus transactional MAP_FIXED retirement
+      - name: Apply lifetime transaction plus owner-ID instrumentation
         shell: bash
         run: |
           set -euxo pipefail
@@ -105,16 +106,17 @@ jobs:
           python3 .github/fieldwork/add_revoked_h_state.py src
           python3 .github/fieldwork/pre_map_fixed_retire.py src
           python3 .github/fieldwork/add_map_fixed_rollback_transaction.py src
+          python3 .github/fieldwork/add_vma_owner_id.py src
           git -C src diff --check
-          git -C src diff > "$R/rollback-transaction.diff"
-          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-rollback.log" 2>&1
+          git -C src diff > "$R/owner-id.diff"
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-owner-id.log" 2>&1
 
-      - name: Run transaction matrix
+      - name: Run owner-ID matrix
         shell: bash
         run: |
           set -uxo pipefail
           run_case() {
-            mode="$1"; name="rollback-$mode"
+            mode="$1"; name="owner-$mode"
             set +e
             FEX_ROOTFS="$ROOTFS" timeout 30s "$GITHUB_WORKSPACE/src/build/Bin/FEX" \
               /opt/fex-ci/vma-linkaddress-probe "$mode" \
@@ -123,7 +125,7 @@ jobs:
             set -e
             echo "$rc" > "$R/$name.exit"
             printf '%s=%s\n' "$name" "$rc" | tee -a "$R/matrix.txt"
-            grep -E 'VMA |DIAG_MAP_FIXED|DIAG_ROLLBACK|DIAG_REVOKED_H|DIAG_LOCKED|DIAG_MULTI' \
+            grep -E 'VMA |DIAG_OWNER_|DIAG_MAP_FIXED|DIAG_ROLLBACK|DIAG_REVOKED_H|DIAG_MULTI' \
               "$R/$name.stderr" > "$R/$name.key-lines" || true
             cat "$R/$name.key-lines"
           }
@@ -132,11 +134,12 @@ jobs:
           run_case map-fixed-fail
           run_case map-fixed
           run_case map-fixed-reregister
+          run_case mprotect-owner
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: map-fixed-rollback-transaction-${{ github.run_id }}
-          path: receipts-map-fixed-rollback
+          name: vma-owner-id-${{ github.run_id }}
+          path: receipts-owner-id
           retention-days: 30
