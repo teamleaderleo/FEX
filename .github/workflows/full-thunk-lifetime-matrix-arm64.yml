@@ -61,51 +61,45 @@ jobs:
 
           p = Path('src/FEXCore/Source/Interface/Core/LookupCache.h')
           s = p.read_text()
-          old = '''    return BlockList.insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, CodePages}).first->second;
-          }'''
-          new = '''    auto& Entry = BlockList.insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, CodePages}).first->second;
-            // Custom-IR blocks have no decoded guest CodePages, but still need a
-            // cache-retirement index for RemoveCustomIREntrypoint's range invalidation.
-            if (CodePages.empty()) {
-              this->CodePages[Address >> 12].push_back(Address);
-            }
-            return Entry;
-          }'''
-          if old not in s:
-              raise SystemExit('shared AddBlockMapping site missing')
-          s = s.replace(old, new, 1)
+          needle = '    return BlockList.insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, CodePages}).first->second;'
+          replacement = '''    auto& Entry = BlockList.insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, CodePages}).first->second;
+              // Custom-IR blocks have no decoded guest CodePages, but still need a
+              // cache-retirement index for RemoveCustomIREntrypoint's range invalidation.
+              if (CodePages.empty()) {
+                this->CodePages[Address >> 12].push_back(Address);
+              }
+              return Entry;'''
+          if s.count(needle) != 1:
+              raise SystemExit(f'shared AddBlockMapping line count={s.count(needle)}')
+          s = s.replace(needle, replacement, 1)
 
-          old = '''    for (const auto& CodePage : Entry.CodePages) {
+          local_old = '''    for (const auto& CodePage : Entry.CodePages) {
               CachedCodePages[CodePage >> 12].insert(Address);
-            }
-
-            // Do L1'''
-          new = '''    if (Entry.CodePages.empty()) {
+            }'''
+          local_new = '''    if (Entry.CodePages.empty()) {
               CachedCodePages[Address >> 12].insert(Address);
             } else {
               for (const auto& CodePage : Entry.CodePages) {
                 CachedCodePages[CodePage >> 12].insert(Address);
               }
-            }
-
-            // Do L1'''
-          if old not in s:
-              raise SystemExit('local CacheBlockMapping site missing')
-          s = s.replace(old, new, 1)
+            }'''
+          if s.count(local_old) != 1:
+              raise SystemExit(f'local CacheBlockMapping block count={s.count(local_old)}')
+          s = s.replace(local_old, local_new, 1)
           p.write_text(s)
 
           core = Path('src/FEXCore/Source/Interface/Core/Core.cpp')
           s = core.read_text()
           old = '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  HasCustomIRHandlers = true;'
           new = '  auto InsertedIterator = CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {Handler, Creator, Data});\n  fprintf(stderr, "DIAG_CUSTOM_ADD H=%#lx inserted=%d data=%p\\n", Entrypoint, InsertedIterator.second ? 1 : 0, Data);\n  HasCustomIRHandlers = true;'
-          if old not in s:
-              raise SystemExit('custom add trace site missing')
+          if s.count(old) != 1:
+              raise SystemExit(f'custom add site count={s.count(old)}')
           s = s.replace(old, new, 1)
 
           old = '  CustomIRHandlers.erase(Entrypoint);\n  HasCustomIRHandlers = !CustomIRHandlers.empty();\n  SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);'
           new = '  auto Erased = CustomIRHandlers.erase(Entrypoint);\n  HasCustomIRHandlers = !CustomIRHandlers.empty();\n  SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);\n  fprintf(stderr, "DIAG_CUSTOM_REMOVE_RANGE H=%#lx handler=%zu\\n", Entrypoint, Erased);'
-          if old not in s:
-              raise SystemExit('custom remove trace site missing')
+          if s.count(old) != 1:
+              raise SystemExit(f'custom remove site count={s.count(old)}')
           s = s.replace(old, new, 1)
 
           fn = s.find('void ContextImpl::AddThunkTrampolineIRHandler')
