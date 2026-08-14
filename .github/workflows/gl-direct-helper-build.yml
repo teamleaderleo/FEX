@@ -99,6 +99,7 @@ jobs:
           grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
           nm -D guest/libfex-GL-bridge.so | tee "$R/bridge.symbols"
           grep -q 'FEXGLBridgeMalloc' "$R/bridge.symbols"
+          grep -q 'fex_gl_bridge_malloc_unpacker' "$R/bridge.symbols"
           grep -q 'fex_gl_bridge_xsync_unpacker' "$R/bridge.symbols"
           grep -q 'fex_gl_bridge_xgetvisualinfo_unpacker' "$R/bridge.symbols"
           grep -q 'fex_gl_bridge_xdisplaystring_unpacker' "$R/bridge.symbols"
