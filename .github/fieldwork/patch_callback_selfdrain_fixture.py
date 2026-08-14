@@ -18,9 +18,6 @@ def main() -> None:
     guest = root / 'guest/guest_dso.cpp'
     makefile = root / 'Makefile'
 
-    # patch_callback_inflight_fixture.py already added dlfcn-capable guest code
-    # and the callback registration thunks. Add a self handle used only by this
-    # adversarial fixture.
     if '#include <dlfcn.h>' not in guest.read_text():
         once(guest, '#include <cstdint>\n', '#include <cstdint>\n#include <dlfcn.h>\n', 'guest dlfcn include')
 
@@ -34,7 +31,7 @@ def main() -> None:
     once(
         guest,
         '''  return generation * 10000 + x * 10 + 3;\n}\n''',
-        '''  if (callback_self_handle) {\n    void* handle = callback_self_handle;\n    callback_self_handle = nullptr;\n    // This runs while FEX's host-to-guest callback descriptor is active.\n    // Descriptor-only teardown can unmap the frame. A drain that waits for\n    // Active==0 can instead wait on the lease held by this same thread.\n    const int close_rc = dlclose(handle);\n    if (close_rc != 0) {\n      return -8000 + close_rc;\n    }\n  }\n  return generation * 10000 + x * 10 + 3;\n}\n''',
+        '''  if (callback_self_handle) {\n    void* handle = callback_self_handle;\n    callback_self_handle = nullptr;\n    const int close_rc = dlclose(handle);\n    if (close_rc != 0) {\n      return -8000 + close_rc;\n    }\n  }\n  return generation * 10000 + x * 10 + 3;\n}\n''',
         'self-close in callback target',
     )
 
@@ -120,8 +117,8 @@ int main() {
 
     once(
         makefile,
-        '''all: guest/fex_full_lifetime host/libfex_thunk_host-lifetime.so\n''',
-        '''all: guest/fex_full_lifetime guest/callback_selfdrain host/libfex_thunk_host-lifetime.so\n''',
+        'all: guest/liblifetime-guest.so guest/fex_full_lifetime guest/callback_inflight host/lifetime-host.so\n',
+        'all: guest/liblifetime-guest.so guest/fex_full_lifetime guest/callback_inflight guest/callback_selfdrain host/lifetime-host.so\n',
         'make all selfdrain',
     )
     makefile.write_text(makefile.read_text() + '''\n
