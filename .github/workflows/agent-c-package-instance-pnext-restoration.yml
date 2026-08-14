@@ -1,0 +1,57 @@
+name: Agent C package validated instance pNext restoration
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-package-instance-pnext-restoration.yml]
+
+permissions:
+  contents: write
+
+env:
+  BASE_SHA: c011366706eaf65a00380003989b3a10811212b6
+  FIELDWORK_SHA: 8aab7fb4412948b040e1886bb9aa252205ded9c7
+  TARGET_BRANCH: fix/vulkan-instance-pnext-callback-restoration
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.TARGET_BRANCH }}
+          path: src
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Apply exact validated candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git -C src rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C fieldwork rev-parse HEAD)" = "$FIELDWORK_SHA"
+          python3 fieldwork/investigations/fex-vulkan-thunk-lifecycle/apply_instance_pnext_callback_restoration.py src
+          git -C src diff --check
+          git -C src diff --exit-code -- ThunkLibs/libvulkan/Host.cpp && exit 1 || true
+          test "$(git -C src status --short | wc -l)" -eq 1
+          git -C src status --short | grep -q '^ M ThunkLibs/libvulkan/Host.cpp$'
+          git -C src diff -- ThunkLibs/libvulkan/Host.cpp
+
+      - name: Commit and push source branch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git -C src config user.name 'Leo'
+          git -C src config user.email 'cheerleaderleo@outlook.com'
+          git -C src add ThunkLibs/libvulkan/Host.cpp
+          git -C src commit -m 'ThunkLibs/vulkan: preserve instance pNext callback inputs'
+          git -C src push origin HEAD:"$TARGET_BRANCH"
+          git -C src rev-parse HEAD
