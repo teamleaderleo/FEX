@@ -1,0 +1,39 @@
+name: Thunkgen custom registry regression
+on:
+  workflow_dispatch:
+  push:
+    branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
+    paths:
+      - LINUX_FIELDWORK_GENERATED_CUSTOM_REGISTRY.py
+      - LINUX_FIELDWORK_GENERATED_CUSTOM_REGISTRY_TEST.py
+      - .github/workflows/linux-fieldwork-thunkgen-custom-registry-test.yml
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang lld clang-tools libclang-dev llvm-dev pkg-config ccache gcc-x86-64-linux-gnu g++-x86-64-linux-gnu gcc-i686-linux-gnu g++-i686-linux-gnu libcap-dev libglfw3-dev libepoxy-dev python3-dev libsdl2-dev libasound2-dev libdrm-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libgl-dev libegl-dev libvulkan-dev
+      - name: Apply generator candidate and test
+        run: |
+          set -euxo pipefail
+          git apply --check LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
+          git apply LINUX_FIELDWORK_NATIVE_FIRST_V3.patch
+          python3 LINUX_FIELDWORK_GENERATED_CUSTOM_REGISTRY.py
+          python3 LINUX_FIELDWORK_GENERATED_CUSTOM_REGISTRY_TEST.py
+          git diff --check
+      - name: Configure
+        run: |
+          set -euxo pipefail
+          C=$(dirname "$(find /usr/lib/llvm-18 -name ClangConfig.cmake -print -quit)")
+          L=$(dirname "$(find /usr/lib/llvm-18 -name LLVMConfig.cmake -print -quit)")
+          CC=clang CXX=clang++ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=False -DENABLE_ASSERTIONS=True -DBUILD_TESTING=True -DBUILD_THUNKS=False -DBUILD_FEXCONFIG=False -DRANGES_NATIVE=OFF -DClang_DIR="$C" -DLLVM_DIR="$L"
+      - name: Run thunk generator tests
+        run: cmake --build build --target thunkgen_tests -j"$(nproc)"
