@@ -89,6 +89,7 @@ jobs:
         run: |
           set -euxo pipefail
           python3 diagnostics/thunk-range-retirement-2608/apply_exact_customir_retirement_v2.py
+          python3 diagnostics/thunk-range-retirement-2608/repair_exact_customir_retirement_v2_compile.py
           git diff --check
           git diff -- FEXCore Source > "$R/v2.diff"
           cmake --build build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-v2.log" 2>&1
