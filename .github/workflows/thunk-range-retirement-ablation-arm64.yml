@@ -1,0 +1,105 @@
+name: CustomIR retirement ownership ablation
+
+on:
+  push:
+    branches: [diagnostic/thunk-range-retirement-2608]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ablation:
+    name: ${{ matrix.mode }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [baseline, registry-only, cache-only, full]
+    env:
+      FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-${{ matrix.mode }}
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and fixture
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang lld libclang-dev llvm-dev pkg-config libcap-dev gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'fex=%s\nfieldwork=%s\ncarrier=%s\nmode=%s\n' "$(git rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" "$GITHUB_SHA" '${{ matrix.mode }}' > "$R/identity.txt"
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+
+      - name: Apply selected ownership mode
+        if: matrix.mode != 'baseline'
+        run: |
+          set -euxo pipefail
+          python3 diagnostics/thunk-range-retirement-2608/apply_exact_customir_retirement_v2.py
+          python3 diagnostics/thunk-range-retirement-2608/repair_exact_customir_retirement_v2_compile.py
+          python3 diagnostics/thunk-range-retirement-2608/select_exact_customir_retirement_mode.py '${{ matrix.mode }}'
+          git diff --check
+          git diff -- FEXCore Source > "$R/applied.diff"
+
+      - name: Build FEX and server
+        run: |
+          set -euxo pipefail
+          CC=clang CXX=clang++ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
+          cmake --build build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build.log" 2>&1
+          test -x build/Bin/FEX
+          test -x build/Bin/FEXServer
+
+      - name: Prepare amd64 guest
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci/link"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cd /tmp/repro/fex-linkaddress-guest
+          make clean all CXX=x86_64-linux-gnu-g++
+          cp fex_link_lifetime libguest_link_lifetime.so "$ROOTFS/opt/fex-ci/link/"
+
+      - name: Run forced-different reload discriminator
+        run: |
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/link" && FEX_ROOTFS="$ROOTFS" timeout 45s "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/link/fex_link_lifetime --force-different) > "$R/stdout.txt" 2> "$R/stderr.txt"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/exit.txt"
+          grep -E 'stable native|proof:|reload invoker|reserved old|old invoker after reload|new invoker after reload|linked entry|fresh direct' "$R/stdout.txt" > "$R/key-lines.txt" || true
+          grep -E 'already linked elsewhere|Retiring guest trampoline' "$R/stderr.txt" >> "$R/key-lines.txt" || true
+          cat "$R/key-lines.txt"
+          printf 'mode=%s\nrc=%s\n' '${{ matrix.mode }}' "$rc" | tee "$R/summary.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: customir-retirement-${{ matrix.mode }}-${{ github.run_id }}
+          path: receipts-${{ matrix.mode }}
+          if-no-files-found: warn
