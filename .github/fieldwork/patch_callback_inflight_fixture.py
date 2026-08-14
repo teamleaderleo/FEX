@@ -21,9 +21,9 @@ anchor = '    if (cb_before != want_cb) return 11;\n\n'
 block = r'''    if (cb_before != want_cb) return 11;
 
     if (callback_race_unmap || callback_race_pin) {
-      const char* arm = "/tmp/fex-callback-race-arm";
-      const char* entered = "/tmp/fex-callback-race-entered";
-      const char* release = "/tmp/fex-callback-race-release";
+      const char* arm = "./fex-callback-race-arm";
+      const char* entered = "./fex-callback-race-entered";
+      const char* release = "./fex-callback-race-release";
       unlink(arm); unlink(entered); unlink(release);
       {
         FILE* f = fopen(arm, "w");
