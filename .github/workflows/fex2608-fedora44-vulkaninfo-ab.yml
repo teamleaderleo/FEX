@@ -130,15 +130,22 @@ jobs:
           docker rm "$cid"
           trap - EXIT
 
-          # Use the runner's native-ARM DNF only as a package solver/downloader.
-          # --forcearch=x86_64 and --installroot keep the installed payload x86-64;
-          # no Fedora x86-64 executable is run during rootfs construction.
+          FEDORA_KEY="$ROOTFS/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-44-x86_64"
+          test -r "$FEDORA_KEY"
+          sha256sum "$FEDORA_KEY" | tee "$R/fedora-gpg-key.sha256"
+
+          # Ubuntu's ARM-native DNF is only the solver/installer. DNF 4 does not
+          # rewrite file:// GPG-key URLs relative to --installroot, so point the
+          # Fedora repo IDs explicitly at the key in the exported Fedora rootfs.
+          # No Fedora x86-64 executable is run during rootfs construction.
           sudo dnf -y \
             --installroot="$ROOTFS" \
             --releasever=44 \
             --forcearch=x86_64 \
             --setopt=install_weak_deps=False \
             --setopt=cachedir="$RUNNER_TEMP/dnf-cache" \
+            --setopt="fedora.gpgkey=file://$FEDORA_KEY" \
+            --setopt="updates.gpgkey=file://$FEDORA_KEY" \
             install vulkan-tools libX11 libX11-xcb libxcb libXrandr libXrender \
             > "$R/dnf-install.log" 2>&1
 
