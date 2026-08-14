@@ -43,10 +43,11 @@ jobs:
           CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
             -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_X86_HOST_DEBUG=ON \
             -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
             -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
             > "$R/cmake.log" 2>&1
-          cmake --build src/build --target thunkgen -- -j"$(nproc)" -v > "$R/build-thunkgen.log" 2>&1
+          cmake --build src/build --target thunkgen -- -j"$(nproc)" -v > "$R/build-thunkgen.log" 2>&1 || { tail -n 200 "$R/build-thunkgen.log"; exit 1; }
       - name: Build split Vulkan guest pair
         run: |
           set -euxo pipefail
