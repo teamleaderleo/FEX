@@ -1,0 +1,39 @@
+name: Callback in-flight fixture discovery
+on:
+  push:
+    branches: [ci/callback-inflight-fixture-discovery-20260814]
+    paths: [.github/workflows/callback-inflight-fixture-discovery.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
+          path: fieldwork
+          fetch-depth: 1
+      - name: Extract and print callback fixture context
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro receipts
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          find /tmp/repro/fex-full-thunk-pair -maxdepth 3 -type f -print | sort | tee receipts/files.txt
+          for f in /tmp/repro/fex-full-thunk-pair/guest/* /tmp/repro/fex-full-thunk-pair/host/*; do
+            test -f "$f" || continue
+            echo "===== $f ====="
+            grep -n -E -C 16 'callback|Callback|reload|dlclose|retained|generation|thread|pthread' "$f" || true
+          done | tee receipts/callback-context.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: callback-inflight-fixture-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
