@@ -1,9 +1,10 @@
-name: Derived GL resident bridge build 32-bit
+name: Directional GL resident bridge build 32-bit
 
 on:
   push:
-    branches: [ci/gl-derived-bridge-32-build-20260814]
+    branches: [ci/gl-directional-bridge-32-20260814]
     paths:
+      - .github/fieldwork/apply_directional_resident_bridge.py
       - .github/workflows/gl-derived-bridge-build-32.yml
   workflow_dispatch:
 
@@ -11,11 +12,11 @@ permissions:
   contents: read
 
 jobs:
-  gl-bridge-32:
+  gl-directional-bridge-32:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 55
     env:
-      R: ${{ github.workspace }}/receipts-gl-bridge-32
+      R: ${{ github.workspace }}/receipts-gl-directional-32
       DEBIAN_FRONTEND: noninteractive
       PROTOTYPE_SHA: 9bfbf20080cc58a12d3fc5ace127893940a0b035
     steps:
@@ -38,8 +39,19 @@ jobs:
             libxrandr-dev libxrender-dev binutils
           git rev-parse HEAD | tee "$R/carrier-sha.txt"
           git merge-base --is-ancestor "$PROTOTYPE_SHA" HEAD
-          git diff --name-only "$PROTOTYPE_SHA" HEAD -- ThunkLibs FEXCore Source | tee "$R/product-source-diff.txt"
-          test ! -s "$R/product-source-diff.txt"
+          git diff --name-only "$PROTOTYPE_SHA" HEAD -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+
+      - name: Apply typed directional bridge prototype
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/apply_directional_resident_bridge.py
+          git diff --check
+          git diff -- ThunkLibs/Generator/gen.cpp ThunkLibs/Generator/extract_guest_bridge.py | tee "$R/directional-generator.diff"
+          grep -q 'resident_callback_sha256s' ThunkLibs/Generator/gen.cpp
+          grep -q 'FEX_RESIDENT_CALLBACK_DIRECTION' ThunkLibs/Generator/gen.cpp
+          grep -q 'needs_unpacker' ThunkLibs/Generator/extract_guest_bridge.py
 
       - name: Build thunk generator
         shell: bash
@@ -54,7 +66,7 @@ jobs:
             -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
           cmake --build build --target thunkgen -- -j"$(nproc)" -v > "$R/build-thunkgen.log" 2>&1
 
-      - name: Wire and build 32-bit GL bridge
+      - name: Wire and build directional 32-bit GL bridge
         shell: bash
         run: |
           set -euxo pipefail
@@ -87,18 +99,31 @@ jobs:
           ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
           grep -q 'NEEDED.*libfex-GL-bridge.so' "$R/wrapper.dynamic"
           grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
-          grep '^MAKE_CALLBACK_THUNK' guest32/gen/thunkgen_guest_libGL.inl > "$R/source-thunks.txt"
-          grep '^MAKE_CALLBACK_THUNK' guest32/gen/thunkgen_guest_libGL_bridge.inl > "$R/bridge-thunks.txt"
+
+          grep '^[[:space:]]*MAKE_CALLBACK_THUNK' guest32/gen/thunkgen_guest_libGL.inl > "$R/source-thunks.txt"
+          grep '^[[:space:]]*MAKE_CALLBACK_THUNK' guest32/gen/thunkgen_guest_libGL_bridge.inl > "$R/bridge-thunks.txt"
           diff -u "$R/source-thunks.txt" "$R/bridge-thunks.txt"
-          wc -l "$R/source-thunks.txt" | tee "$R/signature-count.txt"
+
+          total="$(wc -l < "$R/source-thunks.txt")"
+          callback="$(grep -c 'FEX_RESIDENT_CALLBACK_DIRECTION' guest32/gen/thunkgen_guest_libGL.inl || true)"
+          invokers="$(grep -c '^extern "C" uintptr_t fex_bridge_libGL_invoker_.*() {' guest32/gen/thunkgen_guest_libGL_bridge.inl || true)"
+          unpackers="$(grep -c '^extern "C" uintptr_t fex_bridge_libGL_unpacker_.*() {' guest32/gen/thunkgen_guest_libGL_bridge.inl || true)"
+          printf 'total_host_call_signatures=%s\ncallback_direction_signatures=%s\nresident_invokers=%s\nresident_unpackers=%s\n' \
+            "$total" "$callback" "$invokers" "$unpackers" | tee "$R/directional-counts.txt"
+          test "$total" -eq 717
+          test "$callback" -gt 0
+          test "$callback" -lt "$total"
+          test "$invokers" -eq "$total"
+          test "$unpackers" -eq "$callback"
+
           grep -q 'FEXGetResidentCallerForHostFunction' guest32/gen/thunkgen_guest_libGL_bridge_accessors.inl
           grep -q 'FEXAllocateResidentHostTrampolineForGuestFunction' guest32/gen/thunkgen_guest_libGL_bridge_accessors.inl
-          echo DERIVED_GL_BRIDGE_32_BUILD_OK | tee "$R/result.txt"
+          echo DIRECTIONAL_GL_BRIDGE_32_BUILD_OK | tee "$R/result.txt"
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gl-derived-bridge-32-${{ github.run_id }}
-          path: receipts-gl-bridge-32
+          name: gl-directional-bridge-32-${{ github.run_id }}
+          path: receipts-gl-directional-32
           retention-days: 30
