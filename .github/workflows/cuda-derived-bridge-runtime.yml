@@ -1,0 +1,192 @@
+name: Derived CUDA resident bridge runtime
+
+on:
+  push:
+    branches: [diagnostic/cuda-derived-bridge-output]
+    paths:
+      - .github/workflows/cuda-derived-bridge-runtime.yml
+      - ThunkLibs/Generator/extract_guest_bridge.py
+      - ThunkLibs/libcuda/**
+      - ThunkLibs/libcuda_bridge/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-derived:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs-cuda-derived
+      R: ${{ github.workspace }}/receipts-cuda-derived
+      H: ${{ github.workspace }}/host-cuda-derived
+      NATIVE: ${{ github.workspace }}/native-cuda-derived
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H" "$NATIVE"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils libcap-dev
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+
+      - name: Build FEX and CUDA host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer cuda-host-64 -- -j"$(nproc)" \
+            > "$R/build-host.log" 2>&1 || { tail -n 320 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libcuda-host.so "$H/libcuda-host.so"
+
+      - name: Build derived CUDA guest bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s = p.read_text()
+          anchor = '''generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp)\nadd_guest_lib(cuda "libcuda.so.1")\n'''
+          block = '''generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp)\n\nset(CUDA_GUEST_INL "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libcuda.inl")\nset(CUDA_BRIDGE_INL "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libcuda_bridge.inl")\nset(CUDA_BRIDGE_ACCESSORS "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libcuda_bridge_accessors.inl")\nadd_custom_command(\n  OUTPUT "${CUDA_BRIDGE_INL}" "${CUDA_BRIDGE_ACCESSORS}"\n  DEPENDS "${CUDA_GUEST_INL}" "${FEX_PROJECT_SOURCE_DIR}/ThunkLibs/Generator/extract_guest_bridge.py"\n  COMMAND "${Python3_EXECUTABLE}"\n    "${FEX_PROJECT_SOURCE_DIR}/ThunkLibs/Generator/extract_guest_bridge.py"\n    "${CUDA_GUEST_INL}" "${CUDA_BRIDGE_INL}" "${CUDA_BRIDGE_ACCESSORS}" --prefix libcuda\n  VERBATIM)\nadd_custom_target(cuda-bridge-generated DEPENDS "${CUDA_BRIDGE_INL}" "${CUDA_BRIDGE_ACCESSORS}")\n\nadd_library(libcuda_bridge-guest-deps INTERFACE)\ntarget_link_libraries(libcuda_bridge-guest-deps INTERFACE libcuda-guest-deps)\nset(GEN_libcuda_bridge "${CUDA_BRIDGE_INL}" "${CUDA_BRIDGE_ACCESSORS}")\nadd_guest_lib(cuda_bridge "libfex-cuda-bridge.so")\nset_target_properties(cuda_bridge-guest PROPERTIES OUTPUT_NAME "fex-cuda-bridge")\ntarget_link_options(cuda_bridge-guest PRIVATE "LINKER:-z,nodelete")\nadd_dependencies(cuda_bridge-guest cuda-bridge-generated)\n\nadd_guest_lib(cuda "libcuda.so.1")\ntarget_link_libraries(cuda-guest PRIVATE cuda_bridge-guest)\nadd_dependencies(cuda-guest cuda-bridge-generated)\n'''
+          if s.count(anchor) != 1:
+              raise SystemExit(f'CUDA guest CMake anchor count={s.count(anchor)}')
+          p.write_text(s.replace(anchor, block, 1))
+          PY
+          git diff --check
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target cuda-guest cuda_bridge-guest -- -j"$(nproc)" \
+            > "$R/build-guest.log" 2>&1 || { tail -n 400 "$R/build-guest.log"; exit 1; }
+
+          readelf -d guest/libcuda-guest.so > "$R/wrapper.dynamic"
+          readelf -d guest/libfex-cuda-bridge.so > "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-cuda-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libcuda.inl | tee "$R/guest-signature-count.txt"
+          grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libcuda_bridge.inl | tee "$R/bridge-signature-count.txt"
+          stat -c 'bridge_file_bytes=%s' guest/libfex-cuda-bridge.so | tee "$R/bridge-size.txt"
+
+      - name: Build fake native CUDA library
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/fakecuda.c <<'EOF'
+          #include <stdint.h>
+          #include <string.h>
+          typedef int CUresult;
+          typedef int CUdriverProcAddressQueryResult;
+          CUresult cuDriverGetVersion(int *driverVersion) {
+            if (driverVersion) *driverVersion = 12080;
+            return 0;
+          }
+          CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion, uint64_t flags,
+                                       CUdriverProcAddressQueryResult *status) {
+            (void)cudaVersion; (void)flags;
+            if (!symbol || !pfn) return 1;
+            if (!strcmp(symbol, "cuDriverGetVersion")) {
+              *pfn = (void*)cuDriverGetVersion;
+              if (status) *status = 0;
+              return 0;
+            }
+            *pfn = 0;
+            if (status) *status = 1;
+            return 500;
+          }
+          EOF
+          cc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libcuda.so.1 \
+            /tmp/fakecuda.c -o "$NATIVE/libcuda.so.1"
+          nm -D "$NATIVE/libcuda.so.1" | tee "$R/fakecuda.symbols"
+
+      - name: Create amd64 rootfs and probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libcuda-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libcuda.so.1"
+          cp guest/libfex-cuda-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-cuda-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat > /tmp/cudaprobe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mman.h>
+          typedef int CUresult;
+          typedef int CUdriverProcAddressQueryResult;
+          typedef CUresult (*GETPROC)(const char*, void**, int, uint64_t, CUdriverProcAddressQueryResult*);
+          typedef CUresult (*DRIVERGETVER)(int*);
+          struct span { uintptr_t a,b; }; static struct span old[16]; static unsigned oldn;
+          static int mapped(void*p){FILE*f=fopen("/proc/self/maps","r");char l[1024];uintptr_t x=(uintptr_t)p;if(!f)return -1;while(fgets(l,sizeof l,f)){unsigned long a,b;if(sscanf(l,"%lx-%lx",&a,&b)==2&&x>=a&&x<b){fclose(f);return 1;}}fclose(f);return 0;}
+          static int maps_name(const char*n){FILE*f=fopen("/proc/self/maps","r");char l[1024];int c=0;if(!f)return -1;while(fgets(l,sizeof l,f))if(strstr(l,n))++c;fclose(f);return c;}
+          static void capture(void*needle){FILE*f=fopen("/proc/self/maps","r");char l[1024],path[512]={0};uintptr_t x=(uintptr_t)needle;if(!f)exit(70);while(fgets(l,sizeof l,f)){unsigned long a,b;char p[512]={0};if(sscanf(l,"%lx-%lx %*s %*s %*s %*s %511s",&a,&b,p)==3&&x>=a&&x<b){snprintf(path,sizeof path,"%s",p);break;}}if(!path[0])exit(71);rewind(f);oldn=0;while(fgets(l,sizeof l,f)){unsigned long a,b;char p[512]={0};if(sscanf(l,"%lx-%lx %*s %*s %*s %*s %511s",&a,&b,p)==3&&!strcmp(p,path)&&oldn<16)old[oldn++]=(struct span){a,b};}fclose(f);if(!oldn)exit(72);}
+          static void reserve_old(void){for(unsigned i=0;i<oldn;i++){size_t n=old[i].b-old[i].a;if(mmap((void*)old[i].a,n,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0)==MAP_FAILED){fprintf(stderr,"RESERVE_FAIL %lx errno=%d\n",old[i].a,errno);exit(73);}}}
+          int main(void){
+            void*h1=dlopen("libcuda.so.1",RTLD_NOW|RTLD_LOCAL);if(!h1){fprintf(stderr,"DLOPEN1 %s\n",dlerror());return 2;}
+            GETPROC get1=(GETPROC)dlsym(h1,"cuGetProcAddress_v2");if(!get1)return 3;void*praw1=0;CUdriverProcAddressQueryResult st=99;if(get1("cuDriverGetVersion",&praw1,12080,0,&st)||!praw1||st)return 4;DRIVERGETVER p1=(DRIVERGETVER)praw1;int v1=0;if(p1(&v1)||v1!=12080)return 5;
+            fprintf(stderr,"CUDA_GEN1 get=%p H=%p version=%d bridge_maps=%d\n",(void*)get1,praw1,v1,maps_name("libfex-cuda-bridge.so"));capture((void*)get1);
+            if(dlclose(h1))return 6;if(mapped((void*)get1)!=0)return 7;int vr=0;if(p1(&vr)||vr!=12080)return 8;fprintf(stderr,"CUDA_RETAINED_AFTER_CLOSE version=%d\n",vr);reserve_old();
+            void*h2=dlopen("libcuda.so.1",RTLD_NOW|RTLD_LOCAL);if(!h2){fprintf(stderr,"DLOPEN2 %s\n",dlerror());return 9;}GETPROC get2=(GETPROC)dlsym(h2,"cuGetProcAddress_v2");void*praw2=0;st=99;if(!get2||get2("cuDriverGetVersion",&praw2,12080,0,&st)||!praw2||st)return 10;DRIVERGETVER p2=(DRIVERGETVER)praw2;int v2=0;if(p2(&v2)||v2!=12080)return 11;
+            fprintf(stderr,"CUDA_GEN2 get=%p moved=%d H1=%p H2=%p same_H=%d version=%d\n",(void*)get2,get2!=get1,praw1,praw2,praw1==praw2,v2);if(get2==get1||praw1!=praw2)return 12;if(dlclose(h2))return 13;int vf=0;if(p1(&vf)||vf!=12080)return 14;fprintf(stderr,"CUDA_FINAL_RETAINED version=%d\nCUDA_DERIVED_BRIDGE_OK\n",vf);return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/cudaprobe.c -ldl -o "$ROOTFS/opt/fex-ci/cudaprobe"
+
+      - name: Run CUDA bridge discriminator
+        shell: bash
+        run: |
+          set -uxo pipefail
+          set +e
+          LD_LIBRARY_PATH="$NATIVE" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 45s \
+            build/Bin/FEX /opt/fex-ci/cudaprobe > "$R/probe.out" 2> "$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          test "$rc" -eq 0
+          grep -q CUDA_DERIVED_BRIDGE_OK "$R/probe.err"
+          grep -q 'moved=1' "$R/probe.err"
+          grep -q 'same_H=1' "$R/probe.err"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-derived-bridge-${{ github.run_id }}
+          path: receipts-cuda-derived
+          retention-days: 30
