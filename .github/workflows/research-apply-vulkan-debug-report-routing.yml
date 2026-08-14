@@ -1,26 +1,152 @@
-name: Research validate guest thunk lifetime
+name: Research validate pinned guest thunk lifetime
 
 on:
   push:
     branches: [linux-fieldwork/fex-guest-thunk-selfpin]
     paths:
       - .github/workflows/research-apply-vulkan-debug-report-routing.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 45
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-selfpin
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
           submodules: recursive
-      - name: Install dependencies
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and fixture
+        shell: bash
         run: |
+          set -euxo pipefail
+          mkdir -p "$R"
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build clang-18 lld-18 clang-tools-18 libclang-18-dev llvm-18-dev pkg-config ccache gcc-x86-64-linux-gnu g++-x86-64-linux-gnu gcc-i686-linux-gnu g++-i686-linux-gnu libc6-dev-i386-cross libcap-dev libglfw3-dev libepoxy-dev python3-dev libsdl2-dev libasound2-dev libdrm-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libgl-dev libegl-dev libvulkan-dev
-      - name: Build
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils
+          printf 'fex=%s\nfieldwork=%s\ncarrier=%s\n' \
+            "$(git -C src rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" "$GITHUB_SHA" > "$R/identity.txt"
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          cp /tmp/repro/fex-full-thunk-pair/Makefile "$R/Makefile.baseline"
+
+      - name: Build exact current FEX
+        shell: bash
         run: |
-          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX="$PWD/install" -DUSE_LINKER=lld -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm -DENABLE_LTO=False -DENABLE_ASSERTIONS=True -DBUILD_TESTING=True -DBUILD_THUNKS=True -DBUILD_FEX_LINUX_TESTS=True -DBUILD_FEXCONFIG=False -DENABLE_CLANG_THUNKS=True -DRANGES_NATIVE=OFF
-          cmake --build build -j"$(nproc)"
-      - name: Run regression
-        run: ctest --test-dir build --output-on-failure -R '^thunk_testlib\.64\.jit\.flt$'
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
+
+      - name: Prepare rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci/full"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Baseline forced-different lifetime
+        shell: bash
+        run: |
+          set -uxo pipefail
+          PAIR=/tmp/repro/fex-full-thunk-pair
+          make -C "$PAIR" clean
+          make -C "$PAIR" HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/build-baseline.log" 2>&1
+          rm -rf "$ROOTFS/opt/fex-ci/full/guest"
+          cp -a "$PAIR/guest" "$ROOTFS/opt/fex-ci/full/"
+          readelf -d "$PAIR/guest/liblifetime-guest.so" > "$R/baseline.dynamic.txt"
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/full" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$PAIR/host" timeout 30s \
+            "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime --force-different) > "$R/baseline.stdout" 2> "$R/baseline.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/baseline.exit"
+          grep -E 'generation|reload|re-register|retained|fresh|callback|native host stable|signal=|exit=' "$R/baseline.stdout" "$R/baseline.stderr" > "$R/baseline.key-lines.txt" || true
+          cat "$R/baseline.key-lines.txt"
+
+      - name: Build guest-pinned variant
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PAIR=/tmp/repro/fex-full-thunk-pair
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('/tmp/repro/fex-full-thunk-pair/Makefile')
+          s = p.read_text()
+          if '-shared' not in s:
+              raise SystemExit('fixture Makefile has no shared-library link step')
+          # Internal policy discriminator: pin the synthetic thunk DSOs once loaded.
+          # Applying NODELETE to the host helper is harmless here because FEX already retains it;
+          # the behavior under test is the guest wrapper staying mapped after guest dlclose().
+          s = s.replace('-shared', '-shared -Wl,-z,nodelete')
+          p.write_text(s)
+          PY
+          cp "$PAIR/Makefile" "$R/Makefile.pinned"
+          make -C "$PAIR" clean
+          make -C "$PAIR" HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/build-pinned.log" 2>&1
+          readelf -d "$PAIR/guest/liblifetime-guest.so" > "$R/pinned.dynamic.txt"
+          grep -q NODELETE "$R/pinned.dynamic.txt"
+          grep NODELETE "$R/pinned.dynamic.txt"
+
+      - name: Pinned forced-different lifetime
+        shell: bash
+        run: |
+          set -uxo pipefail
+          PAIR=/tmp/repro/fex-full-thunk-pair
+          rm -rf "$ROOTFS/opt/fex-ci/full/guest"
+          cp -a "$PAIR/guest" "$ROOTFS/opt/fex-ci/full/"
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/full" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$PAIR/host" timeout 30s \
+            "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime --force-different) > "$R/pinned.stdout" 2> "$R/pinned.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/pinned.exit"
+          grep -E 'generation|reload|re-register|retained|fresh|callback|native host stable|signal=|exit=' "$R/pinned.stdout" "$R/pinned.stderr" > "$R/pinned.key-lines.txt" || true
+          cat "$R/pinned.key-lines.txt"
+          exit 0
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-thunk-selfpin-${{ github.run_id }}
+          path: receipts-selfpin
+          retention-days: 30
