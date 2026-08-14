@@ -1,0 +1,146 @@
+name: Thunk in-flight selection race ARM64
+
+on:
+  push:
+    branches: [ci/thunk-inflight-selection-race-20260814]
+    paths:
+      - .github/fieldwork/apply_multithread_owner_retire_diag.py
+      - .github/fieldwork/patch_thread_cache_fixture.py
+      - .github/fieldwork/patch_inflight_selection_fixture.py
+      - .github/fieldwork/patch_exitlink_inflight_barrier.py
+      - .github/workflows/thunk-inflight-selection-race-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inflight-race:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact FEX source under test
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout retained synthetic fixture
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_REF }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Install dependencies and prepare in-flight fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 .github/fieldwork/patch_thread_cache_fixture.py /tmp/repro
+          python3 .github/fieldwork/patch_inflight_selection_fixture.py /tmp/repro
+          grep -n 'inflight' /tmp/repro/fex-full-thunk-pair/guest/main.cpp | tee "$R/fixture-sites.txt"
+
+      - name: Apply all-thread retirement and post-selection barrier
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/patch_exitlink_inflight_barrier.py src
+          git -C src diff --check
+          git -C src diff > "$R/fex-diagnostic.diff"
+          git -C src rev-parse HEAD > "$R/product-sha.txt"
+
+      - name: Build diagnostic FEX and thunk pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
+          cd /tmp/repro/fex-full-thunk-pair
+          make clean
+          make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/build-fixture.log" 2>&1
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci/full" "$ROOTFS/tmp/fex-fieldwork"
+          chmod 0777 "$ROOTFS/tmp/fex-fieldwork"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/full/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute pin control and forced in-flight unload race
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          HOST="/tmp/repro/fex-full-thunk-pair/host"
+          BARRIER="$ROOTFS/tmp/fex-fieldwork"
+          run_case() {
+            local name="$1"; shift
+            rm -f "$BARRIER/target" "$BARRIER/selected" "$BARRIER/resume"
+            set +e
+            (cd "$ROOTFS/opt/fex-ci/full" && \
+              FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+              FEX_FIELDWORK_EXITLINK_BARRIER_DIR="$BARRIER" \
+              timeout 30s "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime "$@") \
+              > "$R/$name.stdout" 2> "$R/$name.stderr"
+            local rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            grep -E 'DIAG_MT|DIAG_INFLIGHT|inflight|INFLIGHT_RESULT|native host' \
+              "$R/$name.stdout" "$R/$name.stderr" > "$R/$name.key-lines" || true
+            cat "$R/$name.key-lines"
+            echo "$name=$rc"
+          }
+          set -e
+          run_case pin --inflight-selection --pin
+          run_case unmap --inflight-selection
+          printf 'pin=' > "$R/final-matrix.txt"; cat "$R/pin.exit" >> "$R/final-matrix.txt"
+          printf 'unmap=' >> "$R/final-matrix.txt"; cat "$R/unmap.exit" >> "$R/final-matrix.txt"
+          cat "$R/final-matrix.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunk-inflight-selection-race-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
