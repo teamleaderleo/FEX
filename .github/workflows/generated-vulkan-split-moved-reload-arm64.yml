@@ -1,0 +1,246 @@
+name: Generated Vulkan split moved reload
+
+on:
+  push:
+    branches: [diagnostic/generated-vulkan-split-bridge]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  moved-reload:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs-moved
+      R: ${{ github.workspace }}/receipts-moved
+      H: ${{ github.workspace }}/host-moved
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            mesa-vulkan-drivers binutils
+
+      - name: Build FEX host and generated split thunks
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ >"$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" \
+            >"$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest vulkan_bridge-guest -- -j"$(nproc)" \
+            >"$R/build-guest.log" 2>&1 || { tail -n 240 "$R/build-guest.log"; exit 1; }
+
+          readelf -d guest/libvulkan-guest.so | tee "$R/vulkan.dynamic"
+          readelf -d guest/libfex-vulkan-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/vulkan.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+
+      - name: Build amd64 rootfs and moved-reload probe
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 >/dev/null
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp guest/libfex-vulkan-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-vulkan-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void*d,int x){(void)d;(void)x;return 0;}
+          void *XGetVisualInfo(void*d,long m,void*t,int*c){(void)d;(void)m;(void)t;if(c)*c=0;return 0;}
+          char *XDisplayString(void*d){(void)d;return ":0";}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libX11.so.6 \
+            /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat >/tmp/probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mman.h>
+
+          #ifndef MAP_FIXED_NOREPLACE
+          #define MAP_FIXED_NOREPLACE 0x100000
+          #endif
+
+          typedef void (*PFN)(void);
+          typedef PFN (*GIPA)(void*, const char*);
+          typedef int32_t (*ENUMVER)(uint32_t*);
+
+          struct range { uintptr_t a, b; };
+
+          static int mapped(void *p) {
+            FILE *f = fopen("/proc/self/maps", "r");
+            char line[1024];
+            uintptr_t x = (uintptr_t)p;
+            if (!f) return -1;
+            while (fgets(line, sizeof(line), f)) {
+              unsigned long a, b;
+              if (sscanf(line, "%lx-%lx", &a, &b) == 2 && x >= a && x < b) {
+                fclose(f);
+                return 1;
+              }
+            }
+            fclose(f);
+            return 0;
+          }
+
+          static int maps_name(const char *needle) {
+            FILE *f = fopen("/proc/self/maps", "r");
+            char line[1024];
+            int count = 0;
+            if (!f) return -1;
+            while (fgets(line, sizeof(line), f)) if (strstr(line, needle)) ++count;
+            fclose(f);
+            return count;
+          }
+
+          static int collect_vulkan_ranges(struct range *out, int cap) {
+            FILE *f = fopen("/proc/self/maps", "r");
+            char line[1024];
+            int n = 0;
+            if (!f) return -1;
+            while (fgets(line, sizeof(line), f)) {
+              unsigned long a, b;
+              char path[512] = {0};
+              int fields = sscanf(line, "%lx-%lx %*s %*s %*s %*s %511s", &a, &b, path);
+              if (fields == 3 && strstr(path, "libvulkan.so.1") && n < cap) {
+                out[n++] = (struct range){(uintptr_t)a, (uintptr_t)b};
+              }
+            }
+            fclose(f);
+            return n;
+          }
+
+          static int reserve_ranges(struct range *ranges, int n) {
+            for (int i = 0; i < n; ++i) {
+              size_t len = ranges[i].b - ranges[i].a;
+              void *p = mmap((void*)ranges[i].a, len, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                             -1, 0);
+              if (p == MAP_FAILED) {
+                fprintf(stderr, "RESERVE_FAIL a=%p len=%zu errno=%d\n",
+                        (void*)ranges[i].a, len, errno);
+                return -1;
+              }
+              fprintf(stderr, "RESERVED a=%p b=%p\n",
+                      (void*)ranges[i].a, (void*)ranges[i].b);
+            }
+            return 0;
+          }
+
+          static void release_ranges(struct range *ranges, int n) {
+            for (int i = 0; i < n; ++i) {
+              munmap((void*)ranges[i].a, ranges[i].b - ranges[i].a);
+            }
+          }
+
+          int main(void) {
+            struct range old_ranges[16];
+            void *v1 = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!v1) { fprintf(stderr, "OPEN1_FAIL %s\n", dlerror()); return 2; }
+            GIPA g1 = (GIPA)dlsym(v1, "vkGetInstanceProcAddr");
+            ENUMVER p1 = (ENUMVER)g1(0, "vkEnumerateInstanceVersion");
+            uint32_t ver1 = 0, stale_after_close = 0, ver2 = 0;
+            if (!g1 || !p1 || p1(&ver1) != 0) return 3;
+            int nr = collect_vulkan_ranges(old_ranges, 16);
+            if (nr <= 0) return 4;
+            fprintf(stderr,
+                    "GEN1 gipa=%p H=%p version=%u ranges=%d bridge_maps=%d\n",
+                    (void*)g1, (void*)p1, ver1, nr,
+                    maps_name("libfex-vulkan-bridge.so"));
+
+            if (dlclose(v1) != 0) return 5;
+            if (mapped((void*)g1) != 0) return 6;
+            if (p1(&stale_after_close) != 0 || stale_after_close != ver1) return 7;
+            fprintf(stderr, "GEN1_CLOSED retained_H_ok=1\n");
+
+            if (reserve_ranges(old_ranges, nr) != 0) return 8;
+
+            void *v2 = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!v2) { fprintf(stderr, "OPEN2_FAIL %s\n", dlerror()); return 9; }
+            GIPA g2 = (GIPA)dlsym(v2, "vkGetInstanceProcAddr");
+            ENUMVER p2 = (ENUMVER)g2(0, "vkEnumerateInstanceVersion");
+            if (!g2 || !p2) return 10;
+            fprintf(stderr,
+                    "GEN2 gipa=%p H=%p moved=%d same_H=%d bridge_maps=%d\n",
+                    (void*)g2, (void*)p2, g2 != g1, p2 == p1,
+                    maps_name("libfex-vulkan-bridge.so"));
+            if (g2 == g1 || p2 != p1) return 11;
+            if (p2(&ver2) != 0 || ver2 != ver1) return 12;
+            fprintf(stderr, "GEN2_CALL_OK version=%u\n", ver2);
+
+            uint32_t old_again = 0;
+            if (p1(&old_again) != 0 || old_again != ver1) return 13;
+            fprintf(stderr, "OLD_H_AFTER_MOVED_RELOAD_OK version=%u\n", old_again);
+
+            if (dlclose(v2) != 0) return 14;
+            release_ranges(old_ranges, nr);
+            fprintf(stderr, "GENERATED_VULKAN_SPLIT_MOVED_RELOAD_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/probe"
+
+      - name: Run forced moved wrapper reload
+        run: |
+          set -uxo pipefail
+          LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" \
+            build/Bin/FEX /opt/fex-ci/probe >"$R/probe.out" 2>"$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          test "$rc" -eq 0
+          grep -q 'GEN1_CLOSED retained_H_ok=1' "$R/probe.err"
+          grep -q 'moved=1 same_H=1' "$R/probe.err"
+          grep -q GEN2_CALL_OK "$R/probe.err"
+          grep -q OLD_H_AFTER_MOVED_RELOAD_OK "$R/probe.err"
+          grep -q GENERATED_VULKAN_SPLIT_MOVED_RELOAD_OK "$R/probe.err"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-vulkan-split-moved-${{ github.run_id }}
+          path: receipts-moved
+          retention-days: 30
