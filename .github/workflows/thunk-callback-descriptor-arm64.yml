@@ -1,0 +1,168 @@
+name: Thunk atomic callback descriptor ARM64
+
+on:
+  push:
+    branches: [ci/thunk-callback-descriptor-20260814]
+    paths:
+      - .github/fieldwork/add_callback_descriptor.py
+      - .github/workflows/thunk-callback-descriptor-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  callback-descriptor:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout retirement helpers
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Checkout retained fixture
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_REF }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and fixture variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/base
+          tar xf /tmp/repro.tar.gz -C /tmp/base
+          for c in force aba thread multi; do cp -a /tmp/base "/tmp/$c"; done
+          python3 retirement-helper/.github/fieldwork/patch_thread_cache_fixture.py /tmp/thread
+          python3 .github/fieldwork/patch_multiowner_fixture.py /tmp/multi
+
+      - name: Apply descriptor-based integrated candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          python3 .github/fieldwork/add_callback_descriptor.py src
+          git -C src diff --check
+          git -C src diff > "$R/callback-descriptor-fex.diff"
+          grep -R -n -E 'DIAG_CALLBACK_DESCRIPTOR|DIAG_REVOKED_H|DIAG_LOCKED|DIAG_MULTI' \
+            src/FEXCore src/Source/Tools/LinuxEmulation | head -280 > "$R/instrumentation-sites.txt" || true
+
+      - name: Build FEX and fixture variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
+          for c in force aba thread multi; do
+            (cd "/tmp/$c/fex-full-thunk-pair" && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) \
+              > "$R/build-$c.log" 2>&1
+          done
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          for c in force aba thread multi; do
+            mkdir -p "$ROOTFS/opt/fex-ci/$c"
+            cp -a "/tmp/$c/fex-full-thunk-pair/guest" "$ROOTFS/opt/fex-ci/$c/"
+          done
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute descriptor regression matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          run_case() {
+            case_name="$1"; shift
+            host="/tmp/$case_name/fex-full-thunk-pair/host"
+            set +e
+            (cd "$ROOTFS/opt/fex-ci/$case_name" && \
+              FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$host" timeout 30s \
+              "$FEX" "/opt/fex-ci/$case_name/guest/fex_full_lifetime" "$@") \
+              > "$R/$case_name.stdout" 2> "$R/$case_name.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$case_name.exit"
+            echo "===== $case_name rc=$rc ====="
+            grep -E 'DIAG_CALLBACK_DESCRIPTOR|DIAG_REVOKED_H|DIAG_LOCKED|DIAG_MULTI|retained callback|current callback|thread-cache|multi-owner' \
+              "$R/$case_name.stdout" "$R/$case_name.stderr" || true
+          }
+
+          run_case force --force-different
+          run_case aba
+          run_case thread --thread-cache
+          run_case multi --multi-owner
+
+          test "$(cat "$R/force.exit")" = 0
+          test "$(cat "$R/aba.exit")" = 0
+          test "$(cat "$R/thread.exit")" = 0
+          test "$(cat "$R/multi.exit")" = 0
+
+          grep -q 'DIAG_CALLBACK_DESCRIPTOR_CREATE' "$R/force.stderr"
+          grep -q 'DIAG_CALLBACK_DESCRIPTOR_LIVE' "$R/force.stderr"
+          grep -q 'DIAG_CALLBACK_DESCRIPTOR_RETIRE' "$R/force.stderr"
+          grep -q 'DIAG_CALLBACK_DESCRIPTOR_REVOKED' "$R/force.stderr"
+          grep -Eq 'retained callback reload.*exit=113' "$R/force.stdout"
+          grep -Eq 'current callback after new.*exit=0' "$R/force.stdout"
+          grep -Eq 'retained callback reload.*exit=113' "$R/aba.stdout"
+          grep -Eq 'current callback after new.*exit=0' "$R/aba.stdout"
+          grep -q 'thread-cache post-reload' "$R/thread.stdout"
+          grep -q 'multi-owner promoted B' "$R/multi.stdout"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunk-callback-descriptor-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
