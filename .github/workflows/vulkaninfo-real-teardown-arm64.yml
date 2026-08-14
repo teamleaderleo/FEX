@@ -1,0 +1,271 @@
+name: Real x86 vulkaninfo teardown A-B ARM64
+
+on:
+  push:
+    branches: [ci/vulkaninfo-teardown-20260814]
+    paths:
+      - .github/workflows/vulkaninfo-real-teardown-arm64.yml
+      - .github/fieldwork/add_revoked_h_state.py
+      - .github/fieldwork/merge_callback_tombstone.py
+      - .github/fieldwork/fix_retirement_lock_order.py
+      - .github/fieldwork/promote_multiowner_claims.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vulkaninfo-ab:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 100
+    env:
+      FEX_SOURCE_REF: fix/vulkan-callback-proc-routing
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      APTROOT: ${{ github.workspace }}/apt-amd64
+      R: ${{ github.workspace }}/receipts-vulkaninfo
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout FEX with callback proc routing diagnostic
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SOURCE_REF }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout lifetime helper
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Host dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config ccache \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers
+          printf 'carrier=%s\nfex_source=%s\nhelper=%s\nsource_ref=%s\n' \
+            "$GITHUB_SHA" "$(git -C src rev-parse HEAD)" "$(git -C retirement-helper rev-parse HEAD)" "$FEX_SOURCE_REF" \
+            > "$R/identity.txt"
+          git -C src diff 71afe476751deac24adabd1adb575fd2337b6e0a..HEAD -- ThunkLibs/libvulkan \
+            > "$R/callback-routing-source.diff"
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          printf '%s\n' "$ICD" > "$R/lvp-icd.txt"
+
+      - name: Build stock runtime and routed Vulkan thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-stock.log" 2>&1
+          cmake --build src/build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" \
+            > "$R/build-stock-host.log" 2>&1
+          cmake -S src/ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" \
+            > "$R/build-guest.log" 2>&1
+          mkdir -p /tmp/fex-stock
+          cp src/build/Bin/FEX src/build/Bin/FEXServer /tmp/fex-stock/
+          sha256sum guest-build/libvulkan-guest.so src/build/HostLibs_64/libvulkan-host.so \
+            > "$R/thunk-sha256-before.txt"
+
+      - name: Resolve and extract real amd64 vulkan-tools package closure
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$APTROOT/etc/apt" "$APTROOT/state/lists/partial" "$APTROOT/cache/archives/partial"
+          : > "$APTROOT/status"
+          cat > "$APTROOT/etc/apt/sources.list" <<'EOF'
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble main universe
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble-updates main universe
+          deb [arch=amd64] http://security.ubuntu.com/ubuntu noble-security main universe
+          EOF
+
+          APT=(apt-get
+            -o APT::Architecture=amd64
+            -o APT::Architectures=amd64
+            -o Dir::Etc::sourcelist="$APTROOT/etc/apt/sources.list"
+            -o Dir::Etc::sourceparts=-
+            -o Dir::State::status="$APTROOT/status"
+            -o Dir::State::lists="$APTROOT/state/lists"
+            -o Dir::Cache::archives="$APTROOT/cache/archives"
+            -o Debug::NoLocking=true)
+
+          "${APT[@]}" update > "$R/apt-amd64-update.log" 2>&1
+          "${APT[@]}" --download-only -y --no-install-recommends install \
+            vulkan-tools libx11-6 libx11-xcb1 libxcb1 libxrandr2 libwayland-client0 \
+            > "$R/apt-amd64-download.log" 2>&1
+
+          shopt -s nullglob
+          debs=("$APTROOT"/cache/archives/*.deb)
+          test "${#debs[@]}" -gt 0
+          : > "$R/amd64-packages.txt"
+          for deb in "${debs[@]}"; do
+            printf '%s\t%s\t%s\n' \
+              "$(dpkg-deb -f "$deb" Package)" "$(dpkg-deb -f "$deb" Version)" "$(dpkg-deb -f "$deb" Architecture)" \
+              >> "$R/amd64-packages.txt"
+          done
+          sort -o "$R/amd64-packages.txt" "$R/amd64-packages.txt"
+          grep -E '^vulkan-tools\t' "$R/amd64-packages.txt" | tee "$R/vulkan-tools-package.txt"
+
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+
+          for deb in "${debs[@]}"; do
+            dpkg-deb -x "$deb" "$ROOTFS"
+          done
+
+          test -x "$ROOTFS/usr/bin/vulkaninfo"
+          file "$ROOTFS/usr/bin/vulkaninfo" > "$R/vulkaninfo.file"
+          sha256sum "$ROOTFS/usr/bin/vulkaninfo" > "$R/vulkaninfo.sha256"
+
+          # The amd64 package closure provides real user libraries. Replace only
+          # the guest Vulkan loader with FEX's generated guest thunk.
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu"
+          cp guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+
+          cat >/tmp/bogus.c <<'EOF'
+          __attribute__((constructor)) static void init_bogus(void) {}
+          int fex_vulkaninfo_bogus(void) { return 17; }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libfex_vulkaninfo_bogus.so /tmp/bogus.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex_vulkaninfo_bogus.so"
+
+      - name: Run stock real vulkaninfo matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          unset DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR
+          ICD="$(cat "$R/lvp-icd.txt")"
+          HOST="$GITHUB_WORKSPACE/src/build/HostLibs_64"
+          FEX=/tmp/fex-stock/FEX
+          run_case() {
+            scope="$1"; preload="$2"
+            name="stock-${scope}-${preload}"
+            args=()
+            if [ "$scope" = summary ]; then args=(--summary); fi
+            set +e
+            if [ "$preload" = normal ]; then
+              VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 45s \
+                "$FEX" /usr/bin/vulkaninfo "${args[@]}" > "$R/$name.stdout" 2> "$R/$name.stderr"
+            elif [ "$preload" = pin ]; then
+              VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 45s \
+                "$FEX" /usr/bin/env LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libvulkan.so.1 \
+                /usr/bin/vulkaninfo "${args[@]}" > "$R/$name.stdout" 2> "$R/$name.stderr"
+            else
+              VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 45s \
+                "$FEX" /usr/bin/env LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libfex_vulkaninfo_bogus.so \
+                /usr/bin/vulkaninfo "${args[@]}" > "$R/$name.stdout" 2> "$R/$name.stderr"
+            fi
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            printf '%s=%s\n' "$name" "$rc" | tee -a "$R/stock-matrix.txt"
+            tail -n 20 "$R/$name.stderr" > "$R/$name.stderr.tail" || true
+            tail -n 20 "$R/$name.stdout" > "$R/$name.stdout.tail" || true
+          }
+          set -e
+          : > "$R/stock-matrix.txt"
+          for scope in summary full; do
+            for preload in normal pin bogus; do
+              run_case "$scope" "$preload"
+            done
+          done
+
+      - name: Apply lifetime candidate and rebuild runtime only
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/merge_callback_tombstone.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          git -C src diff --check
+          git -C src diff > "$R/lifetime-candidate.diff"
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" \
+            > "$R/build-candidate-runtime.log" 2>&1
+          sha256sum guest-build/libvulkan-guest.so src/build/HostLibs_64/libvulkan-host.so \
+            > "$R/thunk-sha256-after.txt"
+          diff -u "$R/thunk-sha256-before.txt" "$R/thunk-sha256-after.txt" > "$R/thunk-sha256.diff"
+
+      - name: Run candidate real vulkaninfo matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          unset DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR
+          ICD="$(cat "$R/lvp-icd.txt")"
+          HOST="$GITHUB_WORKSPACE/src/build/HostLibs_64"
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          run_case() {
+            scope="$1"; preload="$2"
+            name="candidate-${scope}-${preload}"
+            args=()
+            if [ "$scope" = summary ]; then args=(--summary); fi
+            set +e
+            if [ "$preload" = normal ]; then
+              VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 45s \
+                "$FEX" /usr/bin/vulkaninfo "${args[@]}" > "$R/$name.stdout" 2> "$R/$name.stderr"
+            elif [ "$preload" = pin ]; then
+              VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 45s \
+                "$FEX" /usr/bin/env LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libvulkan.so.1 \
+                /usr/bin/vulkaninfo "${args[@]}" > "$R/$name.stdout" 2> "$R/$name.stderr"
+            else
+              VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 45s \
+                "$FEX" /usr/bin/env LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libfex_vulkaninfo_bogus.so \
+                /usr/bin/vulkaninfo "${args[@]}" > "$R/$name.stdout" 2> "$R/$name.stderr"
+            fi
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            printf '%s=%s\n' "$name" "$rc" | tee -a "$R/candidate-matrix.txt"
+            grep -E 'DIAG_REVOKED_H|DIAG_LOCKED|DIAG_MULTI|DIAG_INTEGRATED' "$R/$name.stderr" \
+              > "$R/$name.diag" || true
+            tail -n 20 "$R/$name.stderr" > "$R/$name.stderr.tail" || true
+            tail -n 20 "$R/$name.stdout" > "$R/$name.stdout.tail" || true
+          }
+          set -e
+          : > "$R/candidate-matrix.txt"
+          for scope in summary full; do
+            for preload in normal pin bogus; do
+              run_case "$scope" "$preload"
+            done
+          done
+          cat "$R/stock-matrix.txt" "$R/candidate-matrix.txt" | tee "$R/matrix.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-vulkaninfo-teardown-${{ github.run_id }}
+          path: receipts-vulkaninfo
+          retention-days: 30
