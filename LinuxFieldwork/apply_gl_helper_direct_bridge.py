@@ -45,7 +45,7 @@ for old, new in replacements.items():
     s = s.replace(old, new, 1)
 
 decls = '''extern "C" void* FEXGLBridgeMalloc(size_t size);\nextern "C" uintptr_t fex_gl_bridge_malloc_unpacker();\nextern "C" uintptr_t fex_gl_bridge_xsync_unpacker();\nextern "C" uintptr_t fex_gl_bridge_xgetvisualinfo_unpacker();\nextern "C" uintptr_t fex_gl_bridge_xdisplaystring_unpacker();\n\n'''
-oninit = 'void OnInit() {'
+oninit = 'static void OnInit() {'
 assert s.count(oninit) == 1, s.count(oninit)
 s = s.replace(oninit, decls + oninit, 1)
 guest.write_text(s)
