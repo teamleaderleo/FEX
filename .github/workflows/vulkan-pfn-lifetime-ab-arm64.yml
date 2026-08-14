@@ -1,0 +1,205 @@
+name: Vulkan PFN lifetime stock-candidate A-B ARM64
+
+on:
+  push:
+    branches: [ci/vulkan-pfn-lifetime-candidate-20260814]
+    paths:
+      - .github/workflows/vulkan-pfn-lifetime-ab-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vulkan-pfn-ab:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-ab
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact pristine FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout retirement helper
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Checkout retained Vulkan PFN probe
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-customir-retirement
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config ccache \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers
+
+      - name: Build pristine FEX and real Vulkan thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-stock.log" 2>&1
+          cmake --build src/build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" \
+            > "$R/build-stock-host.log" 2>&1
+          cmake -S src/ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-stock-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" \
+            > "$R/build-stock-guest.log" 2>&1
+          cp src/build/Bin/FEX /tmp/FEX-stock
+          cp src/build/Bin/FEXServer /tmp/FEXServer-stock
+          sha256sum guest-build/libvulkan-guest.so src/build/HostLibs_64/libvulkan-host.so \
+            > "$R/thunk-sha256-before.txt"
+
+      - name: Prepare shared rootfs and probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_pfn_unload_probe.c \
+            -ldl -o "$ROOTFS/opt/fex-ci/vulkan-pfn-probe"
+
+      - name: Run pristine stock matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          HOST="$GITHUB_WORKSPACE/src/build/HostLibs_64"
+          run_case() {
+            phase="$1"; mode="$2"
+            set +e
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+              /tmp/FEX-stock /opt/fex-ci/vulkan-pfn-probe "$mode" \
+              > "$R/${phase}-${mode}.stdout" 2> "$R/${phase}-${mode}.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/${phase}-${mode}.exit"
+            echo "===== ${phase}-${mode} rc=$rc ====="
+            grep -E 'PROBE |Input address for AddThunkTrampoline|signal|SIG' \
+              "$R/${phase}-${mode}.stdout" "$R/${phase}-${mode}.stderr" || true
+          }
+          run_case stock hold
+          run_case stock close
+          run_case stock reload
+
+      - name: Apply candidate to same source tree and rebuild only FEX runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/merge_callback_tombstone.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          git -C src diff --check
+          git -C src diff > "$R/candidate.diff"
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" \
+            > "$R/build-candidate-runtime.log" 2>&1
+          sha256sum guest-build/libvulkan-guest.so src/build/HostLibs_64/libvulkan-host.so \
+            > "$R/thunk-sha256-after.txt"
+          diff -u "$R/thunk-sha256-before.txt" "$R/thunk-sha256-after.txt" \
+            > "$R/thunk-sha256.diff"
+
+      - name: Run candidate matrix against identical Vulkan thunks
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          HOST="$GITHUB_WORKSPACE/src/build/HostLibs_64"
+          run_case() {
+            phase="$1"; mode="$2"
+            set +e
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+              "$FEX" /opt/fex-ci/vulkan-pfn-probe "$mode" \
+              > "$R/${phase}-${mode}.stdout" 2> "$R/${phase}-${mode}.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/${phase}-${mode}.exit"
+            echo "===== ${phase}-${mode} rc=$rc ====="
+            grep -E 'PROBE |DIAG_REVOKED_H|DIAG_LOCKED|DIAG_MULTI|DIAG_INTEGRATED' \
+              "$R/${phase}-${mode}.stdout" "$R/${phase}-${mode}.stderr" || true
+          }
+          run_case candidate hold
+          run_case candidate close
+          run_case candidate reload
+
+          printf 'stock_hold=%s\nstock_close=%s\nstock_reload=%s\ncandidate_hold=%s\ncandidate_close=%s\ncandidate_reload=%s\n' \
+            "$(cat "$R/stock-hold.exit")" "$(cat "$R/stock-close.exit")" "$(cat "$R/stock-reload.exit")" \
+            "$(cat "$R/candidate-hold.exit")" "$(cat "$R/candidate-close.exit")" "$(cat "$R/candidate-reload.exit")" \
+            | tee "$R/matrix.txt"
+
+          test "$(cat "$R/stock-hold.exit")" = 0
+          test "$(cat "$R/stock-close.exit")" = 139
+          test "$(cat "$R/stock-reload.exit")" = 139
+          test "$(cat "$R/candidate-hold.exit")" = 0
+          test "$(cat "$R/candidate-close.exit")" = 139
+          test "$(cat "$R/candidate-reload.exit")" = 0
+
+          grep -q 'PROBE return where=after-close-with-extra-ref result=0' "$R/stock-hold.stderr"
+          grep -q 'PROBE reserved-old-generation-ranges=' "$R/stock-reload.stderr"
+          grep -q 'PROBE acquired generation=2' "$R/stock-reload.stderr"
+          grep -q 'DIAG_REVOKED_H_COMPILE' "$R/candidate-close.stderr"
+          grep -q 'PROBE return where=after-reload-new-pfn result=0' "$R/candidate-reload.stderr"
+          grep -q 'DIAG_REVOKED_H_ACTIVATE' "$R/candidate-reload.stderr"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-pfn-lifetime-ab-${{ github.run_id }}
+          path: receipts-ab
+          retention-days: 30
