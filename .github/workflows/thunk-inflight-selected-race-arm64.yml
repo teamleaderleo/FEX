@@ -114,7 +114,7 @@ jobs:
           git -C src diff > "$R/inflight-selected.diff"
           cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-inflight-selected.log" 2>&1
 
-      - name: Run selected-before-retirement race
+      - name: Run old-H redirect versus target replacement
         shell: bash
         run: |
           set +e
@@ -129,13 +129,14 @@ jobs:
           cat "$R/key-lines.txt"
           printf 'selected-race=%s\n' "$rc" > "$R/matrix.txt"
 
-      - name: Assert stale selected block crosses owner generation
+      - name: Assert old H resolves new target generation
         shell: bash
         run: |
           set -euxo pipefail
           test "$(cat "$R/run.exit")" = 0
           grep -q 'DIAG_INFLIGHT_SELECTED H=0x700000020000' "$R/run.stderr"
-          grep -q 'INFLIGHT selected-before-retire H=0x700000020000' "$R/run.stderr"
+          grep -q 'stage=before-target-selection' "$R/run.stderr"
+          grep -q 'INFLIGHT old-H-redirect-pending H=0x700000020000' "$R/run.stderr"
           grep -q 'DIAG_MULTI_RETIRE H=0x700000020000' "$R/run.stderr"
           grep -q 'DIAG_INFLIGHT_RESUME H=0x700000020000' "$R/run.stderr"
           grep -q 'INFLIGHT replacement-committed H=0x700000020000' "$R/run.stderr"
