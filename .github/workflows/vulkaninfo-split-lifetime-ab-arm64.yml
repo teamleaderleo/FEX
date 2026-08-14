@@ -122,12 +122,8 @@ jobs:
           file "$ROOTFS/usr/bin/vulkaninfo" | tee "$R/vulkaninfo.file"
           test -x "$ROOTFS/usr/bin/vulkaninfo"
 
-          # Extract-only assembly does not run the distro action that creates
-          # the merged-/usr compatibility interpreter path expected by amd64
-          # ELF binaries. Materialize that one standard path from libc6.
-          find "$ROOTFS" -name 'ld-linux-x86-64.so.2' -ls | tee "$R/amd64-loaders.txt"
-          loader="$(find "$ROOTFS" -type f -name 'ld-linux-x86-64.so.2' | head -1)"
-          test -n "$loader"
+          loader="$ROOTFS/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+          test -x "$loader"
           sudo mkdir -p "$ROOTFS/lib64"
           sudo cp -L "$loader" "$ROOTFS/lib64/ld-linux-x86-64.so.2"
           test -x "$ROOTFS/lib64/ld-linux-x86-64.so.2"
