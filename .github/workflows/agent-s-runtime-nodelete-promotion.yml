@@ -1,0 +1,86 @@
+name: Agent S runtime NODELETE promotion
+
+on:
+  push:
+    branches: [ci/agent-s-runtime-nodelete-promotion-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  promotion:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test base namespace promotion and NEWLM recycling
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat >/tmp/promote.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <link.h>
+          #include <stdio.h>
+          static int init_count;
+          __attribute__((visibility("default"))) int probe(void) { return ++init_count; }
+          __attribute__((constructor)) static void init(void) {
+            Dl_info info = {};
+            if (!dladdr((void*)&init, &info) || !info.dli_fname) return;
+            void *self = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+            if (!self) return;
+            Lmid_t lmid = (Lmid_t)-1;
+            if (dlinfo(self, RTLD_DI_LMID, &lmid) == 0) {
+              fprintf(stderr, "CTOR lmid=%ld path=%s\n", (long)lmid, info.dli_fname);
+              if (lmid == LM_ID_BASE) {
+                void *pin = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
+                fprintf(stderr, "PROMOTE pin=%p err=%s\n", pin, pin ? "none" : dlerror());
+                if (pin) dlclose(pin);
+              }
+            }
+            dlclose(self);
+          }
+          EOF
+          cc -shared -fPIC -O2 -Wl,-soname,libpromote.so /tmp/promote.c -ldl -o /tmp/libpromote.so
+          ! readelf -d /tmp/libpromote.so | grep -q NODELETE
+
+          cat >/tmp/test.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <link.h>
+          #include <stdio.h>
+          typedef int(*fn_t)(void);
+          int main(void) {
+            void *h = dlopen("/tmp/libpromote.so", RTLD_NOW|RTLD_LOCAL);
+            if(!h){fprintf(stderr,"BASE_OPEN_FAIL %s\n",dlerror());return 2;}
+            fn_t f=(fn_t)dlsym(h,"probe");
+            if(!f)return 3;
+            fprintf(stderr,"BASE_BEFORE value=%d fn=%p\n",f(),(void*)f);
+            if(dlclose(h))return 4;
+            fprintf(stderr,"BASE_AFTER value=%d fn=%p\n",f(),(void*)f);
+            void *nl=dlopen("/tmp/libpromote.so",RTLD_NOW|RTLD_NOLOAD);
+            fprintf(stderr,"BASE_NOLOAD handle=%p\n",nl);
+            if(!nl)return 5;
+            dlclose(nl);
+
+            int ok=0;
+            for(int i=0;i<40;i++){
+              void*n=dlmopen(LM_ID_NEWLM,"/tmp/libpromote.so",RTLD_NOW|RTLD_LOCAL);
+              if(!n){fprintf(stderr,"NEWLM_FAIL i=%d err=%s\n",i,dlerror());break;}
+              fn_t nf=(fn_t)dlsym(n,"probe");
+              if(!nf || nf()!=1)return 6;
+              ++ok;
+              if(dlclose(n))return 7;
+            }
+            fprintf(stderr,"NEWLM_RESULT ok=%d\n",ok);
+            if(ok!=40)return 8;
+            fprintf(stderr,"RUNTIME_NODELETE_PROMOTION_OK\n");
+            return 0;
+          }
+          EOF
+          cc -O2 -Wall -Wextra -Werror /tmp/test.c -ldl -o /tmp/test
+          /tmp/test 2>&1 | tee /tmp/promotion.log
+          grep -q 'BASE_NOLOAD handle=0x' /tmp/promotion.log
+          grep -q 'NEWLM_RESULT ok=40' /tmp/promotion.log
+          grep -q RUNTIME_NODELETE_PROMOTION_OK /tmp/promotion.log
