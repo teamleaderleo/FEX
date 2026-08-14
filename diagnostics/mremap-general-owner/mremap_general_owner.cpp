@@ -138,6 +138,7 @@ int InPlaceShrinkReuse() {
   if (!MakeRX(reused, page)) return 35;
 
   const int keep_value = keep();
+  std::fprintf(stderr, "MREMAP_GENERAL shrink-keep value=%d reused=%p\n", keep_value, reused);
   const int tail_value = old_tail();
   std::fprintf(stderr,
                "MREMAP_GENERAL shrink-final keep-value=%d tail-value=%d reused=%p expected-current-gap=333\n",
