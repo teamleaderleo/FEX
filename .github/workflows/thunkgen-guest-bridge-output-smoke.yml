@@ -1,0 +1,115 @@
+name: thunkgen guest bridge output smoke
+
+on:
+  push:
+    branches: [diagnostic/thunkgen-resident-bridge-output-20260814]
+    paths:
+      - .github/fieldwork/apply_thunkgen_guest_bridge_output.py
+      - .github/workflows/thunkgen-guest-bridge-output-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-output:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      R: ${{ github.workspace }}/receipts-bridge-output
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and prototype patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libvulkan-dev
+          python3 .github/fieldwork/apply_thunkgen_guest_bridge_output.py .
+          git diff --check
+          git diff -- ThunkLibs/Generator/interface.h ThunkLibs/Generator/main.cpp ThunkLibs/Generator/gen.cpp ThunkLibs/GuestLibs/CMakeLists.txt \
+            > "$R/prototype.diff"
+
+      - name: Build patched thunkgen
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build-bridge-gen -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_X86_HOST_DEBUG=ON \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build-bridge-gen --target thunkgen -- -j"$(nproc)" -v \
+            > "$R/build-thunkgen.log" 2>&1 || { tail -n 260 "$R/build-thunkgen.log"; exit 1; }
+
+      - name: Generate normal and bridge fragments for Vulkan and GL
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest-bridge-gen -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build-bridge-gen/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-bridge-gen --target \
+            libvulkan-guest-bridge-gen libGL-guest-bridge-gen vulkan-guest GL-guest \
+            -- -j"$(nproc)" -v > "$R/build-generated.log" 2>&1 \
+            || { tail -n 320 "$R/build-generated.log"; exit 1; }
+          ls -l guest-bridge-gen/gen/thunkgen_guest_libvulkan.inl guest-bridge-gen/gen/thunkgen_bridge_libvulkan.inl \
+                guest-bridge-gen/gen/thunkgen_guest_libGL.inl guest-bridge-gen/gen/thunkgen_bridge_libGL.inl \
+            | tee "$R/generated-files.txt"
+
+      - name: Compare bridge fragments with canonical guest generation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' | tee "$R/compare.txt"
+          from pathlib import Path
+          import re
+
+          def callbacks(text):
+              return [line.strip() for line in text.splitlines() if line.strip().startswith('MAKE_CALLBACK_THUNK(')]
+
+          def internal_symbols(text):
+              marker = '#define FOREACH_internal_SYMBOL(EXPAND)'
+              start = text.find(marker)
+              if start < 0:
+                  raise AssertionError('missing FOREACH_internal_SYMBOL')
+              nxt = text.find('\n#define FOREACH_', start + len(marker))
+              block = text[start:] if nxt < 0 else text[start:nxt]
+              return re.findall(r'EXPAND\(([^,]+),\s*"TODO"\)', block)
+
+          for lib in ('libvulkan', 'libGL'):
+              guest = Path(f'guest-bridge-gen/gen/thunkgen_guest_{lib}.inl').read_text()
+              bridge = Path(f'guest-bridge-gen/gen/thunkgen_bridge_{lib}.inl').read_text()
+              gcb, bcb = callbacks(guest), callbacks(bridge)
+              gsym, bsym = internal_symbols(guest), internal_symbols(bridge)
+              print(f'{lib}: callbacks guest={len(gcb)} bridge={len(bcb)} equal={gcb == bcb}')
+              print(f'{lib}: internal symbols guest={len(gsym)} bridge={len(bsym)} equal={gsym == bsym}')
+              assert gcb == bcb
+              assert gsym == bsym
+              assert 'MAKE_THUNK(' not in bridge
+              assert 'fexfn_pack_' not in bridge
+              assert 'extern "C"' not in bridge
+              assert bcb
+              assert bsym
+          print('THUNKGEN_GUEST_BRIDGE_OUTPUT_EQUIVALENT')
+          PY
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunkgen-guest-bridge-output-${{ github.run_id }}
+          path: receipts-bridge-output
+          retention-days: 30
