@@ -83,7 +83,7 @@ jobs:
               text = p.read_text()
               if branch_old in text:
                   raise SystemExit(f'{p}: stale branch')
-              if 'apply_resident_output_candidate.py\n' in text:
+              if re.search(r'^\s+python3 ThunkLibs/Generator/apply_resident', text, re.M):
                   raise SystemExit(f'{p}: stale apply invocation')
           PY
 
