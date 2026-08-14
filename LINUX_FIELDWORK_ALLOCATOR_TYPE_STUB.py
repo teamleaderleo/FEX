@@ -5,10 +5,10 @@ iface = iface_path.read_text()
 old = '''// TODO: Should not be opaque, but it's usually NULL anyway. Supporting the contained function pointers will need more work.
 template<>
 struct fex_gen_type<VkAllocationCallbacks> : fexgen::opaque_type {};'''
-new = '''// Linux Fieldwork experiment: expose VkAllocationCallbacks to the normal
-// struct repacker and handle all pointer-bearing members explicitly.
+new = '''// Linux Fieldwork experiment: make VkAllocationCallbacks repackable and
+// handle all pointer-bearing members explicitly.
 template<>
-struct fex_gen_type<VkAllocationCallbacks> : fexgen::emit_layout_wrappers {};
+struct fex_gen_type<VkAllocationCallbacks> {};
 template<>
 struct fex_gen_config<&VkAllocationCallbacks::pUserData> : fexgen::custom_repack {};
 template<>
@@ -72,70 +72,3 @@ bool fex_custom_repack_exit(guest_layout<VkAllocationCallbacks>&, const host_lay
 }
 '''
 host_path.write_text(host.replace(anchor, anchor + insert, 1))
-
-# Trace by a distinctive member name rather than relying on the generator's
-# spelling of the canonical struct type.
-data_path = Path("ThunkLibs/Generator/data_layout.cpp")
-data = data_path.read_text()
-loop_needle = '''  } else if (guest_struct_info) {
-    std::vector<TypeCompatibility> member_compat;
-    for (std::size_t member_idx = 0; member_idx < guest_struct_info->members.size(); ++member_idx) {
-'''
-loop_repl = '''  } else if (guest_struct_info) {
-    const bool trace_allocator = std::any_of(guest_struct_info->members.begin(), guest_struct_info->members.end(),
-                                             [](const auto& member) { return member.member_name == "pfnAllocation"; });
-    if (trace_allocator) {
-      fmt::print(stderr, "ALLOC_COMPAT type={} guest_members={} host_members={} custom_members={} initial={}\\n",
-                 clang::QualType {type, 0}.getAsString(), guest_struct_info->members.size(),
-                 host_info.get_if_struct()->members.size(), types.at(type).custom_repacked_members.size(), static_cast<int>(compat));
-    }
-    std::vector<TypeCompatibility> member_compat;
-    for (std::size_t member_idx = 0; member_idx < guest_struct_info->members.size(); ++member_idx) {
-'''
-if data.count(loop_needle) != 1:
-    raise SystemExit(f"expected one struct loop anchor, found {data.count(loop_needle)}")
-data = data.replace(loop_needle, loop_repl, 1)
-member_needle = '''      if (types.at(type).UsesCustomRepackFor(host_member_field)) {
-        member_compat.push_back(TypeCompatibility::Repackable);
-        continue;
-'''
-member_repl = '''      if (trace_allocator) {
-        fmt::print(stderr, "ALLOC_COMPAT member={} guest_type={} host_type={} custom={}\\n",
-                   guest_struct_info->members.at(member_idx).member_name,
-                   guest_struct_info->members.at(member_idx).type_name,
-                   host_member_field->getType().getAsString(),
-                   types.at(type).UsesCustomRepackFor(host_member_field));
-      }
-      if (types.at(type).UsesCustomRepackFor(host_member_field)) {
-        member_compat.push_back(TypeCompatibility::Repackable);
-        continue;
-'''
-if data.count(member_needle) != 1:
-    raise SystemExit(f"expected one member compatibility anchor, found {data.count(member_needle)}")
-data = data.replace(member_needle, member_repl, 1)
-result_needle = '''    } else {
-      // Downgrade to None
-      compat = TypeCompatibility::None;
-    }
-  }
-
-  type_compat.at(type) = compat;
-'''
-result_repl = '''    } else {
-      // Downgrade to None
-      compat = TypeCompatibility::None;
-    }
-    if (trace_allocator) {
-      fmt::print(stderr, "ALLOC_COMPAT result={} member_results=", static_cast<int>(compat));
-      for (auto member_result : member_compat) {
-        fmt::print(stderr, "{} ", static_cast<int>(member_result));
-      }
-      fmt::print(stderr, "\\n");
-    }
-  }
-
-  type_compat.at(type) = compat;
-'''
-if data.count(result_needle) != 1:
-    raise SystemExit(f"expected one result anchor, found {data.count(result_needle)}")
-data_path.write_text(data.replace(result_needle, result_repl, 1))
