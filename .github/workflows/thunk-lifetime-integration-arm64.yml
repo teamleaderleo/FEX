@@ -96,7 +96,7 @@ jobs:
             > "$R/cmake.log" 2>&1
           cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
           for c in force aba thread multi; do
-            (cd "/tmp/$c/fex-full-thunk-pair" && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu=g++) \
+            (cd "/tmp/$c/fex-full-thunk-pair" && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) \
               > "$R/build-$c.log" 2>&1
           done
 
