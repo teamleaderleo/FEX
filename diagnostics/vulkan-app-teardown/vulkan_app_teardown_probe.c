@@ -34,12 +34,20 @@ int main(int argc, char **argv) {
   setvbuf(stderr, NULL, _IONBF, 0);
 
   const int pin = argc == 2 && strcmp(argv[1], "pin") == 0;
-  if (argc > 2 || (argc == 2 && !pin)) {
-    fprintf(stderr, "usage: %s [pin]\n", argv[0]);
+  const int bogus = argc == 2 && strcmp(argv[1], "bogus") == 0;
+  if (argc > 2 || (argc == 2 && !pin && !bogus)) {
+    fprintf(stderr, "usage: %s [pin|bogus]\n", argv[0]);
     return 64;
   }
 
-  fprintf(stderr, "APP begin maps=%d pin=%d\n", CountVulkanMappings(), pin);
+  void *bogus_handle = NULL;
+  if (bogus) {
+    bogus_handle = dlopen("libfex_teardown_bogus.so", RTLD_NOW | RTLD_LOCAL);
+    if (!bogus_handle) Die("dlopen bogus control");
+  }
+
+  fprintf(stderr, "APP begin maps=%d pin=%d bogus=%d bogus_handle=%p\n",
+          CountVulkanMappings(), pin, bogus, bogus_handle);
 
   void *lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
   if (!lib) Die("dlopen libvulkan");
@@ -136,6 +144,10 @@ int main(int argc, char **argv) {
   if (pin_handle) {
     fprintf(stderr, "APP pin intentionally retained through normal return maps=%d handle=%p\n",
             CountVulkanMappings(), pin_handle);
+  }
+  if (bogus_handle) {
+    fprintf(stderr, "APP bogus DSO intentionally retained through normal return maps=%d handle=%p\n",
+            CountVulkanMappings(), bogus_handle);
   }
 
   fprintf(stderr, "APP normal-return\n");
