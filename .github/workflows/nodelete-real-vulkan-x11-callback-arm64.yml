@@ -1,0 +1,204 @@
+name: NODELETE real Vulkan X11 callback lifetime
+
+on:
+  push:
+    branches: [ci/nodelete-vulkan-x11-callback-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-vulkan-x11-callback:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and native Vulkan control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers vulkan-tools xvfb binutils
+          LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP"
+          echo "$LVP" > "$R/lvp.txt"
+          VK_DRIVER_FILES="$LVP" vulkaninfo --summary > "$R/native-vulkaninfo.out" 2> "$R/native-vulkaninfo.err"
+          git rev-parse HEAD | tee "$R/fex-candidate-sha.txt"
+
+      - name: Build FEX runtime and Vulkan host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1 || { tail -n 240 "$R/build-host.log"; exit 1; }
+          test -x build/Bin/FEX
+          test -f build/HostLibs_64/libvulkan-host.so
+          cp build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+
+      - name: Build candidate Vulkan guest thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1 || { tail -n 240 "$R/build-guest.log"; exit 1; }
+          readelf -d guest/libvulkan-guest.so | tee "$R/guest-dynamic.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/guest-dynamic.txt"
+          grep -q 'SONAME.*libvulkan.so.1' "$R/guest-dynamic.txt"
+
+      - name: Create amd64 rootfs and X11 callback probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat > /tmp/x11stub.c <<'EOF'
+          #include <stdio.h>
+          int XSync(void *display, int discard) {
+            fprintf(stderr, "GUEST_XSYNC display=%p discard=%d\n", display, discard);
+            return 0;
+          }
+          void *XGetVisualInfo(void *display, long mask, void *templ, int *count) {
+            fprintf(stderr, "GUEST_XGETVISUALINFO display=%p mask=%ld\n", display, mask);
+            (void)templ;
+            if (count) *count = 0;
+            return 0;
+          }
+          char *XDisplayString(void *display) {
+            fprintf(stderr, "GUEST_XDISPLAYSTRING display=%p\n", display);
+            return ":99";
+          }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat > /tmp/x11probe.c <<'EOF'
+          #define VK_USE_PLATFORM_XLIB_KHR
+          #include <vulkan/vulkan.h>
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+
+          static void die(const char *what, int code) {
+            fprintf(stderr, "FAIL %s\n", what);
+            exit(code);
+          }
+
+          int main(void) {
+            void *vulkan = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!vulkan) { fprintf(stderr, "DLERROR %s\n", dlerror()); return 2; }
+            PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(vulkan, "vkGetInstanceProcAddr");
+            if (!gipa) die("gipa", 3);
+            PFN_vkCreateInstance create_instance = (PFN_vkCreateInstance)gipa(VK_NULL_HANDLE, "vkCreateInstance");
+            if (!create_instance) die("create_instance", 4);
+
+            const char *exts[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_XLIB_SURFACE_EXTENSION_NAME };
+            VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "fex-nodelete-x11", .apiVersion = VK_API_VERSION_1_0 };
+            VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app, .enabledExtensionCount = 2, .ppEnabledExtensionNames = exts };
+            VkInstance instance = VK_NULL_HANDLE;
+            VkResult cr = create_instance(&ci, NULL, &instance);
+            fprintf(stderr, "CREATE_INSTANCE result=%d instance=%p\n", cr, (void *)instance);
+            if (cr != VK_SUCCESS) return 5;
+
+            PFN_vkEnumeratePhysicalDevices enumerate = (PFN_vkEnumeratePhysicalDevices)gipa(instance, "vkEnumeratePhysicalDevices");
+            PFN_vkGetPhysicalDeviceXlibPresentationSupportKHR xlib_support =
+              (PFN_vkGetPhysicalDeviceXlibPresentationSupportKHR)gipa(instance, "vkGetPhysicalDeviceXlibPresentationSupportKHR");
+            if (!enumerate || !xlib_support) die("required PFN", 6);
+            uint32_t count = 0;
+            if (enumerate(instance, &count, NULL) != VK_SUCCESS || count == 0) die("enumerate count", 7);
+            VkPhysicalDevice *phys = calloc(count, sizeof(*phys));
+            if (!phys) return 8;
+            if (enumerate(instance, &count, phys) != VK_SUCCESS || count == 0) die("enumerate devices", 9);
+            fprintf(stderr, "PHYSICAL count=%u first=%p xlib_pfn=%p\n", count, (void *)phys[0], (void *)xlib_support);
+
+            Display *guest_display_1 = (Display *)(uintptr_t)0x12345000;
+            Display *guest_display_2 = (Display *)(uintptr_t)0x12346000;
+            VkBool32 before = xlib_support(phys[0], 0, guest_display_1, 0);
+            fprintf(stderr, "BEFORE_CLOSE_XLIB result=%u\n", before);
+
+            if (dlclose(vulkan) != 0) die("dlclose", 10);
+            fprintf(stderr, "AFTER_DLCLOSE_BEGIN_CALLBACK_TEST\n");
+            VkBool32 after = xlib_support(phys[0], 0, guest_display_2, 0);
+            fprintf(stderr, "AFTER_CLOSE_XLIB result=%u\n", after);
+            fprintf(stderr, "REAL_NODELETE_VULKAN_X11_CALLBACK_OK\n");
+            free(phys);
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/x11probe.c -ldl -o "$ROOTFS/opt/fex-ci/x11probe"
+          file "$ROOTFS/opt/fex-ci/x11probe" "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6" > "$R/x86-files.txt"
+
+      - name: Run retained Vulkan X11 callbacks after dlclose
+        shell: bash
+        run: |
+          set -euxo pipefail
+          Xvfb :99 -screen 0 640x480x24 > "$R/xvfb.log" 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 50); do
+            if DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then break; fi
+            sleep 0.1
+          done
+          DISPLAY=:99 xdpyinfo >/dev/null
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          LVP="$(cat "$R/lvp.txt")"
+          set +e
+          DISPLAY=:99 VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" \
+            "$FEX" /opt/fex-ci/x11probe > "$R/x11probe.out" 2> "$R/x11probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/x11probe.exit"
+          cat "$R/x11probe.err"
+          test "$rc" -eq 0
+          grep -q 'AFTER_DLCLOSE_BEGIN_CALLBACK_TEST' "$R/x11probe.err"
+          after_line="$(grep -n 'AFTER_DLCLOSE_BEGIN_CALLBACK_TEST' "$R/x11probe.err" | head -n1 | cut -d: -f1)"
+          tail -n "+$after_line" "$R/x11probe.err" > "$R/after-close-callbacks.txt"
+          grep -q 'GUEST_XSYNC display=0x12346000' "$R/after-close-callbacks.txt"
+          grep -q 'GUEST_XDISPLAYSTRING display=0x12346000' "$R/after-close-callbacks.txt"
+          grep -q 'REAL_NODELETE_VULKAN_X11_CALLBACK_OK' "$R/after-close-callbacks.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodelete-real-vulkan-x11-callback-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
