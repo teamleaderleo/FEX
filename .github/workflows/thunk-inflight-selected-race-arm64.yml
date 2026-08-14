@@ -1,0 +1,150 @@
+name: Thunk selected in-flight race ARM64
+
+on:
+  push:
+    branches: [ci/thunk-inflight-selected-race-20260814]
+    paths:
+      - diagnostics/thunk-inflight-race/thunk_inflight_race.cpp
+      - .github/workflows/thunk-inflight-selected-race-arm64.yml
+      - .github/fieldwork/add_inflight_selected_pause.py
+      - .github/fieldwork/add_vma_owner_id.py
+      - .github/fieldwork/add_owner_claim_identity.py
+      - .github/fieldwork/pre_map_fixed_retire.py
+      - .github/fieldwork/add_map_fixed_rollback_transaction.py
+      - .github/fieldwork/add_revoked_h_state.py
+      - .github/fieldwork/merge_callback_tombstone.py
+      - .github/fieldwork/fix_retirement_lock_order.py
+      - .github/fieldwork/promote_multiowner_claims.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selected-race:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-inflight-selected
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout lifetime helper
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Dependencies and identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang lld pkg-config libcap-dev \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'carrier=%s\nfex=%s\nhelper=%s\n' \
+            "$GITHUB_SHA" "$(git -C src rev-parse HEAD)" "$(git -C retirement-helper rev-parse HEAD)" \
+            > "$R/identity.txt"
+
+      - name: Build base FEX runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang CXX=clang++ cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-base.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-base.log" 2>&1
+
+      - name: Prepare amd64 rootfs and race probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci" "$ROOTFS/usr/lib/x86_64-linux-gnu"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          x86_64-linux-gnu-g++ -std=c++20 -O2 -g -Wall -Wextra -Wpedantic -Werror -pthread \
+            -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" \
+            diagnostics/thunk-inflight-race/thunk_inflight_race.cpp \
+            -o "$ROOTFS/opt/fex-ci/thunk-inflight-race"
+          file "$ROOTFS/opt/fex-ci/thunk-inflight-race" > "$R/probe.file"
+
+      - name: Apply owner-aware lifetime candidate and deterministic pause
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/merge_callback_tombstone.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          python3 .github/fieldwork/pre_map_fixed_retire.py src
+          python3 .github/fieldwork/add_map_fixed_rollback_transaction.py src
+          python3 .github/fieldwork/add_vma_owner_id.py src
+          python3 .github/fieldwork/add_owner_claim_identity.py src
+          python3 .github/fieldwork/add_inflight_selected_pause.py src
+          git -C src diff --check
+          git -C src diff > "$R/inflight-selected.diff"
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build-inflight-selected.log" 2>&1
+
+      - name: Run selected-before-retirement race
+        shell: bash
+        run: |
+          set +e
+          FEX_ROOTFS="$ROOTFS" FEX_DIAG_INFLIGHT_SELECT=1 timeout 30s \
+            "$GITHUB_WORKSPACE/src/build/Bin/FEX" /opt/fex-ci/thunk-inflight-race \
+            > "$R/run.stdout" 2> "$R/run.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/run.exit"
+          grep -E 'INFLIGHT |DIAG_INFLIGHT_|DIAG_OWNER_CLAIM|DIAG_MAP_FIXED|DIAG_ROLLBACK|DIAG_MULTI|DIAG_REVOKED_H|DIAG_LOCKED' \
+            "$R/run.stderr" > "$R/key-lines.txt" || true
+          cat "$R/key-lines.txt"
+          printf 'selected-race=%s\n' "$rc" > "$R/matrix.txt"
+
+      - name: Assert stale selected block crosses owner generation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(cat "$R/run.exit")" = 0
+          grep -q 'DIAG_INFLIGHT_SELECTED H=0x700000020000' "$R/run.stderr"
+          grep -q 'INFLIGHT selected-before-retire H=0x700000020000' "$R/run.stderr"
+          grep -q 'DIAG_MULTI_RETIRE H=0x700000020000' "$R/run.stderr"
+          grep -q 'DIAG_INFLIGHT_RESUME H=0x700000020000' "$R/run.stderr"
+          grep -q 'INFLIGHT replacement-committed H=0x700000020000' "$R/run.stderr"
+          grep -q 'INFLIGHT final worker-value=222 reregister=0' "$R/run.stderr"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunk-inflight-selected-${{ github.run_id }}
+          path: receipts-inflight-selected
+          retention-days: 30
