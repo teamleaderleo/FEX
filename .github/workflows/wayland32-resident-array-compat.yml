@@ -163,7 +163,7 @@ jobs:
             return (struct wl_display*)&proxy;
           }
 
-          WL_EXPORT void *wl_proxy_get_listener(struct wl_proxy *p) {
+          WL_EXPORT const void *wl_proxy_get_listener(struct wl_proxy *p) {
             struct fake_proxy *fp = (struct fake_proxy*)p;
             fprintf(stderr, "HOST_WL_GET_LISTENER proxy=%p listener=%p\n", (void*)p, (void*)fp->listener);
             return fp->listener;
