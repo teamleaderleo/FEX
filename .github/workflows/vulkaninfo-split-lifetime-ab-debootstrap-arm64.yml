@@ -1,0 +1,195 @@
+name: Hosted vulkaninfo split lifetime A-B debootstrap ARM64
+
+on:
+  push:
+    branches: [ci/thunk-callback-descriptor-20260814]
+    paths:
+      - .github/fieldwork/apply_vulkan_split_bridge.py
+      - .github/workflows/vulkaninfo-split-lifetime-ab-debootstrap-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vulkaninfo-ab:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      HOST: ${{ github.workspace }}/host-thunks
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact stock FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Host dependencies and native Vulkan control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config ccache \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers vulkan-tools xvfb x11-utils debootstrap ubuntu-keyring file
+          LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP"
+          echo "$LVP" > "$R/lvp.txt"
+          VK_DRIVER_FILES="$LVP" vulkaninfo --summary > "$R/native-vulkaninfo.stdout" 2> "$R/native-vulkaninfo.stderr"
+
+      - name: Apply only Finding A host-thunk routing diagnostic
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/ThunkLibs/libvulkan/Host.cpp')
+          s=p.read_text()
+          old='  } else if (a_1 == "vkFreeMemory"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkFreeMemory;\n'
+          new=old+'  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;\n'
+          if s.count(old)!=1: raise SystemExit(f'Finding A anchor count {s.count(old)}')
+          p.write_text(s.replace(old,new,1))
+          PY
+          git -C src diff -- ThunkLibs/libvulkan/Host.cpp > "$R/finding-a.diff"
+
+      - name: Build FEX, Finding-A host thunk, and unsplit Vulkan guest wrapper
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S src/ThunkLibs/GuestLibs -B guest-unsplit -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-unsplit.log" 2>&1
+          cmake --build guest-unsplit --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-unsplit.log" 2>&1
+          cp guest-unsplit/libvulkan-guest.so "$R/libvulkan-unsplit.so"
+          readelf -d "$R/libvulkan-unsplit.so" > "$R/unsplit.dynamic.txt"
+
+      - name: Foreign first-stage amd64 rootfs extraction only
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo rm -rf "$ROOTFS"
+          sudo debootstrap \
+            --foreign \
+            --arch=amd64 \
+            --variant=minbase \
+            --components=main,universe \
+            --include=vulkan-tools,libx11-6,ca-certificates \
+            --keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg \
+            noble "$ROOTFS" http://archive.ubuntu.com/ubuntu \
+            > "$R/debootstrap.log" 2>&1 || { tail -n 240 "$R/debootstrap.log"; exit 1; }
+          file "$ROOTFS/usr/bin/vulkaninfo" | tee "$R/vulkaninfo.file"
+          test -x "$ROOTFS/usr/bin/vulkaninfo"
+          test -x "$ROOTFS/lib64/ld-linux-x86-64.so.2" -o -x "$ROOTFS/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu"
+          rm -f "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp "$R/libvulkan-unsplit.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          find "$ROOTFS/usr/lib/x86_64-linux-gnu" -maxdepth 1 \( -name 'libX11.so.6*' -o -name 'libstdc++.so.6*' \) -print | sort > "$R/rootfs-key-libs.txt"
+          cat "$R/rootfs-key-libs.txt"
+
+      - name: Run unsplit vulkaninfo with Finding A fixed
+        shell: bash
+        run: |
+          set -euxo pipefail
+          Xvfb :99 -screen 0 640x480x24 > "$R/xvfb-unsplit.log" 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 50); do DISPLAY=:99 xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+          DISPLAY=:99 xdpyinfo >/dev/null
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP="$(cat "$R/lvp.txt")"
+          set +e
+          DISPLAY=:99 VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+            timeout 60s "$FEX" /usr/bin/vulkaninfo --summary \
+            > "$R/unsplit-vulkaninfo.stdout" 2> "$R/unsplit-vulkaninfo.stderr"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/unsplit-vulkaninfo.exit"
+          grep -E 'Vulkan Instance Version|deviceName|driverName|GPU|ERROR|Segmentation|Illegal' \
+            "$R/unsplit-vulkaninfo.stdout" "$R/unsplit-vulkaninfo.stderr" | head -160 > "$R/unsplit-key.txt" || true
+          cat "$R/unsplit-key.txt"
+          kill "$xvfb_pid" >/dev/null 2>&1 || true
+          trap - EXIT
+
+      - name: Transform only guest Vulkan lifetime ownership and build split pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/apply_vulkan_split_bridge.py src
+          git -C src diff --check
+          git -C src diff -- ThunkLibs/libvulkan/Guest.cpp ThunkLibs/libvulkan/GuestBridge.cpp ThunkLibs/GuestLibs/CMakeLists.txt \
+            > "$R/split-lifetime.diff"
+          cmake -S src/ThunkLibs/GuestLibs -B guest-split -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-split.log" 2>&1
+          cmake --build guest-split --target vulkan-guest vulkan-bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-split.log" 2>&1 || { tail -n 260 "$R/build-split.log"; exit 1; }
+          readelf -d guest-split/libvulkan-guest.so > "$R/split-wrapper.dynamic.txt"
+          readelf -d guest-split/libfex-vulkan-bridge.so > "$R/split-bridge.dynamic.txt"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/split-wrapper.dynamic.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/split-bridge.dynamic.txt"
+          rm -f "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp guest-split/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp guest-split/libfex-vulkan-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+
+      - name: Run split vulkaninfo with identical FEX core and Finding A host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          Xvfb :99 -screen 0 640x480x24 > "$R/xvfb-split.log" 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 50); do DISPLAY=:99 xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+          DISPLAY=:99 xdpyinfo >/dev/null
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP="$(cat "$R/lvp.txt")"
+          set +e
+          DISPLAY=:99 VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+            timeout 60s "$FEX" /usr/bin/vulkaninfo --summary \
+            > "$R/split-vulkaninfo.stdout" 2> "$R/split-vulkaninfo.stderr"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/split-vulkaninfo.exit"
+          grep -E 'Vulkan Instance Version|deviceName|driverName|GPU|ERROR|Segmentation|Illegal|resident host invoker' \
+            "$R/split-vulkaninfo.stdout" "$R/split-vulkaninfo.stderr" | head -220 > "$R/split-key.txt" || true
+          cat "$R/split-key.txt"
+          printf 'unsplit=%s\nsplit=%s\n' "$(cat "$R/unsplit-vulkaninfo.exit")" "$rc" | tee "$R/matrix.txt"
+          test "$rc" = 0
+          grep -q 'deviceName' "$R/split-vulkaninfo.stdout"
+          grep -q 'driverName' "$R/split-vulkaninfo.stdout"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkaninfo-split-lifetime-ab-debootstrap-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
