@@ -1,0 +1,90 @@
+name: DRM resident unpacker + unloadable callback target control
+
+on:
+  push:
+    branches: [ci/drm-loadmodule-plugin-unload-control-20260814]
+    paths:
+      - LinuxFieldwork/drm_loadmodule_plugin.c
+      - LinuxFieldwork/drm_serverinfo_plugin_inflight_probe.c
+      - .github/workflows/drm-loadmodule-plugin-unload-control-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  control:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 65
+    env:
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-plugin-control
+      HOST: ${{ github.workspace }}/host-thunks
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Provenance and dependencies
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libdrm-dev libgl-dev
+      - name: Apply generated DRM resident bridge
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_drm_serverinfo_generated_resident.py
+          git diff --check
+          git diff -- ThunkLibs > "$R/generated-resident.diff"
+      - name: Build FEX and DRM thunks
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer drm-host-64 -- -j"$(nproc)" > "$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libdrm-host.so "$HOST/libdrm-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target drm-guest drm_bridge-guest -- -j"$(nproc)" > "$R/build-guest.log" 2>&1
+      - name: Prepare guest rootfs and plugin fixture
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-build/libdrm-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libdrm.so.2"
+          cp guest-build/libfex-drm-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-drm-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          x86_64-linux-gnu-gcc -O2 -fPIC -shared -Wall -Wextra -Werror LinuxFieldwork/drm_loadmodule_plugin.c -o "$ROOTFS/opt/fex-ci/libdrm-callback-plugin.so"
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -I/usr/include/libdrm LinuxFieldwork/drm_serverinfo_plugin_inflight_probe.c -ldl -pthread -o "$ROOTFS/opt/fex-ci/drm-plugin-inflight-probe"
+          readelf -d "$ROOTFS/opt/fex-ci/libdrm-callback-plugin.so" > "$R/plugin.dynamic"
+          readelf -d guest-build/libfex-drm-bridge.so > "$R/bridge.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+      - name: Execute target-unload control
+        shell: bash
+        run: |
+          set +e
+          (cd "$ROOTFS/opt/fex-ci" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 20s "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/drm-plugin-inflight-probe) > "$R/run.stdout" 2> "$R/run.stderr"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/run.exit"
+          cat "$R/run.stderr"
+          grep -q 'DRM_PLUGIN_PROBE callback-blocked mapped-before-close=1' "$R/run.stderr"
+          grep -q 'DRM_PLUGIN_PROBE plugin-close rc=0' "$R/run.stderr"
+          test "$rc" -ne 124
+          printf 'generated_resident_unpacker_plugin_target_control=%s\n' "$rc" | tee "$R/result.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: drm-plugin-target-control-${{ github.run_id }}
+          path: receipts-plugin-control
+          retention-days: 30
