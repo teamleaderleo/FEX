@@ -1,0 +1,155 @@
+name: Gate FEX-2608 mremap destination code cache
+
+on:
+  push:
+    branches: [ci/fex2608-staged-lifetime-integration-20260814]
+    paths:
+      - .github/workflows/fex2608-mremap-destination-codecache.yml
+      - .github/fieldwork/apply_mremap_destination_codecache_invalidation.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      FEX_BASE: e869aa644a16e4332cdc15c1ea0b4d13d482385d
+      BRANCH: candidate/fex2608-mremap-destination-codecache
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-mremap-codecache
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_BASE }}
+          path: product
+          fetch-depth: 1
+          submodules: recursive
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-combined-repair
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev binutils
+
+      - name: Build mapping fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 .github/fieldwork/patch_callback_mapping_mutation_fixture.py /tmp/repro/fex-full-thunk-pair
+          sed -i '1{/^#define _GNU_SOURCE$/d;}' /tmp/repro/fex-full-thunk-pair/guest/callback_mapping_mutation.cpp
+          (cd /tmp/repro/fex-full-thunk-pair && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) > "$R/build-fixture.log" 2>&1
+
+      - name: Apply focused code-cache fix
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/apply_mremap_destination_codecache_invalidation.py "$GITHUB_WORKSPACE/product"
+          git -C product diff --check
+          git -C product diff > "$R/candidate.diff"
+          git -C product diff --stat | tee "$R/candidate.stat"
+
+      - name: Build FEX and server
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S product -B product/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build product/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build.log" 2>&1
+
+      - name: Prepare rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Prove destination translation is refreshed
+        shell: bash
+        run: |
+          set -uo pipefail
+          FIXTURE_HOST=/tmp/repro/fex-full-thunk-pair/host
+          BIN="$GITHUB_WORKSPACE/product/build/Bin/FEX"
+
+          set +e
+          (cd "$ROOTFS/opt/fex-ci" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 20s "$BIN" /opt/fex-ci/guest/callback_mapping_mutation mremap-dest) > "$R/mremap-dest.out" 2> "$R/mremap-dest.err"
+          rc=$?
+          set -e
+          cat "$R/mremap-dest.err"
+
+          # This exact-FEX-2608 branch deliberately has no descriptor retirement
+          # for mremap yet, so the escaped old callback remains callable and the
+          # fixture returns 20. The code-cache criterion is that both old and new
+          # invocations now execute the moved source bytes (70433), not stale 70423.
+          test "$rc" -eq 20
+          grep -q 'MAPMUT child callback-returned rv=70433' "$R/mremap-dest.err"
+          grep -q 'MAPMUT mremap-dest fresh=70433' "$R/mremap-dest.err"
+
+          # Neighboring remap behavior remains viable.
+          set +e
+          (cd "$ROOTFS/opt/fex-ci" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 20s "$BIN" /opt/fex-ci/guest/callback_mapping_mutation mremap-shrink-prefix) > "$R/shrink-prefix.out" 2> "$R/shrink-prefix.err"
+          prefix_rc=$?
+          (cd "$ROOTFS/opt/fex-ci" && FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 20s "$BIN" /opt/fex-ci/guest/callback_mapping_mutation mremap-fail) > "$R/mremap-fail.out" 2> "$R/mremap-fail.err"
+          fail_rc=$?
+          set -e
+          test "$prefix_rc" -eq 0
+          test "$fail_rc" -eq 0
+
+      - name: Publish focused branch after gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git -C product config user.name 'Leo'
+          git -C product config user.email 'cheerleaderleo@outlook.com'
+          git -C product add Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.h
+          git -C product diff --cached --check
+          git -C product commit -m 'linux: invalidate mremap destination translations'
+          git -C product push --force-with-lease origin "HEAD:refs/heads/$BRANCH"
+          git -C product rev-parse HEAD | tee "$R/PASS.sha.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex2608-mremap-destination-codecache-${{ github.run_id }}
+          path: receipts-mremap-codecache
+          retention-days: 30
