@@ -20,14 +20,17 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mmdebstrap file
+          sudo apt-get install -y --no-install-recommends mmdebstrap file ubuntu-keyring
       - name: Extract foreign amd64 rootfs without executing guest scripts
         run: |
           set -euxo pipefail
           sudo rm -rf /tmp/rootfs-amd64
           sudo mmdebstrap \
+            --mode=root \
             --variant=extract \
             --architectures=amd64 \
+            --skip=check/qemu \
+            --keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg \
             --components=main,universe \
             --include=vulkan-tools,libx11-6,ca-certificates \
             noble /tmp/rootfs-amd64 \
@@ -37,6 +40,5 @@ jobs:
           file /tmp/rootfs-amd64/usr/bin/vulkaninfo
           test -x /tmp/rootfs-amd64/usr/bin/vulkaninfo
           test -x /tmp/rootfs-amd64/lib64/ld-linux-x86-64.so.2 -o -x /tmp/rootfs-amd64/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
-          ldd_status=0
           ls -l /tmp/rootfs-amd64/usr/bin/vulkaninfo
-          find /tmp/rootfs-amd64/usr/lib/x86_64-linux-gnu -maxdepth 1 -name 'libX11.so.6*' -o -name 'libvulkan.so.1*' | sort
+          find /tmp/rootfs-amd64/usr/lib/x86_64-linux-gnu -maxdepth 1 \( -name 'libX11.so.6*' -o -name 'libvulkan.so.1*' \) -print | sort
