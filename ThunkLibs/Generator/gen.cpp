@@ -413,6 +413,8 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
     std::size_t index;
     std::string signature;
     std::vector<unsigned char> sha256;
+    std::unordered_map<unsigned, ParameterAnnotations> param_annotations;
+    std::string registration_key;
     bool used_as_callback;
   };
   std::vector<GuestFuncPtrEntry> guest_funcptr_entries;
@@ -425,6 +427,11 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
       auto existing = std::find_if(guest_funcptr_entries.begin(), guest_funcptr_entries.end(),
                                    [&](const GuestFuncPtrEntry& entry) { return entry.sha256 == cb_sha256; });
       if (existing != guest_funcptr_entries.end()) {
+        if (existing->param_annotations != type_it->second.second) {
+          throw std::runtime_error(fmt::format(
+            "Conflicting parameter annotations for runtime function pointer signature {}: {} vs {}",
+            funcptr_signature, existing->registration_key, type_it->first));
+        }
         existing->used_as_callback |= used_as_callback;
         continue;
       }
@@ -432,6 +439,8 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
         .index = static_cast<std::size_t>(std::distance(thunked_funcptrs.begin(), type_it)),
         .signature = std::move(funcptr_signature),
         .sha256 = std::move(cb_sha256),
+        .param_annotations = type_it->second.second,
+        .registration_key = type_it->first,
         .used_as_callback = used_as_callback,
       });
     }
