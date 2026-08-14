@@ -71,16 +71,20 @@ def main() -> None:
         const auto TailBase = reinterpret_cast<uintptr_t>(old_address) + NewLength;
         const auto TailLength = OldLength - NewLength;
 
+        // Prepare the destructive tail first. If the kernel keeps the remap in
+        // place, rolling back a later prefix snapshot then restores state that
+        // already has the tail retired. This avoids resurrecting a standby tail
+        // claim when one H has claims in both pieces.
+        if (TailLength) {
+          fprintf(stderr, "DIAG_MREMAP_PREPARE_TAIL range=%#lx+%#lx maymove=%d\\n",
+                  TailBase, TailLength, MayMove ? 1 : 0);
+          TruncatedTailRetirementToken = Thunks->PrepareGuestRangeRetirement(Thread, TailBase, TailLength);
+        }
         if (MayMove && PrefixLength) {
           fprintf(stderr, "DIAG_MREMAP_PREPARE_PREFIX range=%#lx+%#lx maymove=1\\n",
                   reinterpret_cast<uintptr_t>(old_address), PrefixLength);
           RetainedPrefixRetirementToken =
             Thunks->PrepareGuestRangeRetirement(Thread, reinterpret_cast<uintptr_t>(old_address), PrefixLength);
-        }
-        if (TailLength) {
-          fprintf(stderr, "DIAG_MREMAP_PREPARE_TAIL range=%#lx+%#lx maymove=%d\\n",
-                  TailBase, TailLength, MayMove ? 1 : 0);
-          TruncatedTailRetirementToken = Thunks->PrepareGuestRangeRetirement(Thread, TailBase, TailLength);
         }
       }
 
@@ -110,11 +114,11 @@ def main() -> None:
         '''      if (DestinationRetirementToken) {
         Thunks->RollbackGuestRangeRetirement(Thread, DestinationRetirementToken);
       }
-      if (TruncatedTailRetirementToken) {
-        Thunks->RollbackGuestRangeRetirement(Thread, TruncatedTailRetirementToken);
-      }
       if (RetainedPrefixRetirementToken) {
         Thunks->RollbackGuestRangeRetirement(Thread, RetainedPrefixRetirementToken);
+      }
+      if (TruncatedTailRetirementToken) {
+        Thunks->RollbackGuestRangeRetirement(Thread, TruncatedTailRetirementToken);
       }
       if (SourceRetirementToken) {
         Thunks->RollbackGuestRangeRetirement(Thread, SourceRetirementToken);
@@ -179,7 +183,7 @@ def main() -> None:
         'general remap success commit or rollback',
     )
 
-    print('Generalized mremap lifetime transaction for move/grow/shrink outcomes')
+    print('Generalized mremap lifetime transaction for move/grow/shrink outcomes with tail-first shrink ordering')
 
 
 if __name__ == '__main__':
