@@ -70,6 +70,7 @@ jobs:
           timeout 40s gdb -q -batch \
             -ex 'set pagination off' \
             -ex 'set confirm off' \
+            -ex 'handle SIGBUS nostop noprint pass' \
             -ex "set environment VK_DRIVER_FILES $ICD" \
             -ex "set environment FEX_ROOTFS $ROOTFS" \
             -ex "set environment FEX_THUNKHOSTLIBS $HOSTTHUNKS" \
@@ -84,7 +85,7 @@ jobs:
           gdb_rc=$?
           set -e
           printf 'gdb=%s\n' "$gdb_rc" | tee receipts/final-matrix.txt
-          tail -n 240 receipts/gdb.log
+          tail -n 300 receipts/gdb.log
       - name: Upload backtrace
         if: always()
         uses: actions/upload-artifact@v4
