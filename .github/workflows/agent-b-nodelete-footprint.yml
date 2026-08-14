@@ -36,8 +36,8 @@ jobs:
           git rev-parse HEAD | tee "$R/carrier-sha.txt"
           git log --oneline -4 | tee "$R/lineage.txt"
           git diff --check
-          git diff 8fe2f3d1e2fd29d78b1927616daf0e973df54816 -- ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/nodelete-candidate.diff"
-          grep -q 'LINKER:-z,nodelete' "$R/nodelete-candidate.diff"
+          git cat-file -e 38db7b14fe5a8e314e2a914f53173c253a6acc4b^{commit}
+          grep -n 'LINKER:-z,nodelete' ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/nodelete-candidate.txt"
 
       - name: Build thunk generator
         shell: bash
