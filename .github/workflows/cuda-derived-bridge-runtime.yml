@@ -39,7 +39,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
-            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils libcap-dev
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils libcap-dev libgl-dev
           git rev-parse HEAD | tee "$R/carrier-sha.txt"
 
       - name: Build FEX and CUDA host thunk
