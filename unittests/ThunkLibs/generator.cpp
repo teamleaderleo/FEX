@@ -814,6 +814,23 @@ TEST_CASE_METHOD(Fixture, "StructRepacking") {
       CHECK_NOTHROW(run_thunkgen_host("struct A { void* a; };\n",
                                       code + "template<> struct fex_gen_config<&A::a> : fexgen::custom_repack {};\n", guest_abi));
     }
+
+
+    SECTION("Const parameter preserves pointee constness in repack wrapper") {
+      const std::string const_code = "#include <thunks_common.h>\n"
+                                     "void func(const A*);\n"
+                                     "template<auto> struct fex_gen_config {};\n"
+                                     "template<> struct fex_gen_config<&A::a> : fexgen::custom_repack {};\n"
+                                     "template<> struct fex_gen_config<func> {};\n";
+      const auto output = run_thunkgen_host("struct A { void* a; };\n", const_code, guest_abi);
+      const auto wrapper_begin = output.code.find("make_repack_wrapper<");
+      REQUIRE(wrapper_begin != std::string::npos);
+      const auto wrapper_end = output.code.find(">(args->", wrapper_begin);
+      REQUIRE(wrapper_end != std::string::npos);
+      const auto wrapper_type = output.code.substr(wrapper_begin, wrapper_end - wrapper_begin);
+      CHECK(wrapper_type.find("A") != std::string::npos);
+      CHECK(wrapper_type.find("const") != std::string::npos);
+    }
   }
 
   SECTION("Pointer to struct with pointer member of consistent data layout") {

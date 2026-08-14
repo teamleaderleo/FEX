@@ -626,16 +626,6 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
         function_to_call = "fexfn_impl_" + libname + "_" + function_name;
       }
 
-      auto get_type_name_with_nonconst_pointee = [&](clang::QualType type) {
-        type = type.getLocalUnqualifiedType();
-        if (type->isPointerType()) {
-          // Strip away "const" from pointee type
-          type = context.getPointerType(type->getPointeeType().getLocalUnqualifiedType());
-        }
-        return get_type_name(context, type.getTypePtr());
-      };
-
-
       file << "static void fexfn_unpack_" << libname << "_" << function_name << "(" << struct_name << "* args) {\n";
 
       for (unsigned param_idx = 0; param_idx != thunk.param_types.size(); ++param_idx) {
@@ -673,8 +663,12 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
           fmt::print(file, "  host_layout<{}> a_{} {{ args->a_{} }};\n", get_type_name(context, param_type.getTypePtr()), param_idx, param_idx);
         } else if (pointee_compat == TypeCompatibility::Repackable) {
           // TODO: Require opt-in for this to be emitted since it's single-element only; otherwise, pointers-to-arrays arguments will cause stack trampling
+          // Preserve pointee constness in the wrapper type. repack_wrapper strips
+          // const only for its internal host-layout storage, while retaining the
+          // original pointer type to decide whether exit repacking may write back
+          // to guest memory.
           fmt::print(file, "  auto a_{} = make_repack_wrapper<{}>(args->a_{});\n", param_idx,
-                     get_type_name_with_nonconst_pointee(param_type), param_idx);
+                     get_type_name(context, param_type.getTypePtr()), param_idx);
         } else {
           throw report_error(thunk.decl->getLocation(), "Cannot generate unpacking function for function %0 with unannotated pointer "
                                                         "parameter %1")
