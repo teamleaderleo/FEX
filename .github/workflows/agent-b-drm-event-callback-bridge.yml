@@ -23,14 +23,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 6
+          fetch-depth: 8
 
       - name: Dependencies and product provenance
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$R" "$HOST"
-          git log --oneline -6 | tee "$R/lineage.txt"
+          git log --oneline -8 | tee "$R/lineage.txt"
           git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
           test ! -s "$R/pre-patch-product-source-diff.txt"
           sudo apt-get update
@@ -50,14 +50,14 @@ jobs:
           grep -q 'DRM_CALLBACK count=1' "$R/native.stderr"
           grep -q 'MARK handle-return rc=0 callbacks=1' "$R/native.stderr"
 
-      - name: Apply callback-aware guest diagnostic
+      - name: Apply two-sided callback bridge diagnostic
         shell: bash
         run: |
           set -euxo pipefail
           python3 LinuxFieldwork/apply_drm_event_callback_bridge.py
           git diff --check
-          git diff -- ThunkLibs/libdrm/libdrm_interface.cpp ThunkLibs/libdrm/Guest.cpp | tee "$R/drm-callback-bridge.diff"
-          test "$(git diff --name-only -- ThunkLibs FEXCore Source | sort | tr '\n' ' ')" = 'ThunkLibs/libdrm/Guest.cpp ThunkLibs/libdrm/libdrm_interface.cpp '
+          git diff -- ThunkLibs/libdrm/libdrm_interface.cpp ThunkLibs/libdrm/Guest.cpp ThunkLibs/libdrm/Host.cpp | tee "$R/drm-callback-bridge.diff"
+          test "$(git diff --name-only -- ThunkLibs FEXCore Source | sort | tr '\n' ' ')" = 'ThunkLibs/libdrm/Guest.cpp ThunkLibs/libdrm/Host.cpp ThunkLibs/libdrm/libdrm_interface.cpp '
 
       - name: Build candidate FEX and DRM thunks
         shell: bash
@@ -107,7 +107,7 @@ jobs:
           candidate_rc=$?
           set -e
           echo "$candidate_rc" > "$R/candidate.exit"
-          printf 'native=%s\npristine_reference=132\ncandidate=%s\n' "$(cat "$R/native.exit")" "$candidate_rc" | tee "$R/final-matrix.txt"
+          printf 'native=%s\npristine_reference=132\nguest_only_reference=139\ncandidate=%s\n' "$(cat "$R/native.exit")" "$candidate_rc" | tee "$R/final-matrix.txt"
           cat "$R/candidate.stderr"
           test "$candidate_rc" = 0
           grep -q 'DRM_CALLBACK count=1' "$R/candidate.stderr"
