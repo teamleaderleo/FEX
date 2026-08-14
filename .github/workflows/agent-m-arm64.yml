@@ -63,7 +63,7 @@ jobs:
           test -n "$THUNKGEN"
           realpath "$THUNKGEN" | tee "$R/thunkgen-path.txt"
 
-      - name: Build all real 64-bit guest thunks
+      - name: Build and measure all real 64-bit guest thunks
         shell: bash
         run: |
           set -euxo pipefail
@@ -80,14 +80,31 @@ jobs:
             asound-guest vulkan-guest drm-guest wayland-client-guest VDSO-guest GL-guest EGL-guest cuda-guest \
             -- -j"$(nproc)" -v > "$R/all64-build.log" 2>&1 || { tail -n 360 "$R/all64-build.log"; exit 1; }
 
+          : > "$R/footprint.tsv"
+          printf 'label\tfile_bytes\tload_memsz_bytes\tneeded\n' >> "$R/footprint.tsv"
+
           check_so() {
             label="$1"; pattern="$2"; soname="$3"
             path="$(find guest-build -type f -name "$pattern" | head -n1)"
             test -n "$path"
             file "$path" | tee "$R/${label}-file.txt"
             readelf -d "$path" | tee "$R/${label}-dynamic.txt"
+            readelf -W -l "$path" | tee "$R/${label}-program-headers.txt"
             grep -q 'FLAGS_1.*NODELETE' "$R/${label}-dynamic.txt"
             grep -Fq "SONAME)             Library soname: [$soname]" "$R/${label}-dynamic.txt"
+            bytes="$(stat -c '%s' "$path")"
+            load_mem="$(python3 - "$R/${label}-program-headers.txt" <<'PY'
+          import sys
+          total = 0
+          for line in open(sys.argv[1]):
+              fields = line.split()
+              if fields and fields[0] == 'LOAD':
+                  total += int(fields[5], 16)
+          print(total)
+          PY
+            )"
+            needed="$(sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' "$R/${label}-dynamic.txt" | paste -sd, -)"
+            printf '%s\t%s\t%s\t%s\n' "$label" "$bytes" "$load_mem" "$needed" | tee -a "$R/footprint.tsv"
             echo "ALL64_${label}_NODELETE_OK"
           }
 
@@ -99,6 +116,18 @@ jobs:
           check_so GL 'libGL-guest.so*' 'libGL.so.1'
           check_so EGL 'libEGL-guest.so*' 'libEGL.so.1'
           check_so cuda 'libcuda-guest.so*' 'libcuda.so.1'
+
+          python3 - "$R/footprint.tsv" <<'PY' | tee "$R/footprint-summary.txt"
+          import csv, sys
+          rows = list(csv.DictReader(open(sys.argv[1]), delimiter='\t'))
+          file_total = sum(int(r['file_bytes']) for r in rows)
+          load_total = sum(int(r['load_memsz_bytes']) for r in rows)
+          print(f'WRAPPER_COUNT={len(rows)}')
+          print(f'FILE_BYTES_TOTAL={file_total}')
+          print(f'PT_LOAD_MEMSZ_TOTAL={load_total}')
+          print(f'FILE_MIB_TOTAL={file_total / 1024 / 1024:.3f}')
+          print(f'PT_LOAD_MIB_TOTAL={load_total / 1024 / 1024:.3f}')
+          PY
           echo ALL_64_SHARED_GUEST_THUNKS_NODELETE_OK
 
       - name: Upload receipts
