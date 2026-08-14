@@ -67,8 +67,9 @@ int main(int argc, char** argv) {
   const bool MapFixedReregister = argc == 2 && std::strcmp(argv[1], "map-fixed-reregister") == 0;
   const bool MapFixedFail = argc == 2 && std::strcmp(argv[1], "map-fixed-fail") == 0;
   const bool Mprotect = argc == 2 && std::strcmp(argv[1], "mprotect") == 0;
-  if (!MapFixed && !MapFixedReregister && !MapFixedFail && !Mprotect) {
-    std::fprintf(stderr, "usage: %s map-fixed|map-fixed-reregister|map-fixed-fail|mprotect\n", argv[0]);
+  const bool MprotectOwner = argc == 2 && std::strcmp(argv[1], "mprotect-owner") == 0;
+  if (!MapFixed && !MapFixedReregister && !MapFixedFail && !Mprotect && !MprotectOwner) {
+    std::fprintf(stderr, "usage: %s map-fixed|map-fixed-reregister|map-fixed-fail|mprotect|mprotect-owner\n", argv[0]);
     return 64;
   }
 
@@ -146,6 +147,23 @@ int main(int argc, char** argv) {
     const int Second = Linked();
     std::fprintf(stderr, "VMA after-map-fixed value=%d reregister=%d\n", Second, MapFixedReregister ? 1 : 0);
     return Second == 222 ? 0 : 8;
+  }
+
+  if (MprotectOwner) {
+    // Permission changes do not create a new mapping generation. Make the page
+    // writable, mutate its code, then return it to RX and verify the existing H
+    // remains a valid pointer to the same mapping generation.
+    if (!Protect(Target, PageSize, PROT_READ | PROT_WRITE)) {
+      return 16;
+    }
+    EmitReturn(Target, 333);
+    if (!Protect(Target, PageSize, PROT_READ | PROT_EXEC)) {
+      return 17;
+    }
+    const int Restored = Linked();
+    std::fprintf(stderr, "VMA mprotect-owner-preserved H=%p T=%p value=%d\n",
+                 reinterpret_cast<void*>(SyntheticH), Target, Restored);
+    return Restored == 333 ? 0 : 18;
   }
 
   if (!Protect(Target, PageSize, PROT_NONE)) {
