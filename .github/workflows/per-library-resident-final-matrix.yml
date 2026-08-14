@@ -1,0 +1,158 @@
+name: Per-library resident bridge final matrix
+
+on:
+  push:
+    branches: [diagnostic/per-library-resident-final-matrix-20260814]
+    paths:
+      - .github/workflows/per-library-resident-final-matrix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  final-matrix:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      SOURCE_SHA: 1e8b042e7d50335cdbf2b1b6bfd0c888296dd73a
+      R: ${{ github.workspace }}/resident-final-matrix-receipts
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and exact source provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          git cat-file -e "$SOURCE_SHA^{commit}"
+          git diff --name-only "$SOURCE_SHA" -- ThunkLibs FEXCore Source | tee "$R/product-source-diff.txt"
+          test ! -s "$R/product-source-diff.txt"
+          git rev-parse "$SOURCE_SHA" | tee "$R/source-sha.txt"
+          git rev-list --count f3ab82a73fb48271ee12a882c98bc5d823a2b4d1.."$SOURCE_SHA" | tee "$R/tranche-count.txt"
+          test "$(cat "$R/tranche-count.txt")" -eq 3
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config python3 \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            gcc-multilib-x86-64-linux-gnu g++-multilib-x86-64-linux-gnu \
+            libcap-dev libgl-dev libdrm-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers libwayland-dev binutils file
+
+      - name: Build all 64-bit host and guest bridge pairs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host64.log" 2>&1
+          cmake --build build --target \
+            thunkgen GL-host-64 vulkan-host-64 cuda-host-64 wayland-client-host-64 drm-host-64 \
+            -- -j"$(nproc)" -v > "$R/build-host64.log" 2>&1 \
+            || { tail -n 520 "$R/build-host64.log"; exit 1; }
+
+          cmake -S ThunkLibs/GuestLibs -B guest64 -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest64.log" 2>&1
+          cmake --build guest64 --target \
+            GL-guest GL_bridge-guest \
+            vulkan-guest vulkan_bridge-guest \
+            cuda-guest cuda_bridge-guest \
+            wayland-client-guest wayland-client_bridge-guest \
+            drm-guest drm_bridge-guest \
+            -- -j"$(nproc)" -v > "$R/build-guest64.log" 2>&1 \
+            || { tail -n 620 "$R/build-guest64.log"; exit 1; }
+          echo FINAL_MATRIX_64_BUILD_OK | tee "$R/build64-gate.txt"
+
+      - name: Verify roles and all 64-bit ELF boundaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp guest64/gen/thunkgen_bridge_libGL.inl "$R/gl-bridge.inl"
+          test "$(grep -c 'caller=1 unpacker=0' "$R/gl-bridge.inl")" -eq 736
+          ! grep -q 'unpacker=1' "$R/gl-bridge.inl"
+
+          cp guest64/gen/thunkgen_bridge_libdrm.inl "$R/drm-bridge.inl"
+          grep 'FEX_BRIDGE_ROLE' "$R/drm-bridge.inl" | tee "$R/drm-role-lines.txt"
+          test "$(grep -c 'caller=0 unpacker=1' "$R/drm-role-lines.txt")" -eq 3
+          ! grep -q 'caller=1' "$R/drm-role-lines.txt"
+          test "$(wc -l < "$R/drm-role-lines.txt")" -eq 3
+
+          for gen in libvulkan libcuda; do
+            cp "guest64/gen/thunkgen_bridge_${gen}.inl" "$R/${gen}-bridge.inl"
+            grep 'FEX_BRIDGE_ROLE' "$R/${gen}-bridge.inl" | tee "$R/${gen}-role-lines.txt"
+            test -s "$R/${gen}-role-lines.txt"
+          done
+
+          for pair in \
+            'gl libGL-guest.so libfex-GL-bridge.so' \
+            'vulkan libvulkan-guest.so libfex-vulkan-bridge.so' \
+            'cuda libcuda-guest.so libfex-cuda-bridge.so' \
+            'wayland libwayland-client-guest.so libfex-wayland-client-bridge.so' \
+            'drm libdrm-guest.so libfex-drm-bridge.so'; do
+            set -- $pair
+            name="$1"; wrapper="guest64/$2"; bridge="guest64/$3"
+            file "$wrapper" "$bridge" | tee "$R/${name}-files.txt"
+            readelf -d "$wrapper" > "$R/${name}-wrapper.dynamic"
+            readelf -d "$bridge" > "$R/${name}-bridge.dynamic"
+            ! grep -q 'FLAGS_1.*NODELETE' "$R/${name}-wrapper.dynamic"
+            grep -q 'NEEDED.*libfex-' "$R/${name}-wrapper.dynamic"
+            grep -q 'RUNPATH.*\$ORIGIN' "$R/${name}-wrapper.dynamic"
+            grep -q 'FLAGS_1.*NODELETE' "$R/${name}-bridge.dynamic"
+          done
+
+          size \
+            guest64/libGL-guest.so guest64/libfex-GL-bridge.so \
+            guest64/libvulkan-guest.so guest64/libfex-vulkan-bridge.so \
+            guest64/libcuda-guest.so guest64/libfex-cuda-bridge.so \
+            guest64/libwayland-client-guest.so guest64/libfex-wayland-client-bridge.so \
+            guest64/libdrm-guest.so guest64/libfex-drm-bridge.so \
+            | tee "$R/size64.txt"
+          echo FINAL_MATRIX_64_ROLE_ELF_OK | tee "$R/elf64-gate.txt"
+
+      - name: Build and verify 32-bit Wayland resident pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest32 -G Ninja \
+            -DBITNESS=32 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_32.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest32.log" 2>&1
+          cmake --build guest32 --target wayland-client-guest wayland-client_bridge-guest \
+            -- -j"$(nproc)" -v > "$R/build-guest32.log" 2>&1 \
+            || { tail -n 520 "$R/build-guest32.log"; exit 1; }
+
+          file guest32/libwayland-client-guest.so guest32/libfex-wayland-client-bridge.so | tee "$R/wayland32-files.txt"
+          readelf -h guest32/libwayland-client-guest.so | tee "$R/wayland32-wrapper.elf"
+          readelf -h guest32/libfex-wayland-client-bridge.so | tee "$R/wayland32-bridge.elf"
+          grep -q 'Class:.*ELF32' "$R/wayland32-wrapper.elf"
+          grep -q 'Class:.*ELF32' "$R/wayland32-bridge.elf"
+          readelf -d guest32/libwayland-client-guest.so | tee "$R/wayland32-wrapper.dynamic"
+          readelf -d guest32/libfex-wayland-client-bridge.so | tee "$R/wayland32-bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wayland32-wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-wayland-client-bridge.so' "$R/wayland32-wrapper.dynamic"
+          grep -q 'RUNPATH.*\$ORIGIN' "$R/wayland32-wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/wayland32-bridge.dynamic"
+          size guest32/libwayland-client-guest.so guest32/libfex-wayland-client-bridge.so | tee "$R/size32.txt"
+          echo FINAL_MATRIX_WAYLAND32_ELF_OK | tee "$R/wayland32-gate.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resident-final-matrix-${{ github.run_id }}
+          path: resident-final-matrix-receipts
+          retention-days: 30
