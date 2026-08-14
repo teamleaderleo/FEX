@@ -29,25 +29,26 @@ static void VKAPI_PTR report_cb(const VkDeviceMemoryReportCallbackDataEXT *data,
 }
 #endif
 
-static int has_extension(VkPhysicalDevice physical) {
-  uint32_t count = 0;
-  if (vkEnumerateDeviceExtensionProperties(physical, NULL, &count, NULL) != VK_SUCCESS) return 0;
-  VkExtensionProperties *props = calloc(count ? count : 1, sizeof(*props));
-  if (!props) return 0;
-  if (vkEnumerateDeviceExtensionProperties(physical, NULL, &count, props) != VK_SUCCESS) { free(props); return 0; }
-  int found = 0;
-  for (uint32_t i = 0; i < count; ++i) {
-    if (!strcmp(props[i].extensionName, VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME)) { found = 1; break; }
-  }
-  free(props);
-  return found;
-}
+#define RESOLVE(type, name) \
+  type name = (type)dlsym(vulkan, #name); \
+  if (!(name)) { fprintf(stderr, "SKIP missing %s\n", #name); return 77; }
 
 int main(int argc, char **argv) {
   int support_only = argc == 2 && !strcmp(argv[1], "--support");
   if (argc > 2 || (argc == 2 && !support_only)) return 64;
-  void *vulkan = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_GLOBAL);
+  void *vulkan = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
   if (!vulkan) { fprintf(stderr, "SKIP dlopen %s\n", dlerror()); return 77; }
+
+  RESOLVE(PFN_vkCreateInstance, vkCreateInstance)
+  RESOLVE(PFN_vkDestroyInstance, vkDestroyInstance)
+  RESOLVE(PFN_vkEnumeratePhysicalDevices, vkEnumeratePhysicalDevices)
+  RESOLVE(PFN_vkEnumerateDeviceExtensionProperties, vkEnumerateDeviceExtensionProperties)
+  RESOLVE(PFN_vkGetPhysicalDeviceQueueFamilyProperties, vkGetPhysicalDeviceQueueFamilyProperties)
+  RESOLVE(PFN_vkGetPhysicalDeviceMemoryProperties, vkGetPhysicalDeviceMemoryProperties)
+  RESOLVE(PFN_vkCreateDevice, vkCreateDevice)
+  RESOLVE(PFN_vkDestroyDevice, vkDestroyDevice)
+  RESOLVE(PFN_vkAllocateMemory, vkAllocateMemory)
+  RESOLVE(PFN_vkFreeMemory, vkFreeMemory)
 
   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "fex-mem-report", .apiVersion = VK_API_VERSION_1_1};
   VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
@@ -65,7 +66,18 @@ int main(int argc, char **argv) {
   VkPhysicalDevice physical = physical_devices[0];
   free(physical_devices);
 
-  int supported = has_extension(physical);
+  uint32_t ext_count = 0;
+  result = vkEnumerateDeviceExtensionProperties(physical, NULL, &ext_count, NULL);
+  if (result != VK_SUCCESS) return 72;
+  VkExtensionProperties *props = calloc(ext_count ? ext_count : 1, sizeof(*props));
+  if (!props) return 73;
+  result = vkEnumerateDeviceExtensionProperties(physical, NULL, &ext_count, props);
+  if (result != VK_SUCCESS) return 74;
+  int supported = 0;
+  for (uint32_t i = 0; i < ext_count; ++i) {
+    if (!strcmp(props[i].extensionName, VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME)) { supported = 1; break; }
+  }
+  free(props);
   fprintf(stderr, "MEM_REPORT_SUPPORT supported=%d physical=%p\n", supported, (void *)physical);
   fflush(stderr);
   if (!supported) { vkDestroyInstance(instance, NULL); return 77; }
@@ -74,16 +86,16 @@ int main(int argc, char **argv) {
   uint32_t queue_count = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, NULL);
   VkQueueFamilyProperties *queues = calloc(queue_count ? queue_count : 1, sizeof(*queues));
-  if (!queues) return 72;
+  if (!queues) return 75;
   vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, queues);
   uint32_t qi = 0;
   while (qi < queue_count && queues[qi].queueCount == 0) ++qi;
   free(queues);
-  if (qi == queue_count) return 73;
+  if (qi == queue_count) return 76;
 
   VkPhysicalDeviceMemoryProperties memory_properties;
   vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
-  if (memory_properties.memoryTypeCount == 0) return 74;
+  if (memory_properties.memoryTypeCount == 0) return 78;
 
   float priority = 1.0f;
   VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = qi, .queueCount = 1, .pQueuePriorities = &priority};
@@ -110,7 +122,7 @@ int main(int argc, char **argv) {
   result = vkCreateDevice(physical, &dci, NULL, &device);
   fprintf(stderr, "MARK create-device-return result=%d callbacks=%u device=%p\n", result, callback_count, (void *)device);
   fflush(stderr);
-  if (result != VK_SUCCESS) { vkDestroyInstance(instance, NULL); return 75; }
+  if (result != VK_SUCCESS) { vkDestroyInstance(instance, NULL); return 79; }
 
   VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = 4096, .memoryTypeIndex = 0};
   VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -126,6 +138,5 @@ int main(int argc, char **argv) {
   fprintf(stderr, "MARK destroy-device-return callbacks=%u\n", callback_count);
   fflush(stderr);
   vkDestroyInstance(instance, NULL);
-
   return callback_count ? 0 : 20;
 }
