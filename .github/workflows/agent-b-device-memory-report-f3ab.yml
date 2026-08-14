@@ -1,0 +1,136 @@
+name: Agent B current-main device-memory-report callback
+
+on:
+  push:
+    branches: [ci/agent-b-device-memory-report-f3ab-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      HOST: ${{ github.workspace }}/host-thunks
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan1 libvulkan-dev mesa-vulkan-drivers
+          printf 'carrier=%s\nproduct=%s\n' "$(git rev-parse HEAD)" "$PRODUCT_SHA" > "$R/identity.txt"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source > "$R/product-source-diff.txt"
+          test ! -s "$R/product-source-diff.txt"
+
+      - name: Native support gate
+        id: support
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cc -O2 -Wall -Wextra -Werror -IExternal/Vulkan-Headers/include \
+            LinuxFieldwork/device_memory_report_probe.c -ldl -lvulkan -o "$R/native-probe"
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$ICD" "$R/native-probe" --support > "$R/support.stdout" 2> "$R/support.stderr"
+          rc=$?
+          set -e
+          cat "$R/support.stderr"
+          echo "$rc" > "$R/support.exit"
+          if [ "$rc" -eq 0 ]; then echo 'supported=yes' >> "$GITHUB_OUTPUT"; else echo 'supported=no' >> "$GITHUB_OUTPUT"; fi
+
+      - name: Build exact product Vulkan thunks
+        if: steps.support.outputs.supported == 'yes'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1
+
+      - name: Prepare FEX rootfs
+        if: steps.support.outputs.supported == 'yes'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 \
+            /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -IExternal/Vulkan-Headers/include \
+            LinuxFieldwork/device_memory_report_probe.c -ldl -lvulkan -o "$ROOTFS/opt/fex-ci/mem-report-probe"
+
+      - name: Execute native and FEX callback path
+        if: steps.support.outputs.supported == 'yes'
+        shell: bash
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$ICD" timeout 30s "$R/native-probe" > "$R/native.stdout" 2> "$R/native.stderr"
+          native_rc=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+            timeout 30s "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/mem-report-probe \
+            > "$R/fex.stdout" 2> "$R/fex.stderr"
+          fex_rc=$?
+          set -e
+          printf 'native=%s\nfex=%s\n' "$native_rc" "$fex_rc" | tee "$R/final-matrix.txt"
+          cat "$R/native.stderr" "$R/fex.stderr"
+
+      - name: Record unsupported native driver
+        if: steps.support.outputs.supported != 'yes'
+        shell: bash
+        run: |
+          echo 'Lavapipe did not advertise VK_EXT_device_memory_report; runtime callback claim remains source-only.' | tee "$R/final-matrix.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-b-device-memory-report-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
