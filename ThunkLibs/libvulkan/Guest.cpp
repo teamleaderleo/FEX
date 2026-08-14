@@ -24,42 +24,32 @@ $end_info$
 
 extern "C" {
 
-// Maps Vulkan API function names to the address of a guest function which is
-// linked to the corresponding host function pointer
-const std::unordered_map<std::string_view, uintptr_t /* guest function address */> HostPtrInvokers = std::invoke([]() {
-#define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(GetCallerForHostFunction(name));
-  std::unordered_map<std::string_view, uintptr_t> Ret;
-  FOREACH_internal_SYMBOL(PAIR);
-  return Ret;
-#undef PAIR
-});
+uintptr_t fex_vulkan_bridge_find_host_invoker(const char* name);
+uintptr_t fex_vulkan_bridge_fatal_invoker();
+uintptr_t fex_vulkan_bridge_xsync_unpacker();
+uintptr_t fex_vulkan_bridge_xgetvisualinfo_unpacker();
+uintptr_t fex_vulkan_bridge_xdisplaystring_unpacker();
 
 // This variable controls the behavior of vkGetDevice/InstanceProcAddr for functions we don't know the signature of:
 // - if false (default), we return a nullptr (since the application might have a fallback code path)
 // - if true, we return a stub function that fatally errors upon being called
 constexpr bool stub_unknown_functions = false;
 
-// Fatally erroring function with a thunk-like interface. This is used as a placeholder for unknown Vulkan functions
-[[noreturn]]
-static void FatalError(void* raw_args) {
-  auto called_function = reinterpret_cast<PackedArguments<void, uintptr_t>*>(raw_args)->a0;
-  fprintf(stderr, "FATAL: Called unknown Vulkan function at address %p\n", reinterpret_cast<void*>(called_function));
-  __builtin_trap();
-}
+// Unknown-function fatal invoker is owned by the resident bridge DSO.
 
 static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {
-  auto It = HostPtrInvokers.find(name);
-  if (It == HostPtrInvokers.end()) {
+  const auto GuestInvoker = fex_vulkan_bridge_find_host_invoker(name);
+  if (!GuestInvoker) {
     fprintf(stderr, "%s: Unknown Vulkan function at address %p: %s\n", origin, func, name);
     if (stub_unknown_functions) {
-      const auto StubHostPtrInvoker = CallHostFunction<FatalError, void>;
-      LinkAddressToFunction((uintptr_t)func, reinterpret_cast<uintptr_t>(StubHostPtrInvoker));
+      const auto StubHostPtrInvoker = fex_vulkan_bridge_fatal_invoker();
+      LinkAddressToFunction((uintptr_t)func, StubHostPtrInvoker);
       return func;
     }
     return nullptr;
   }
-  fprintf(stderr, "Linking address %p to host invoker %#zx\n", func, It->second);
-  LinkAddressToFunction((uintptr_t)func, It->second);
+  fprintf(stderr, "Linking address %p to resident host invoker %#zx\n", func, GuestInvoker);
+  LinkAddressToFunction((uintptr_t)func, GuestInvoker);
   return func;
 }
 
@@ -87,9 +77,9 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
 void OnInit() {
   // TODO: Load libX11 on-demand instead
   void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);
-  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
-  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
-  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), fex_vulkan_bridge_xsync_unpacker());
+  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), fex_vulkan_bridge_xgetvisualinfo_unpacker());
+  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), fex_vulkan_bridge_xdisplaystring_unpacker());
 }
 
 LOAD_LIB_INIT(libvulkan, OnInit)

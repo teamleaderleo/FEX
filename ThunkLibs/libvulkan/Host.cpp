@@ -362,6 +362,10 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkAllocateMemory;
   } else if (a_1 == "vkFreeMemory"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkFreeMemory;
+  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;
+  } else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;
   } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkAcquireXlibDisplayEXT;
   } else if (a_1 == "vkGetRandROutputDisplayEXT"sv) {

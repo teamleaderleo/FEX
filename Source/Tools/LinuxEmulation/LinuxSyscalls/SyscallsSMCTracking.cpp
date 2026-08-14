@@ -19,6 +19,7 @@ $end_info$
 #include <sys/shm.h>
 
 #include "LinuxSyscalls/Syscalls.h"
+#include "Thunks.h"
 #include "LinuxSyscalls/SignalDelegator.h"
 
 #include <FEXCore/Debug/InternalThreadState.h>
@@ -355,28 +356,47 @@ uint64_t SyscallHandler::GuestMunmap(bool Is64Bit, FEXCore::Core::InternalThread
 
   uint64_t Result;
   uint64_t Size = FEXCore::AlignUp(length, FEXCore::Utils::FEX_PAGE_SIZE);
-  bool PendingResourceDeletion;
+  bool PendingResourceDeletion {};
+  bool MunmapFailed = false;
+
+  auto* Thunks = (Thread && Size) ? GetThunkHandler() : nullptr;
+  if (Thunks) {
+    Thunks->BeginGuestRangeRetirement(Thread, reinterpret_cast<uintptr_t>(addr), Size);
+  }
 
   {
-    // Frontend calls this with nullptr Thread during initialization.
-    // This is why `GuardSignalDeferringSectionWithFallback` is used here.
-    // To be more optimal the frontend should provide this code with a valid Thread object earlier.
+    // Do not hold VMATracking.Mutex while waiting for callback execution drain.
+    // BeginGuestRangeRetirement has already completed its wait before this lock.
     auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(VMATracking.Mutex, Thread);
 
     if (reinterpret_cast<uintptr_t>(addr) < 0x1'0000'0000ULL) {
       Result = Get32BitAllocator()->Munmap(addr, length);
-      if (FEX::HLE::HasSyscallError(Result)) {
-        return Result;
-      }
+      MunmapFailed = FEX::HLE::HasSyscallError(Result);
     } else {
       Result = ::munmap(addr, length);
       if (Result == -1) {
-        return -errno;
+        Result = -errno;
+        MunmapFailed = true;
       }
     }
-    TrackMunmap(Thread, addr, length);
-    PendingResourceDeletion = VMATracking.HasPendingResourceDeletions();
+
+    if (!MunmapFailed) {
+      TrackMunmap(Thread, addr, length);
+      PendingResourceDeletion = VMATracking.HasPendingResourceDeletions();
+    }
   }
+
+  if (MunmapFailed) {
+    if (Thunks) {
+      Thunks->RollbackGuestRangeRetirement(reinterpret_cast<uintptr_t>(addr), Size);
+    }
+    return Result;
+  }
+
+  if (Thunks) {
+    Thunks->CommitGuestRangeRetirement(Thread, reinterpret_cast<uintptr_t>(addr), Size);
+  }
+
   InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), Size, PendingResourceDeletion);
 
   if (length) {

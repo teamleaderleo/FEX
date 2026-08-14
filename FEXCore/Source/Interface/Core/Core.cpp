@@ -966,6 +966,20 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   return (uintptr_t)CodePtr;
 }
 
+void ContextImpl::InvalidateCodeBuffersCodeEntry(uint64_t Address) {
+  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+  std::scoped_lock lk {CodeBufferListLock};
+  size_t Erased = 0;
+  for (auto it = CodeBufferList.begin(); it != CodeBufferList.end();) {
+    if (auto Strong = it->lock()) {
+      Erased += Strong->LookupCache->InvalidateExactEntry(Address) ? 1 : 0;
+      ++it;
+    } else {
+      it = CodeBufferList.erase(it);
+    }
+  }
+}
+
 void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
 
@@ -980,6 +994,11 @@ void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
       it = CodeBufferList.erase(it);
     }
   }
+}
+
+void ContextImpl::InvalidateThreadCachedCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
+  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+  Thread->LookupCache->InvalidateExactEntry(Address);
 }
 
 void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
@@ -1062,6 +1081,40 @@ void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Gu
   }
 }
 
+void ContextImpl::RetireThunkTrampolineIRHandler(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) {
+  SyscallHandler->RetireThunkTrampolineEntry(Thread, Entrypoint);
+}
+
+void ContextImpl::ActivateThunkTrampolineIRHandler(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint,
+                                                    uintptr_t GuestThunkEntrypoint) {
+  SyscallHandler->ActivateThunkTrampolineEntry(Thread, Entrypoint, GuestThunkEntrypoint);
+}
+
+bool ContextImpl::RemoveThunkTrampolineIRHandlerDefinition(uintptr_t Entrypoint) {
+  std::scoped_lock lk(CustomIRMutex);
+  const auto Erased = CustomIRHandlers.erase(Entrypoint);
+  HasCustomIRHandlers = !CustomIRHandlers.empty();
+  return Erased != 0;
+}
+
+void ContextImpl::AddRevokedThunkTrampolineIRHandlerDefinition(uintptr_t Entrypoint) {
+  auto Result = AddCustomIREntrypoint(
+    Entrypoint,
+    [](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
+      auto IRHeader = emit->_IRHeader(emit->Invalid(), Entrypoint, 0, 0, 0, 0);
+      auto Block = emit->CreateCodeNode(true, 0);
+      IRHeader.first->Blocks = emit->WrapNode(Block);
+      emit->SetCurrentCodeBlock(Block);
+      // Keep H synthetic after its last owner retires. A stale call exits toward
+      // guest address zero instead of letting the frontend decode native host bytes.
+      emit->_ExitFunction(IR::OpSize::i64Bit, emit->Constant(0), IR::BranchHint::None, emit->Invalid(), emit->Invalid());
+    },
+    this,
+    nullptr);
+
+  LOGMAN_THROW_A_FMT(!Result.has_value(), "Revoked synthetic H unexpectedly collided at {:#x}", Entrypoint);
+}
+
 void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {
   LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
   ForceTSOValidRanges.Insert(ValidRanges);
@@ -1082,10 +1135,13 @@ void ContextImpl::MarkMonoBackpatcherBlock(uint64_t BlockEntry) {
 void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) {
   LOGMAN_THROW_A_FMT(Config.Is64BitMode || !(Entrypoint >> 32), "64-bit Entrypoint in 32-bit mode {:x}", Entrypoint);
 
-  std::scoped_lock lk(CustomIRMutex);
-
-  CustomIRHandlers.erase(Entrypoint);
-  HasCustomIRHandlers = !CustomIRHandlers.empty();
+  {
+    std::scoped_lock lk(CustomIRMutex);
+    CustomIRHandlers.erase(Entrypoint);
+    HasCustomIRHandlers = !CustomIRHandlers.empty();
+  }
+  // Preserve the generic remover's existing range-invalidation behavior, but
+  // do not hold CustomIRMutex while entering the code-invalidation path.
   SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
 }
 

@@ -7,6 +7,8 @@
 
 #include <span>
 
+namespace FEXCore::Core { struct InternalThreadState; }
+
 namespace FEX::HLE {
 struct ThreadStateObject;
 
@@ -20,6 +22,9 @@ public:
    * @param Definitions A vector of thunk definitions that the frontend controls
    */
   virtual void AppendThunkDefinitions(std::span<const FEXCore::IR::ThunkDefinition> Definitions) = 0;
+  virtual void BeginGuestRangeRetirement(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Length) = 0;
+  virtual void CommitGuestRangeRetirement(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Length) = 0;
+  virtual void RollbackGuestRangeRetirement(uintptr_t Base, uintptr_t Length) = 0;
 };
 fextl::unique_ptr<ThunkHandler> CreateThunkHandler();
 } // namespace FEX::HLE
