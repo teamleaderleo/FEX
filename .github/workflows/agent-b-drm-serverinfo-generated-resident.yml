@@ -1,0 +1,207 @@
+name: Agent B generated retained DRM callbacks resident bridge
+
+on:
+  push:
+    branches: [ci/agent-b-drm-serverinfo-generated-resident-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 55
+    env:
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      HOST: ${{ github.workspace }}/host-thunks
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and exact-product provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          git log --oneline -12 | tee "$R/lineage.txt"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libdrm-dev libgl-dev
+
+      - name: Native retained-callback precondition
+        shell: bash
+        run: |
+          set -uxo pipefail
+          cc -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
+            LinuxFieldwork/drm_serverinfo_callback_probe.c -ldl -o "$R/native-probe"
+          set +e
+          "$R/native-probe" > "$R/native.stdout" 2> "$R/native.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/native.exit"
+          cat "$R/native.stderr"
+          if [ "$rc" -eq 77 ]; then
+            echo 'supported=no' >> "$GITHUB_ENV"
+          else
+            test "$rc" -eq 0
+            grep -q 'DRM_SERVER_CALLBACK count=1' "$R/native.stderr"
+            grep -q 'MARK open-return fd=-1 callbacks=1' "$R/native.stderr"
+            echo 'supported=yes' >> "$GITHUB_ENV"
+          fi
+
+      - name: Apply generated callbacks plus resident bridge and retained-container policy
+        if: env.supported == 'yes'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_drm_serverinfo_generated_resident.py
+          git diff --check
+          git diff -- \
+            ThunkLibs/Generator \
+            ThunkLibs/include/common/GeneratorInterface.h \
+            ThunkLibs/GuestLibs/CMakeLists.txt \
+            ThunkLibs/libdrm \
+            ThunkLibs/libdrm_bridge \
+            | tee "$R/generated-retained-drm.diff"
+          test "$(git diff --name-only -- ThunkLibs FEXCore Source | sort | tr '\n' ' ')" = \
+            'ThunkLibs/Generator/analysis.cpp ThunkLibs/Generator/analysis.h ThunkLibs/Generator/gen.cpp ThunkLibs/GuestLibs/CMakeLists.txt ThunkLibs/include/common/GeneratorInterface.h ThunkLibs/libdrm/Guest.cpp ThunkLibs/libdrm/Host.cpp ThunkLibs/libdrm/libdrm_interface.cpp ThunkLibs/libdrm_bridge/Guest.cpp '
+
+      - name: Build generated retained callbacks and resident sidecar
+        if: env.supported == 'yes'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer drm-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 320 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libdrm-host.so "$HOST/libdrm-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target drm-guest drm_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 360 "$R/build-guest.log"; exit 1; }
+
+      - name: Prove generated callback coverage and ELF ownership
+        if: env.supported == 'yes'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          normal_inl="guest-build/gen/thunkgen_guest_libdrm.inl"
+          host_inl="build/ThunkLibs/libdrm/thunkgen_host_libdrm.inl"
+          bridge_inl="guest-build/gen/thunkgen_guest_libdrm_bridge.inl"
+          accessors="guest-build/gen/thunkgen_guest_libdrm_bridge_accessors.inl"
+          test -f "$normal_inl"
+          test -f "$host_inl"
+          test -f "$bridge_inl"
+          test -f "$accessors"
+
+          normal_count="$(grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' "$normal_inl")"
+          bridge_count="$(grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' "$bridge_inl")"
+          printf 'normal_callback_signatures=%s\nbridge_callback_signatures=%s\n' "$normal_count" "$bridge_count" \
+            | tee "$R/signature-counts.txt"
+          test "$normal_count" -ge 6
+          test "$normal_count" -eq "$bridge_count"
+
+          grep -n -E 'fex_callback_copy_.*\.(debug_print|load_module|get_perms) = AllocateHostTrampolineForGuestFunction' "$normal_inl" \
+            | tee "$R/generated-serverinfo-guest-markers.txt"
+          grep -q 'debug_print' "$R/generated-serverinfo-guest-markers.txt"
+          grep -q 'load_module' "$R/generated-serverinfo-guest-markers.txt"
+          grep -q 'get_perms' "$R/generated-serverinfo-guest-markers.txt"
+          grep -n -E 'FinalizeHostTrampolineForGuestFunction\(fex_callback_.*_(debug_print|load_module|get_perms)\)' "$host_inl" \
+            | tee "$R/generated-serverinfo-host-markers.txt"
+          grep -q 'debug_print' "$R/generated-serverinfo-host-markers.txt"
+          grep -q 'load_module' "$R/generated-serverinfo-host-markers.txt"
+          grep -q 'get_perms' "$R/generated-serverinfo-host-markers.txt"
+          grep -n 'FEXAllocateResidentHostTrampolineForGuestFunction' "$accessors" \
+            | tee "$R/resident-accessor-marker.txt"
+          grep -n '#define AllocateHostTrampolineForGuestFunction FEXAllocateResidentHostTrampolineForGuestFunction' \
+            ThunkLibs/libdrm/Guest.cpp | tee "$R/wrapper-redirect-marker.txt"
+          grep -n -A16 'fexfn_impl_libdrm_drmSetServerInfo' ThunkLibs/libdrm/Host.cpp \
+            | tee "$R/retained-container-marker.txt"
+          ! grep -q 'FinalizeHostTrampolineForGuestFunction' "$R/retained-container-marker.txt"
+
+          test -f guest-build/libdrm-guest.so
+          test -f guest-build/libfex-drm-bridge.so
+          readelf -d guest-build/libdrm-guest.so | tee "$R/drm.dynamic"
+          readelf -d guest-build/libfex-drm-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/drm.dynamic"
+          grep -q 'NEEDED.*libfex-drm-bridge.so' "$R/drm.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+
+      - name: Prepare amd64 rootfs and moved-reload probe
+        if: env.supported == 'yes'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-build/libdrm-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libdrm.so.2"
+          cp guest-build/libfex-drm-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-drm-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
+            LinuxFieldwork/drm_serverinfo_moved_reload_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/drm-server-moved-probe"
+
+      - name: Execute generated retained callback after moved reload
+        if: env.supported == 'yes'
+        shell: bash
+        run: |
+          set -uxo pipefail
+          set +e
+          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/drm-server-moved-probe \
+            > "$R/moved.stdout" 2> "$R/moved.stderr"
+          moved_rc=$?
+          set -e
+          echo "$moved_rc" > "$R/moved.exit"
+          printf 'native_precondition=%s\nwrapper_owned_unpacker_reference=139\nhandwritten_resident_reference=0\ngenerated_resident_retained=%s\n' \
+            "$(cat "$R/native.exit")" "$moved_rc" | tee "$R/final-matrix.txt"
+          cat "$R/moved.stderr"
+
+          grep -q 'MARK close1-return old_set_mapped=0' "$R/moved.stderr"
+          grep -q 'GEN2 .* moved=1' "$R/moved.stderr"
+          grep -q 'MARK open2-enter retained-registration-only' "$R/moved.stderr"
+          test "$moved_rc" -eq 0
+          grep -q 'DRM_SERVER_CALLBACK count=1' "$R/moved.stderr"
+          grep -q 'MARK open2-return fd=-1 callbacks=1' "$R/moved.stderr"
+          echo 'OUTCOME=generated_callback_conversion_survived_retained_moved_reload' | tee -a "$R/final-matrix.txt"
+
+      - name: Record unavailable control
+        if: env.supported != 'yes'
+        shell: bash
+        run: echo 'Hosted runner has DRM available; retained load_module path unavailable in this lane.' | tee "$R/final-matrix.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-b-drm-serverinfo-generated-resident-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
