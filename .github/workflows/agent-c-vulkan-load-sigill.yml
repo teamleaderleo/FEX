@@ -1,4 +1,4 @@
-name: Agent C route-only Vulkan callback matrix
+name: Agent C two-commit Vulkan proc routing matrix
 
 on:
   push:
@@ -11,11 +11,11 @@ permissions:
   contents: read
 
 jobs:
-  route-only:
+  two-commit-head:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
-      FEX_SHA: 28a3a5bfbd31662bfc4bd316ada39037aebf4165
+      FEX_SHA: 579860a098bdbe94e39970535771bada0f3ed853
       FIELDWORK_SHA: 1b268a6742768086aa8355e997c10b4423319ba6
       DEBIAN_FRONTEND: noninteractive
       ROOTFS: ${{ github.workspace }}/rootfs
@@ -72,7 +72,7 @@ jobs:
           VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 report gipa positive >"$R/native-report.out" 2>"$R/native-report.err"
           VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 utils gipa positive >"$R/native-utils.out" 2>"$R/native-utils.err"
 
-      - name: Build clean route-only FEX Vulkan thunk pair
+      - name: Build clean two-commit FEX Vulkan thunk pair
         shell: bash
         run: |
           set -euxo pipefail
@@ -135,7 +135,7 @@ jobs:
           EOF
           x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/null-gipa.c -ldl -o "$ROOTFS/opt/fex-ci/null-gipa"
 
-      - name: Run route-only callback and proc-address matrix
+      - name: Run two-commit callback and proc-address matrix
         shell: bash
         run: |
           set -uxo pipefail
@@ -156,14 +156,13 @@ jobs:
           run_case report-gipa /opt/fex-ci/callback-probe report gipa 0
           run_case utils-direct /opt/fex-ci/callback-probe utils direct 0
           run_case utils-gipa /opt/fex-ci/callback-probe utils gipa 0
-          # These non-null results are intentionally captured as the remaining custom-first semantics defect.
-          run_case null-report /opt/fex-ci/null-gipa vkCreateDebugReportCallbackEXT nonnull
-          run_case null-shader /opt/fex-ci/null-gipa vkCreateShaderModule nonnull
+          run_case null-report /opt/fex-ci/null-gipa vkCreateDebugReportCallbackEXT null
+          run_case null-shader /opt/fex-ci/null-gipa vkCreateShaderModule null
           {
             for name in report-direct report-gipa utils-direct utils-gipa null-report null-shader; do
               printf '%s=' "$name"; cat "$R/$name.exit"
             done
-          } | tee "$R/route-only-matrix.txt"
+          } | tee "$R/two-commit-matrix.txt"
           for name in report-direct report-gipa utils-direct utils-gipa null-report null-shader; do
             test "$(cat "$R/$name.exit")" = 0
           done
@@ -172,7 +171,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-c-route-only-${{ github.run_id }}
+          name: agent-c-two-commit-${{ github.run_id }}
           path: receipts
           if-no-files-found: warn
           retention-days: 30
