@@ -1,0 +1,138 @@
+name: Agent B allocator const-repack fix
+
+on:
+  push:
+    branches: [ci/agent-b-allocator-const-repack-fix-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    env:
+      PRODUCT_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      HOST: ${{ github.workspace }}/host-thunks
+      R: ${{ github.workspace }}/receipts-const-fix
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+        with:
+          path: carrier
+      - name: Checkout exact product
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          submodules: recursive
+      - name: Dependencies and identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers
+          printf 'carrier=%s\nproduct=%s\n' "$(git -C carrier rev-parse HEAD)" "$(git -C product rev-parse HEAD)" > "$R/identity.txt"
+      - name: Apply allocator mediation and generic const-copyback fix
+        working-directory: product
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 ../carrier/LINUX_FIELDWORK_ALLOCATOR_TRAMPOLINE.py
+          python3 ../carrier/LINUX_FIELDWORK_ALLOCATOR_REPACK_IDENTITY.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/include/common/Host.h')
+          s=p.read_text()
+          old='''        if (!fex_apply_custom_repacking_exit(*orig_arg.get_pointer(), *data)) {\n          if constexpr (!std::is_const_v<std::remove_pointer_t<T>>) { // Skip exit-repacking for const pointees\n'''
+          new='''        if (!fex_apply_custom_repacking_exit(*orig_arg.get_pointer(), *data)) {\n          if constexpr (!std::is_const_v<std::remove_pointer_t<GuestT>>) { // Preserve original guest pointee constness\n'''
+          assert s.count(old)==1, s.count(old)
+          p.write_text(s.replace(old,new,1))
+          PY
+          git diff --check
+          git diff -- ThunkLibs/include/common/Host.h ThunkLibs/libvulkan | tee "$R/product.diff"
+      - name: Build FEX and Vulkan thunks
+        working-directory: product
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 260 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$PWD" -DGENERATOR_EXE="$PWD/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 260 "$R/build-guest.log"; exit 1; }
+      - name: Prove generated nonconst host wrapper and fixed guest constness guard
+        working-directory: product
+        shell: bash
+        run: |
+          set -euxo pipefail
+          host_inl="$(find build -name 'thunkgen_host_libvulkan.inl' -print -quit)"
+          test -n "$host_inl"
+          grep -n 'make_repack_wrapper<VkAllocationCallbacks\*>' "$host_inl" | tee "$R/generated-nonconst-wrapper.txt"
+          grep -n 'std::remove_pointer_t<GuestT>' ThunkLibs/include/common/Host.h | tee "$R/fixed-constness-guard.txt"
+          grep -q 'make_repack_wrapper<VkAllocationCallbacks\*>' "$R/generated-nonconst-wrapper.txt"
+          grep -q 'GuestT' "$R/fixed-constness-guard.txt"
+      - name: Prepare rootfs and allocator probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"; docker export "$cid" | tar -C "$ROOTFS" -xf -; docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp product/guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void*d,int x){(void)d;(void)x;return 0;} void*XGetVisualInfo(void*d,long m,void*t,int*n){(void)d;(void)m;(void)t;if(n)*n=0;return 0;} char*XDisplayString(void*d){(void)d;static char s[]=":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -std=c11 -O0 -g -Wall -Wextra -Werror \
+            carrier/LINUX_FIELDWORK_ALLOCATOR_CROSSCALL_TRACE.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/allocator-const-fix"
+      - name: Execute causal allocator fix discriminator
+        shell: bash
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            product/build/Bin/FEX /opt/fex-ci/allocator-const-fix > "$R/fex.stdout" 2> "$R/fex.stderr"
+          rc=$?; set -e; echo "$rc" > "$R/fex.exit"
+          grep -E 'ALLOC_REPACK_|API_CREATE_|API_DESTROY_|CB_ALLOC|CB_FREE' "$R/fex.stderr" | tee "$R/key-lines.txt" || true
+          printf 'corrupting_reference=139\nconst_fix=%s\n' "$rc" | tee "$R/final-matrix.txt"
+          test "$rc" -eq 0
+          grep -E -q 'ALLOC_REPACK_BEGIN seq=2 .*guest_alloc=0x' "$R/fex.stderr"
+          ! grep -E -q 'ALLOC_REPACK_BEGIN seq=2 .*guest_alloc=\(nil\)' "$R/fex.stderr"
+          grep -q 'CB_FREE_ENTER' "$R/fex.stderr"
+          grep -q 'CB_FREE_RETURN' "$R/fex.stderr"
+          grep -q 'API_DESTROY_RETURN' "$R/fex.stderr"
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-b-allocator-const-repack-fix-${{ github.run_id }}
+          path: receipts-const-fix
+          retention-days: 30
