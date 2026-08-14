@@ -20,6 +20,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: thunk-inflight-selected-race-20260814
+  cancel-in-progress: true
+
 jobs:
   selected-race:
     runs-on: ubuntu-24.04-arm
