@@ -36,12 +36,13 @@ jobs:
           python3 ../carrier/LINUX_FIELDWORK_ALLOCATOR_TRAMPOLINE.py
           git diff --check
           git diff -- ThunkLibs/Generator/gen.cpp unittests/ThunkLibs/generator.cpp ThunkLibs/libvulkan/libvulkan_interface.cpp ThunkLibs/libvulkan/Host.cpp ThunkLibs/libvulkan/Guest.cpp > ../receipts-source.diff
-      - name: Build and run ThunkGen regression
+      - name: Build and run focused ThunkGen regression
         working-directory: product
         run: |
           set -euxo pipefail
           CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=ON -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/
-          cmake --build build --target thunkgen_tests -- -j"$(nproc)"
+          cmake --build build --target thunkgentest -- -j"$(nproc)"
+          build/Bin/thunkgentest "StructRepacking"
       - name: Build FEX and Vulkan thunks
         working-directory: product
         run: |
