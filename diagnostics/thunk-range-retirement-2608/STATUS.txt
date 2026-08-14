@@ -18,10 +18,13 @@ Critical v1 flaw discovered during source audit:
 Current v2 artifacts:
 - apply_exact_customir_retirement_v2.py
 - repair_exact_customir_retirement_v2_compile.py
+- select_exact_customir_retirement_mode.py
 - .github/workflows/thunk-range-retirement-arm64.yml
+- .github/workflows/thunk-range-retirement-ablation-arm64.yml
 - Applicator commit: 7950f66996c5c2b2accada06e0e80c4ef157809d
 - Shared-map compile repair commit: 307ac96592a263f2cc197a6fae7954f9025a4d5c
 - Successful A/B carrier commit: 384bf4a52a465802afa2b6403ea157e4385ade9b
+- 2x2 ablation carrier commit: 17c6429f9f1058e236358509c486581e221afb4d
 
 Hosted ARM64 A/B result:
 - Actions run: 31775159912
@@ -57,6 +60,30 @@ Compile repair discovered by first A/B run:
 - The repair performs shared/L3 exact eviction directly with GuestToHostMap::AcquireWriteLock() plus GuestToHostMap::Erase(H, lock).
 - Per-thread exact L1/L2 eviction remains on LookupCache.
 
+Real-FEX 2x2 ownership ablation:
+- Actions run: 31775684761
+- Workflow: CustomIR retirement ownership ablation
+- All four hosted ARM64 matrix jobs completed successfully as harnesses.
+- Geometry was identical in all modes: H=0x0000700000010000, T1=0x00007ffff7da2150, T2=0x00007ffff7d9d150, old T1 DSO span reserved PROT_NONE, direct T2 call healthy.
+
+Observed split:
+- baseline: registry retained + translated/cache retained -> H call SIGSEGV
+- registry-only: registry retired + translated/cache retained -> H call SIGSEGV
+- cache-only: registry retained + translated/cache exact-evicted -> H call SIGSEGV
+- full: registry retired + translated/cache exact-evicted -> H returns generation-2 value 100100071 and exits 0
+
+Artifact digests:
+- baseline:      c14496a0dd2c836e2e33f2a7e96dc1cdcaa64cec1f8b7eea109fbdcc84705007
+- registry-only: 9d6fb916482ec90c6e7e1793ecc5fcf59d54b20f595eb5aa52fe8c8bb543ab5c
+- cache-only:    3d1de0b75ae97902486845a8fcabfbb3eb259de469eb9efc6e6b1d3061dc9ee2
+- full:          aace2648aac8b6d449c5ad1cefc5c2cbb74664a47853e8ca62855f3648809468
+
+2x2 conclusion:
+- Registry retirement alone is insufficient once H has been translated; already-generated stale H state remains usable.
+- Exact translated/cache eviction alone is insufficient because the retained CustomIR registry can regenerate stale H->T1 routing.
+- Both layers are independently necessary and must be retired as one guest-code lifetime operation.
+- This is now demonstrated in real FEX, not only in the standalone ownership model.
+
 v2 causal experiment semantics:
 1. Add exact shared/L3 eviction for a synthetic entrypoint H via GuestToHostMap::Erase(H), which also delinks inbound direct block links.
 2. Add exact per-thread L1/L2 eviction for H and flush the call/return shadow cache.
@@ -70,9 +97,10 @@ Known limits of v2:
 - Host-to-guest callback trampolines are not retired.
 - mmap(MAP_FIXED), mremap, shmdt, and other destructive mapping paths are not covered by this first probe.
 - No load-generation/owner identity is attached to H->T registrations yet.
-- The informational retirement log did not appear in the successful run's stderr, so the runtime A/B behavior is the primary discriminator; future instrumentation should use an explicit receipt/counter rather than relying on normal logging configuration.
+- Informational retirement logs did not appear under the default hosted logging configuration, so the runtime ownership ablation is the primary discriminator. Future instrumentation should use an explicit receipt/counter when event-count evidence is needed.
 
 Next runtime work:
-- Run a real-FEX 2x2 ownership ablation: baseline, registry-only retirement, cache-only exact eviction, and full retirement+eviction. Expected useful split is baseline/registry-only/cache-only stale versus full fresh generation-2 routing.
-- Apply the causally positive cleanup to the Vulkan teardown experiment with llvmpipe and Venus, recording final exit status and the host-PC/si_addr/guest-RIP fault tuple if any failure remains.
-- If the ablation stays positive, move retirement to a pre-destructive mapping phase and test a peer-thread quiescence barrier before treating any patch as a lifetime repair.
+- Apply the fully causally validated cleanup to the repaired Vulkan teardown experiment with llvmpipe and Venus, retaining pin and bogus-preload controls and recording final exit status.
+- If a Vulkan failure remains, capture host PC, si_addr, JIT membership, and guest RIP before/after reconstruction to assign the remaining failure to a specific execution path.
+- Move retirement to a pre-destructive mapping phase and test peer-thread quiescence before treating the lifetime diagnostic as a production repair.
+- Audit the separate GuestcallToHostTrampoline host-to-guest retained-pointer path under DSO unload/reload.
