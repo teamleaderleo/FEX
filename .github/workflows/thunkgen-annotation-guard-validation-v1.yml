@@ -1,0 +1,165 @@
+name: Thunkgen indirect annotation guard validation v1
+
+on:
+  push:
+    branches: [diagnostic/thunkgen-annotation-guard-v1]
+    paths:
+      - .github/workflows/thunkgen-annotation-guard-validation-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard-validation:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 80
+    env:
+      R: ${{ github.workspace }}/receipts-thunkgen-annotation-guard-v1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and committed guard check
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils libcap-dev \
+            libgl-dev libegl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libwayland-dev libasound2-dev libsdl2-dev libdrm-dev libxshmfence-dev
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+          git diff --check
+          grep -q 'Conflicting parameter annotations for runtime function pointer signature' ThunkLibs/Generator/gen.cpp
+          grep -q 'registration_key' ThunkLibs/Generator/gen.cpp
+          test ! -e .github/workflows/materialize-thunkgen-annotation-guard-v1.yml
+
+      - name: Build guarded thunkgen
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1 \
+            || { tail -n 300 "$R/cmake-host.log"; exit 1; }
+          cmake --build build --target FEX GL-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 600 "$R/build-host.log"; exit 1; }
+          test -x build/Bin/thunkgen
+
+      - name: Conflicting annotation synthetic must fail loudly
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/conflict.cpp <<'EOF'
+          #include <common/GeneratorInterface.h>
+          int SameTypeNormal(int *value);
+          int SameTypePassthrough(int *value);
+          namespace identity_guard {
+          template<auto> struct fex_gen_config : fexgen::indirect_guest_calls {};
+          template<typename> struct fex_gen_type {};
+          template<auto, int, typename = void> struct fex_gen_param {};
+          template<> struct fex_gen_config<SameTypeNormal> {};
+          template<> struct fex_gen_config<SameTypePassthrough> : fexgen::custom_host_impl {};
+          template<> struct fex_gen_param<SameTypePassthrough, 0, int *> : fexgen::ptr_passthrough {};
+          }
+          EOF
+          set +e
+          build/Bin/thunkgen /tmp/conflict.cpp identity_guard -guest "$R/conflict-guest.inl" / -- \
+            -std=c++20 -I"$GITHUB_WORKSPACE/ThunkLibs/include" \
+            > "$R/conflict.out" 2> "$R/conflict.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/conflict.exit"
+          cat "$R/conflict.err"
+          test "$rc" -ne 0
+          grep -q 'Conflicting parameter annotations for runtime function pointer signature' "$R/conflict.err"
+          grep -q 'SameTypeNormal' "$R/conflict.err"
+          grep -q 'SameTypePassthrough' "$R/conflict.err"
+          echo ANNOTATION_CONFLICT_GUARD_REJECTS | tee "$R/conflict-result.txt"
+
+      - name: Identical annotation synthetic must still dedupe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/identical.cpp <<'EOF'
+          #include <common/GeneratorInterface.h>
+          int SameTypeOne(int *value);
+          int SameTypeTwo(int *value);
+          namespace identity_guard_ok {
+          template<auto> struct fex_gen_config : fexgen::indirect_guest_calls {};
+          template<typename> struct fex_gen_type {};
+          template<auto, int, typename = void> struct fex_gen_param {};
+          template<> struct fex_gen_config<SameTypeOne> {};
+          template<> struct fex_gen_config<SameTypeTwo> {};
+          }
+          EOF
+          build/Bin/thunkgen /tmp/identical.cpp identity_guard_ok -guest-resident "$R/identical-guest.inl" / -- \
+            -std=c++20 -I"$GITHUB_WORKSPACE/ThunkLibs/include" \
+            > "$R/identical.out" 2> "$R/identical.err"
+          grep -E '^[[:space:]]*MAKE_CALLBACK_THUNK' "$R/identical-guest.inl" | sed -E 's/^[[:space:]]+//' \
+            | tee "$R/identical-normal-signatures.txt"
+          grep -E '^[[:space:]]*MAKE_CALLBACK_THUNK' "$R/identical-guest_bridge.inl" | sed -E 's/^[[:space:]]+//' \
+            | tee "$R/identical-resident-signatures.txt"
+          test "$(wc -l < "$R/identical-normal-signatures.txt" | tr -d ' ')" = 1
+          test "$(wc -l < "$R/identical-resident-signatures.txt" | tr -d ' ')" = 1
+          diff -u "$R/identical-normal-signatures.txt" "$R/identical-resident-signatures.txt" > "$R/identical-signature-set.diff"
+          echo IDENTICAL_ANNOTATIONS_STILL_DEDUPE | tee "$R/identical-result.txt"
+
+      - name: Build representative repository guest thunk set through guard
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1 \
+            || { tail -n 360 "$R/cmake-guest.log"; exit 1; }
+
+          targets=(
+            GL-guest GL_bridge-guest
+            Vulkan-guest Vulkan_bridge-guest
+            cuda-guest
+            wayland-client-guest
+            SDL2-guest
+            asound-guest
+            EGL-guest
+            drm-guest
+            xshmfence-guest
+          )
+          printf '%s\n' "${targets[@]}" | tee "$R/repository-targets.txt"
+          cmake --build guest --target "${targets[@]}" -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 900 "$R/build-guest.log"; exit 1; }
+          echo REPOSITORY_REPRESENTATIVE_THUNKS_HAVE_NO_ANNOTATION_COLLISION | tee "$R/repository-result.txt"
+
+      - name: Record result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sha256sum build/Bin/thunkgen | tee "$R/thunkgen-sha256.txt"
+          {
+            cat "$R/conflict-result.txt"
+            cat "$R/identical-result.txt"
+            cat "$R/repository-result.txt"
+            echo THUNKGEN_ANNOTATION_GUARD_VALIDATION_OK
+          } | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunkgen-annotation-guard-v1-${{ github.run_id }}
+          path: receipts-thunkgen-annotation-guard-v1
+          retention-days: 30
