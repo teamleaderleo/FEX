@@ -1,0 +1,98 @@
+name: Promote proven FEX-2608 lifetime candidate
+
+on:
+  push:
+    branches: [ci/fex2608-staged-lifetime-integration-20260814]
+    paths:
+      - .github/workflows/promote-fex2608-combined-lifetime-candidate.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      FEX_BASE: e869aa644a16e4332cdc15c1ea0b4d13d482385d
+      CANDIDATE_BRANCH: candidate/fex2608-combined-thunk-lifetime
+
+    steps:
+      - name: Checkout carrier with promotion helper
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout exact FEX-2608 product tree
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_BASE }}
+          path: product
+          fetch-depth: 1
+          submodules: false
+
+      - name: Checkout proven transform helpers
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-callback-transactional-retire-20260814
+          path: transaction-helper
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-callback-descriptor-20260814
+          path: split-helper
+          fetch-depth: 1
+
+      - name: Apply the exact transform stack that passed the combined gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PRODUCT="$GITHUB_WORKSPACE/product"
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py "$PRODUCT" all
+          python3 transaction-helper/.github/fieldwork/promote_multiowner_claims.py "$PRODUCT"
+          python3 transaction-helper/.github/fieldwork/fix_retirement_lock_order.py "$PRODUCT"
+          python3 transaction-helper/.github/fieldwork/add_revoked_h_state.py "$PRODUCT"
+          python3 transaction-helper/.github/fieldwork/add_callback_descriptor.py "$PRODUCT"
+          python3 transaction-helper/.github/fieldwork/add_callback_descriptor_drain.py "$PRODUCT"
+          python3 transaction-helper/.github/fieldwork/add_callback_retirement_transaction.py "$PRODUCT"
+          python3 transaction-helper/.github/fieldwork/refine_callback_transaction_wait.py "$PRODUCT"
+          python3 .github/fieldwork/apply_fex2608_vulkan_debug_report_routing.py "$PRODUCT"
+          python3 split-helper/.github/fieldwork/apply_vulkan_split_bridge.py "$PRODUCT"
+
+          git -C "$PRODUCT" diff --check
+          git -C "$PRODUCT" status --short
+          test -f "$PRODUCT/ThunkLibs/libvulkan/GuestBridge.cpp"
+          grep -q 'vkCreateDebugReportCallbackEXT.*sv' "$PRODUCT/ThunkLibs/libvulkan/Host.cpp"
+          grep -q 'vkDestroyDebugReportCallbackEXT.*sv' "$PRODUCT/ThunkLibs/libvulkan/Host.cpp"
+          grep -q 'NODELETE' "$PRODUCT/ThunkLibs/GuestLibs/CMakeLists.txt"
+
+      - name: Commit product source on fork-local candidate branch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PRODUCT="$GITHUB_WORKSPACE/product"
+          git -C "$PRODUCT" checkout -B "$CANDIDATE_BRANCH" "$FEX_BASE"
+          git -C "$PRODUCT" add \
+            FEXCore \
+            Source/Tools/LinuxEmulation \
+            ThunkLibs/libvulkan \
+            ThunkLibs/GuestLibs/CMakeLists.txt
+          git -C "$PRODUCT" diff --cached --check
+          test -n "$(git -C "$PRODUCT" status --short)"
+          git -C "$PRODUCT" config user.name 'Leo'
+          git -C "$PRODUCT" config user.email 'cheerleaderleo@outlook.com'
+          git -C "$PRODUCT" commit -m 'thunks: preserve escaped bridge and callback lifetimes'
+          git -C "$PRODUCT" push origin "HEAD:refs/heads/$CANDIDATE_BRANCH"
+          git -C "$PRODUCT" rev-parse HEAD
