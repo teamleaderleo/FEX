@@ -1,0 +1,21 @@
+name: amd64 container exec smoke on ARM64
+
+on:
+  push:
+    branches: [ci/vulkan-pfn-lifetime-candidate-20260814]
+    paths:
+      - .github/workflows/amd64-container-exec-smoke.yml
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Execute amd64 container
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04
+          docker run --rm --platform=linux/amd64 ubuntu:24.04 /bin/sh -c 'uname -m; dpkg --print-architecture; echo AMD64_CONTAINER_OK'
