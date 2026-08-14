@@ -95,10 +95,10 @@ jobs:
           ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
           grep -q 'NEEDED.*libfex-GL-bridge.so' "$R/wrapper.dynamic"
           grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
-          grep -c '^MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libGL.inl | tee "$R/guest-callback-count.txt"
-          grep -c '^MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libGL_bridge.inl | tee "$R/bridge-callback-count.txt"
-          diff -u <(grep '^MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libGL.inl) \
-                  <(grep '^MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libGL_bridge.inl) \
+          grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libGL.inl | tee "$R/guest-callback-count.txt"
+          grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libGL_bridge.inl | tee "$R/bridge-callback-count.txt"
+          diff -u <(grep -E '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libGL.inl | sed -E 's/^[[:space:]]+//') \
+                  <(grep -E '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libGL_bridge.inl | sed -E 's/^[[:space:]]+//') \
                   > "$R/callback-set.diff"
           stat -c 'bridge_file_bytes=%s' guest/libfex-GL-bridge.so | tee "$R/bridge-size.txt"
 
