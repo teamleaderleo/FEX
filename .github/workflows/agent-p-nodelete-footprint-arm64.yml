@@ -1,0 +1,98 @@
+name: Agent P NODELETE guest thunk footprint
+
+on:
+  push:
+    branches: [ci/agent-p-nodelete-footprint-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  footprint:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      R: ${{ github.workspace }}/receipts
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev libssl-dev pkg-config libcap-dev binutils \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libwayland-dev \
+            libdrm-dev libasound2-dev libgl-dev libegl-dev
+
+      - name: Build generator and all shared 64-bit guest thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/main-cmake.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" -v > "$R/thunkgen-build.log" 2>&1
+          THUNKGEN="$(find build -type f -name thunkgen -perm -111 | head -n1)"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_CLANG_THUNKS=OFF \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$THUNKGEN" -DX86_DEV_ROOTFS=/ > "$R/guest-cmake.log" 2>&1
+          cmake --build guest-build --target \
+            asound-guest vulkan-guest drm-guest wayland-client-guest VDSO-guest GL-guest EGL-guest cuda-guest \
+            -- -j"$(nproc)" -v > "$R/all64-build.log" 2>&1
+
+      - name: Measure mapped footprint
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' | tee "$R/footprint.tsv"
+          import os, pathlib, subprocess
+          names = ['asound','vulkan','drm','wayland-client','VDSO','GL','EGL','cuda']
+          rows=[]
+          for name in names:
+              matches=list(pathlib.Path('guest-build').rglob(f'lib{name}-guest.so'))
+              if not matches:
+                  raise SystemExit(f'missing {name}')
+              p=matches[0]
+              disk=p.stat().st_size
+              out=subprocess.check_output(['readelf','-lW',str(p)], text=True)
+              load_mem=[]
+              for line in out.splitlines():
+                  parts=line.split()
+                  if parts and parts[0]=='LOAD':
+                      load_mem.append(int(parts[5],16))
+              mapped=sum((x+4095)//4096*4096 for x in load_mem)
+              rows.append((name,disk,mapped,len(load_mem),str(p)))
+          print('name\tdisk_bytes\tload_mem_page_rounded_bytes\tload_segments\tpath')
+          for row in rows:
+              print('\t'.join(map(str,row)))
+          print(f'TOTAL\t{sum(r[1] for r in rows)}\t{sum(r[2] for r in rows)}\t-\t-')
+          PY
+          python3 - <<'PY' "$R/footprint.tsv" | tee "$R/footprint-summary.txt"
+          import csv,sys
+          rows=list(csv.DictReader(open(sys.argv[1]), delimiter='\t'))
+          data=[r for r in rows if r['name']!='TOTAL']
+          for r in data:
+              print(f"{r['name']:16s} disk={int(r['disk_bytes'])/1024:8.1f} KiB mapped≈{int(r['load_mem_page_rounded_bytes'])/1024:8.1f} KiB")
+          total=rows[-1]
+          print(f"ALL_SHARED_64 disk={int(total['disk_bytes'])/1024/1024:.2f} MiB mapped≈{int(total['load_mem_page_rounded_bytes'])/1024/1024:.2f} MiB")
+          PY
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-p-nodelete-footprint-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
