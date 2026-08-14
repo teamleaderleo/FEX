@@ -82,21 +82,22 @@ jobs:
             vk_struct = vk_struct->pNext;
           }'''
           s=s[:start]+new+s[end:]
-          call='''  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
-          *a_2 = to_guest(out);'''
-          replacement='''  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
+          needle='auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);'
+          call=s.index(needle,fn)
+          insert_at=call+len(needle)
+          restoration='''
+
           for (auto it = pnext_restore.rbegin(); it != pnext_restore.rend(); ++it) {
             it->Structure->pNext = it->PNext;
-          }
-          *a_2 = to_guest(out);'''
-          if call not in s:
-            raise SystemExit('vkCreateInstance native-call region not found')
-          p.write_text(s.replace(call,replacement,1))
+          }'''
+          s=s[:insert_at]+restoration+s[insert_at:]
+          p.write_text(s)
           PY
           git -C src diff --check
           git -C src diff -- ThunkLibs/libvulkan/Host.cpp | tee "$R/candidate.diff"
           grep -q 'DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT' "$R/candidate.diff"
           grep -q 'pnext_restore.rbegin' "$R/candidate.diff"
+          grep -q 'get_pointer() = to_guest' "$R/candidate.diff"
 
       - name: Build mixed-chain integrity probe
         shell: bash
