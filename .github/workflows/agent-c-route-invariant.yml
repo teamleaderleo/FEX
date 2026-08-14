@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: teamleaderleo/FEX
-          ref: test/vulkan-custom-route-invariant
+          ref: test/vulkan-custom-route-invariant-v2
           path: candidate
           fetch-depth: 1
 
@@ -42,7 +42,7 @@ jobs:
           grep -F 'vkDestroyDebugReportCallbackEXT' baseline-inventory.txt
           grep -F 'vkCreateDebugUtilsMessengerEXT' baseline-inventory.txt
 
-      - name: Clean candidate must satisfy both ABI inventories
+      - name: Rebased candidate must satisfy both ABI inventories
         shell: bash
         run: |
           set -euxo pipefail
@@ -60,13 +60,14 @@ jobs:
           {
             echo 'baseline=71afe476751deac24adabd1adb575fd2337b6e0a'
             echo "test_branch=$(git -C candidate rev-parse HEAD)"
+            echo 'candidate_parent=c011366706eaf65a00380003989b3a10811212b6'
             echo 'baseline_expected_exit=1'
             echo 'candidate_expected_exit=0'
           } | tee inventory-receipt.txt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: agent-c-route-invariant-${{ github.run_id }}
+          name: agent-c-route-invariant-v2-${{ github.run_id }}
           path: |
             baseline-inventory.txt
             candidate-inventory.txt
