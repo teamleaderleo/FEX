@@ -95,6 +95,16 @@ jobs:
             noble "$ROOTFS" http://archive.ubuntu.com/ubuntu \
             >"$R/debootstrap-first-stage.log" 2>&1
 
+          # Debootstrap/dpkg expect ordinary chroot pseudo-filesystems. The prior run
+          # failed specifically because /proc/self/fd did not exist in the guest rootfs.
+          sudo mkdir -p "$ROOTFS/proc" "$ROOTFS/dev" "$ROOTFS/sys"
+          sudo mount -t proc proc "$ROOTFS/proc"
+          sudo mount --rbind /dev "$ROOTFS/dev"
+          sudo mount --make-rslave "$ROOTFS/dev"
+          sudo mount --rbind /sys "$ROOTFS/sys"
+          sudo mount --make-rslave "$ROOTFS/sys"
+          mount | grep -E " on $ROOTFS/(proc|dev|sys) " | tee "$R/rootfs-mounts.txt"
+
           # Give the guest userspace working DNS, then finish its normal package setup by
           # executing the amd64 second stage under the exact FEX candidate itself.
           sudo cp --remove-destination /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
@@ -141,7 +151,7 @@ jobs:
           x86_64-linux-gnu-readelf -Ws "$X11" | grep -E ' XDisplayString(@|$)' | head -1
 
           {
-            echo 'rootfs_builder=debootstrap amd64 foreign + second-stage under FEX + apt under FEX'
+            echo 'rootfs_builder=debootstrap amd64 foreign + proc/dev/sys + second-stage under FEX + apt under FEX'
             echo 'guest_vulkaninfo=/usr/bin/vulkaninfo'
             sha256sum "$ROOTFS/usr/bin/vulkaninfo" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1" "$X11"
           } | tee "$R/rootfs-receipt.txt"
@@ -188,3 +198,13 @@ jobs:
           path: receipts
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Cleanup rootfs mounts
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          sudo umount -R "$ROOTFS/dev" 2>/dev/null
+          sudo umount -R "$ROOTFS/sys" 2>/dev/null
+          sudo umount "$ROOTFS/proc" 2>/dev/null
+          exit 0
