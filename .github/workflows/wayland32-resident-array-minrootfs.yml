@@ -1,0 +1,335 @@
+name: Wayland 32-bit resident array callback minrootfs
+
+on:
+  push:
+    branches: [diagnostic/wayland32-resident-array-compat-20260814]
+    paths:
+      - .github/workflows/wayland32-resident-array-minrootfs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wayland32-array-minrootfs:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      SOURCE_SHA: 1e8b042e7d50335cdbf2b1b6bfd0c888296dd73a
+      ROOTFS: ${{ github.workspace }}/rootfs-wayland32-min
+      R: ${{ github.workspace }}/wayland32-minrootfs-receipts
+      H: ${{ github.workspace }}/host-wayland32-min
+      NATIVE: ${{ github.workspace }}/native-wayland32-min
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and clean product provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H" "$NATIVE" "$ROOTFS"
+          git cat-file -e "$SOURCE_SHA^{commit}"
+          git diff --name-only "$SOURCE_SHA" -- ThunkLibs FEXCore Source | tee "$R/product-source-diff.txt"
+          test ! -s "$R/product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            gcc-multilib-x86-64-linux-gnu g++-multilib-x86-64-linux-gnu \
+            libcap-dev libwayland-dev libgl-dev binutils file
+
+      - name: Add runtime-only array unpacker getter
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/libwayland-client_bridge/Guest.cpp')
+          s = p.read_text()
+          marker = 'extern "C" uint64_t FEXWaylandAllocateResidentListener(void (*callback)(), const char* s) {'
+          diag = '''extern "C" uintptr_t FEXWaylandDiagArrayUnpacker() {\n  using cb = void(void*, wl_proxy*, wl_array*);\n  return reinterpret_cast<uintptr_t>(&CallbackUnpack<cb>::Unpack);\n}\n'''
+          assert s.count(marker) == 1
+          p.write_text(s.replace(marker, diag + marker, 1))
+          PY
+          git diff --check
+          git diff -- ThunkLibs/libwayland-client_bridge/Guest.cpp | tee "$R/runtime-only.diff"
+
+      - name: Build FEX and real 32-bit Wayland pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer wayland-client-host-32 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 420 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_32/libwayland-client-host.so "$H/libwayland-client-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest32 -G Ninja \
+            -DBITNESS=32 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_32.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest32.log" 2>&1
+          cmake --build guest32 --target wayland-client-guest wayland-client_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest32.log" 2>&1 || { tail -n 520 "$R/build-guest32.log"; exit 1; }
+
+          file guest32/libwayland-client-guest.so guest32/libfex-wayland-client-bridge.so | tee "$R/guest-files.txt"
+          readelf -h guest32/libwayland-client-guest.so | tee "$R/wrapper.elf"
+          readelf -h guest32/libfex-wayland-client-bridge.so | tee "$R/bridge.elf"
+          grep -q 'Class:.*ELF32' "$R/wrapper.elf"
+          grep -q 'Class:.*ELF32' "$R/bridge.elf"
+          readelf -d guest32/libwayland-client-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest32/libfex-wayland-client-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-wayland-client-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'RUNPATH.*\$ORIGIN' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          nm -D guest32/libfex-wayland-client-bridge.so | tee "$R/bridge.symbols"
+          grep -q 'FEXWaylandAllocateResidentListener' "$R/bridge.symbols"
+          grep -q 'FEXWaylandDiagArrayUnpacker' "$R/bridge.symbols"
+          echo WAYLAND32_MINROOTFS_BUILD_ELF_OK | tee "$R/build-gate.txt"
+
+      - name: Build arm64 fake native Wayland
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat >/tmp/fake_wayland.c <<'EOF'
+          #include <wayland-client.h>
+          #include <stdio.h>
+
+          static const struct wl_message diag_events[] = {{ "diag_array", "a", NULL }};
+          static const struct wl_interface diag_interface = {
+            .name = "fex_diag_array", .version = 1,
+            .method_count = 0, .methods = NULL,
+            .event_count = 1, .events = diag_events,
+          };
+          struct fake_proxy {
+            const struct wl_interface *interface;
+            void (**listener)(void);
+            void *data;
+          };
+          static struct fake_proxy proxy = { &diag_interface, NULL, NULL };
+
+          #define EMPTY_INTERFACE(sym) \
+            WL_EXPORT const struct wl_interface sym = { \
+              .name = #sym, .version = 1, .method_count = 0, .methods = NULL, .event_count = 0, .events = NULL \
+            }
+          EMPTY_INTERFACE(wl_output_interface);
+          EMPTY_INTERFACE(wl_shm_pool_interface);
+          EMPTY_INTERFACE(wl_pointer_interface);
+          EMPTY_INTERFACE(wl_compositor_interface);
+          EMPTY_INTERFACE(wl_shm_interface);
+          EMPTY_INTERFACE(wl_registry_interface);
+          EMPTY_INTERFACE(wl_buffer_interface);
+          EMPTY_INTERFACE(wl_seat_interface);
+          EMPTY_INTERFACE(wl_surface_interface);
+          EMPTY_INTERFACE(wl_keyboard_interface);
+          EMPTY_INTERFACE(wl_callback_interface);
+          EMPTY_INTERFACE(wl_display_interface);
+          EMPTY_INTERFACE(wl_data_offer_interface);
+          EMPTY_INTERFACE(wl_data_source_interface);
+          EMPTY_INTERFACE(wl_data_device_interface);
+          EMPTY_INTERFACE(wl_data_device_manager_interface);
+          EMPTY_INTERFACE(wl_shell_interface);
+          EMPTY_INTERFACE(wl_shell_surface_interface);
+          EMPTY_INTERFACE(wl_touch_interface);
+          EMPTY_INTERFACE(wl_region_interface);
+          EMPTY_INTERFACE(wl_subcompositor_interface);
+          EMPTY_INTERFACE(wl_subsurface_interface);
+          #undef EMPTY_INTERFACE
+
+          WL_EXPORT struct wl_display *wl_display_connect(const char *name) {
+            fprintf(stderr, "HOST_WL_CONNECT name=%s proxy=%p interface=%p\n", name ? name : "(null)", (void*)&proxy, (void*)proxy.interface);
+            return (struct wl_display*)&proxy;
+          }
+          WL_EXPORT const void *wl_proxy_get_listener(struct wl_proxy *p) {
+            struct fake_proxy *fp = (struct fake_proxy*)p;
+            return fp->listener;
+          }
+          WL_EXPORT int wl_proxy_add_listener(struct wl_proxy *p, void (**implementation)(void), void *data) {
+            struct fake_proxy *fp = (struct fake_proxy*)p;
+            fp->listener = implementation;
+            fp->data = data;
+            fprintf(stderr, "HOST_WL_SAVE listener_table=%p callback0=%p data=%p\n",
+                    (void*)implementation, implementation ? (void*)implementation[0] : NULL, data);
+            return implementation && implementation[0] ? 0 : -1;
+          }
+          WL_EXPORT int wl_display_roundtrip(struct wl_display *display) {
+            struct fake_proxy *fp = (struct fake_proxy*)display;
+            struct wl_array array = { .size = 7, .alloc = 9, .data = NULL };
+            typedef void (*array_listener_t)(void *, struct wl_proxy *, struct wl_array *);
+            array_listener_t cb = fp->listener ? (array_listener_t)fp->listener[0] : NULL;
+            fprintf(stderr, "HOST_WL_TRIGGER callback=%p data=%p array=%p size=%zu alloc=%zu payload=%p\n",
+                    (void*)cb, fp->data, (void*)&array, array.size, array.alloc, array.data);
+            if (!cb) return -2;
+            cb(fp->data, (struct wl_proxy*)display, &array);
+            return 17;
+          }
+          EOF
+          cc -shared -fPIC -O2 -Wall -Wextra -Werror /tmp/fake_wayland.c \
+            -Wl,-soname,libwayland-client.so.0 -o "$NATIVE/libwayland-client.so.0"
+          file "$NATIVE/libwayland-client.so.0" | tee "$R/native.file"
+
+      - name: Assemble minimal i386 rootfs and guest probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$ROOTFS/lib/i386-linux-gnu" "$ROOTFS/usr/lib/i386-linux-gnu" "$ROOTFS/opt/fex-ci"
+
+          loader="$(x86_64-linux-gnu-gcc -m32 -print-file-name=ld-linux.so.2)"
+          if [ "$loader" = ld-linux.so.2 ] || [ ! -e "$loader" ]; then
+            loader="$(find /usr/x86_64-linux-gnu /usr/lib/gcc-cross/x86_64-linux-gnu -name ld-linux.so.2 -print -quit 2>/dev/null || true)"
+          fi
+          libc="$(x86_64-linux-gnu-gcc -m32 -print-file-name=libc.so.6)"
+          libm="$(x86_64-linux-gnu-gcc -m32 -print-file-name=libm.so.6)"
+          libstdcpp="$(x86_64-linux-gnu-g++ -m32 -print-file-name=libstdc++.so.6)"
+          libgcc="$(x86_64-linux-gnu-gcc -m32 -print-file-name=libgcc_s.so.1)"
+          for f in "$loader" "$libc" "$libm" "$libstdcpp" "$libgcc"; do test -e "$f"; done
+          {
+            echo "loader=$loader"
+            echo "libc=$libc"
+            echo "libm=$libm"
+            echo "libstdcpp=$libstdcpp"
+            echo "libgcc=$libgcc"
+          } | tee "$R/rootfs-libs.txt"
+
+          cp -L "$loader" "$ROOTFS/lib/ld-linux.so.2"
+          cp -L "$loader" "$ROOTFS/lib/i386-linux-gnu/ld-linux.so.2"
+          cp -L "$libc" "$ROOTFS/lib/i386-linux-gnu/libc.so.6"
+          cp -L "$libm" "$ROOTFS/lib/i386-linux-gnu/libm.so.6"
+          cp -L "$libstdcpp" "$ROOTFS/usr/lib/i386-linux-gnu/libstdc++.so.6"
+          cp -L "$libgcc" "$ROOTFS/usr/lib/i386-linux-gnu/libgcc_s.so.1"
+          cp guest32/libwayland-client-guest.so "$ROOTFS/usr/lib/i386-linux-gnu/libwayland-client.so.0"
+          cp guest32/libfex-wayland-client-bridge.so "$ROOTFS/usr/lib/i386-linux-gnu/libfex-wayland-client-bridge.so"
+
+          cat >/tmp/wayland_array32.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <wayland-client.h>
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+
+          typedef struct wl_display *(*connect_t)(const char *);
+          typedef int (*add_listener_t)(struct wl_proxy *, void (**)(void), void *);
+          typedef int (*roundtrip_t)(struct wl_display *);
+          typedef uintptr_t (*getaddr_t)(void);
+          static volatile unsigned callbacks;
+          static volatile unsigned callback_bad;
+
+          static int map_has(void *p, const char *needle) {
+            FILE *f = fopen("/proc/self/maps", "r");
+            char line[1024];
+            uintptr_t x = (uintptr_t)p;
+            if (!f) return -1;
+            while (fgets(line, sizeof(line), f)) {
+              unsigned long a, b;
+              if (sscanf(line, "%lx-%lx", &a, &b) == 2 && x >= a && x < b) {
+                int ok = strstr(line, needle) != NULL;
+                fprintf(stderr, "MAP %p %s", p, line);
+                fclose(f);
+                return ok;
+              }
+            }
+            fclose(f);
+            fprintf(stderr, "UNMAPPED %p\n", p);
+            return 0;
+          }
+          __attribute__((used,noinline))
+          static void array_cb(void *data, struct wl_proxy *proxy, struct wl_array *array) {
+            ++callbacks;
+            if (!array || array->size != 7 || array->alloc != 9 || array->data != NULL ||
+                (uintptr_t)data != UINT32_C(0x12345678)) callback_bad = 1;
+            fprintf(stderr,
+                    "WAYLAND_ARRAY32_CALLBACK count=%u data=%p proxy=%p array=%p size=%zu alloc=%zu payload=%p bad=%u\n",
+                    callbacks, data, (void*)proxy, (void*)array,
+                    array ? array->size : 0, array ? array->alloc : 0,
+                    array ? array->data : NULL, callback_bad);
+          }
+          static void *req(void *h, const char *name) {
+            void *p = dlsym(h, name);
+            if (!p) fprintf(stderr, "DLSYM_FAIL %s %s\n", name, dlerror());
+            return p;
+          }
+          int main(void) {
+            fprintf(stderr, "WAYLAND_ARRAY32_LAYOUT sizeof_size_t=%zu sizeof_ptr=%zu sizeof_wl_array=%zu\n",
+                    sizeof(size_t), sizeof(void*), sizeof(struct wl_array));
+            if (sizeof(size_t) != 4 || sizeof(void*) != 4 || sizeof(struct wl_array) != 12) return 2;
+            void *h = dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_LOCAL);
+            if (!h) { fprintf(stderr, "WAYLAND_OPEN_FAIL %s\n", dlerror()); return 3; }
+            connect_t connect_fn = (connect_t)req(h, "wl_display_connect");
+            add_listener_t add_fn = (add_listener_t)req(h, "wl_proxy_add_listener");
+            roundtrip_t roundtrip_fn = (roundtrip_t)req(h, "wl_display_roundtrip");
+            if (!connect_fn || !add_fn || !roundtrip_fn) return 4;
+            void *bh = dlopen("libfex-wayland-client-bridge.so", RTLD_NOW | RTLD_NOLOAD);
+            if (!bh) { fprintf(stderr, "BRIDGE_NOLOAD_FAIL %s\n", dlerror()); return 5; }
+            getaddr_t get_unpack = (getaddr_t)req(bh, "FEXWaylandDiagArrayUnpacker");
+            if (!get_unpack) return 6;
+            void *array_unpacker = (void*)get_unpack();
+            fprintf(stderr, "WAYLAND_ARRAY32_UNPACKER address=%p\n", array_unpacker);
+            if (map_has(array_unpacker, "/libfex-wayland-client-bridge.so") != 1) return 7;
+            struct wl_display *display = connect_fn(NULL);
+            if (!display) return 8;
+            void (*listeners[1])(void) = { (void (*)(void))array_cb };
+            int add_rc = add_fn((struct wl_proxy*)display, listeners, (void*)(uintptr_t)UINT32_C(0x12345678));
+            fprintf(stderr, "WAYLAND_ARRAY32_ADD rc=%d callbacks=%u\n", add_rc, callbacks);
+            if (add_rc != 0 || callbacks != 0) return 9;
+            int roundtrip_rc = roundtrip_fn(display);
+            fprintf(stderr, "WAYLAND_ARRAY32_ROUNDTRIP rc=%d callbacks=%u bad=%u\n",
+                    roundtrip_rc, callbacks, callback_bad);
+            if (roundtrip_rc != 17 || callbacks != 1 || callback_bad) return 10;
+            if (map_has(array_unpacker, "/libfex-wayland-client-bridge.so") != 1) return 11;
+            fprintf(stderr, "WAYLAND32_RESIDENT_ARRAY_COMPAT_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -m32 -O2 -Wall -Wextra -Werror /tmp/wayland_array32.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/wayland-array32"
+          file "$ROOTFS/opt/fex-ci/wayland-array32" "$ROOTFS/lib/ld-linux.so.2" \
+            "$ROOTFS/lib/i386-linux-gnu/libc.so.6" | tee "$R/rootfs-files.txt"
+          readelf -l "$ROOTFS/opt/fex-ci/wayland-array32" | tee "$R/probe.program-headers"
+          readelf -d "$ROOTFS/opt/fex-ci/wayland-array32" | tee "$R/probe.dynamic"
+          grep -q 'ELF 32-bit' "$R/rootfs-files.txt"
+          grep -q '/lib/ld-linux.so.2' "$R/probe.program-headers"
+
+      - name: Execute 32-bit array callback path
+        shell: bash
+        run: |
+          set -euxo pipefail
+          set +e
+          LD_LIBRARY_PATH="$NATIVE${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 40s \
+            build/Bin/FEX /opt/fex-ci/wayland-array32 > "$R/probe.out" 2> "$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          test "$rc" -eq 0
+          grep -q 'WAYLAND_ARRAY32_LAYOUT sizeof_size_t=4 sizeof_ptr=4 sizeof_wl_array=12' "$R/probe.err"
+          grep -q 'WAYLAND_ARRAY32_UNPACKER address=' "$R/probe.err"
+          grep -q '/libfex-wayland-client-bridge.so' "$R/probe.err"
+          grep -q 'HOST_WL_SAVE listener_table=' "$R/probe.err"
+          grep -q 'HOST_WL_TRIGGER callback=' "$R/probe.err"
+          grep -q 'WAYLAND_ARRAY32_CALLBACK count=1 data=0x12345678' "$R/probe.err"
+          grep -q 'size=7 alloc=9 payload=(nil) bad=0' "$R/probe.err"
+          grep -q 'WAYLAND_ARRAY32_ROUNDTRIP rc=17 callbacks=1 bad=0' "$R/probe.err"
+          grep -q 'WAYLAND32_RESIDENT_ARRAY_COMPAT_OK' "$R/probe.err"
+          echo WAYLAND32_MINROOTFS_RUNTIME_OK | tee "$R/runtime-gate.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayland32-minrootfs-${{ github.run_id }}
+          path: wayland32-minrootfs-receipts
+          retention-days: 30
