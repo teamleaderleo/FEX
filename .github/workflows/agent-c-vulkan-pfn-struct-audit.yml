@@ -1,0 +1,135 @@
+name: Agent C Vulkan extensible function-pointer audit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-vulkan-pfn-struct-audit.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Inventory PFN members in extensible Vulkan structs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p receipts
+          python3 - <<'PY'
+          from __future__ import annotations
+          import collections, json, pathlib, re
+          import xml.etree.ElementTree as ET
+
+          root = pathlib.Path('src')
+          xml_root = ET.parse(root/'External/Vulkan-Headers/registry/vk.xml').getroot()
+          interface = (root/'ThunkLibs/libvulkan/libvulkan_interface.cpp').read_text()
+          host = (root/'ThunkLibs/libvulkan/Host.cpp').read_text()
+
+          aliases={}
+          nodes={}
+          for t in xml_root.findall('./types/type'):
+            if t.get('category') != 'struct': continue
+            name=t.get('name')
+            if not name:
+              n=t.find('name'); name=n.text if n is not None else None
+            if not name: continue
+            nodes[name]=t
+            if t.get('alias'): aliases[name]=t.get('alias')
+
+          def canon(name):
+            seen=set()
+            while name in aliases and name not in seen:
+              seen.add(name); name=aliases[name]
+            return name
+
+          providers=collections.defaultdict(set)
+          for feature in xml_root.findall('./feature'):
+            label='CORE_'+(feature.get('number') or feature.get('name') or '?')
+            for req in feature.findall('./require'):
+              for ty in req.findall('type'):
+                n=ty.get('name')
+                if n: providers[canon(n)].add(label)
+          for ext in xml_root.findall('./extensions/extension'):
+            label=ext.get('name') or 'UNKNOWN_EXTENSION'
+            for req in ext.findall('./require'):
+              for ty in req.findall('type'):
+                n=ty.get('name')
+                if n: providers[canon(n)].add(label)
+
+          rows=[]
+          for raw_name,t in nodes.items():
+            name=canon(raw_name)
+            if raw_name != name: continue
+            extends=tuple(x.strip() for x in t.get('structextends','').split(',') if x.strip())
+            if not extends: continue
+            for member in t.findall('member'):
+              type_node=member.find('type'); name_node=member.find('name')
+              if type_node is None or name_node is None: continue
+              mtype=(type_node.text or '').strip()
+              mname=(name_node.text or '').strip()
+              if not mtype.startswith('PFN_'): continue
+              annotation_pattern=re.compile(rf'^\s*struct\s+fex_gen_config<&{re.escape(name)}::{re.escape(mname)}>\b')
+              annotated=any(annotation_pattern.match(line) for line in interface.splitlines() if not line.lstrip().startswith('//'))
+              rows.append({
+                'struct':name,
+                'member':mname,
+                'pfn_type':mtype,
+                'extends':list(extends),
+                'providers':sorted(providers.get(name,[])),
+                'member_annotation':annotated,
+                'host_name_occurrences':host.count(name),
+                'interface_name_occurrences':interface.count(name),
+              })
+
+          def rank(row):
+            ps=row['providers']
+            if any(p.startswith('CORE_') for p in ps): p=0
+            elif any(p.startswith('VK_KHR_') for p in ps): p=1
+            elif any(p.startswith('VK_EXT_') for p in ps): p=2
+            else: p=3
+            return (p, row['member_annotation'], row['host_name_occurrences']==0, row['struct'], row['member'])
+          rows.sort(key=rank)
+
+          summary={
+            'extensible_struct_pfn_members':len(rows),
+            'member_annotations':sum(r['member_annotation'] for r in rows),
+            'without_member_annotation':sum(not r['member_annotation'] for r in rows),
+            'host_name_never_mentioned':sum(r['host_name_occurrences']==0 for r in rows),
+          }
+          pathlib.Path('receipts/audit.json').write_text(json.dumps({'summary':summary,'rows':rows},indent=2)+'\n')
+          with pathlib.Path('receipts/audit.tsv').open('w') as f:
+            f.write('struct\tmember\tpfn_type\textends\tproviders\tmember_annotation\thost_mentions\n')
+            for r in rows:
+              f.write('\t'.join([r['struct'],r['member'],r['pfn_type'],','.join(r['extends']),','.join(r['providers']),str(int(r['member_annotation'])),str(r['host_name_occurrences'])])+'\n')
+          lines=['# Vulkan function pointers in extensible structs','',f'Exact FEX: `{__import__("os").environ["FEX_SHA"]}`','', '## Counts','']
+          lines += [f'- `{k}`: **{v}**' for k,v in summary.items()]
+          lines += ['', '## Inventory','']
+          for r in rows:
+            lines.append(f"- `{r['struct']}::{r['member']}` (`{r['pfn_type']}`) — extends {', '.join(r['extends'])}; providers={','.join(r['providers'])}; member_annotation={int(r['member_annotation'])}; Host mentions struct {r['host_name_occurrences']} time(s)")
+          pathlib.Path('receipts/summary.md').write_text('\n'.join(lines)+'\n')
+          print(json.dumps(summary,indent=2))
+          for r in rows:
+            print(r['struct'],r['member'],r['pfn_type'],','.join(r['extends']),','.join(r['providers']),int(r['member_annotation']),r['host_name_occurrences'],sep='\t')
+          PY
+          cat receipts/summary.md
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-c-vulkan-pfn-struct-audit-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
