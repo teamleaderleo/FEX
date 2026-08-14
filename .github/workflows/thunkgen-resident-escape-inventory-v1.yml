@@ -1,0 +1,153 @@
+name: Resident escape inventory Wayland CUDA v1
+
+on:
+  push:
+    branches: [diagnostic/thunkgen-resident-output-clean-v1]
+    paths:
+      - .github/workflows/thunkgen-resident-escape-inventory-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  escape-inventory:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    env:
+      R: ${{ github.workspace }}/receipts-resident-escape-inventory-v1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libwayland-dev libasound2-dev
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+
+      - name: Verify committed resident generator and escape anchors
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check
+          grep -q -- '-guest-resident' ThunkLibs/Generator/main.cpp
+          grep -q 'host_to_guest_callback_funcptrs' ThunkLibs/Generator/analysis.cpp
+          grep -q 'used_as_callback' ThunkLibs/Generator/gen.cpp
+          ! grep -q 'FEXResidentBridgeCanUnpack' ThunkLibs/Generator/gen.cpp
+          test ! -e ThunkLibs/Generator/extract_guest_bridge.py
+          grep -q 'AllocateHostTrampolineForGuestFunction' ThunkLibs/libwayland-client/Guest.cpp
+          grep -q 'custom_host_impl, fexgen::custom_guest_entrypoint' ThunkLibs/libwayland-client/libwayland-client_interface.cpp
+          grep -q 'GetCallerForHostFunction(name)' ThunkLibs/libcuda/libcuda_Guest.cpp
+          grep -q 'LinkAddressToFunction' ThunkLibs/libcuda/libcuda_Guest.cpp
+
+      - name: Build thunkgen
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1 \
+            || { tail -n 240 "$R/cmake-host.log"; exit 1; }
+          cmake --build build --target FEX GL-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 420 "$R/build-host.log"; exit 1; }
+          test -x build/Bin/thunkgen
+
+      - name: Request resident output for Wayland and CUDA without wiring companions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s = p.read_text()
+          replacements = {
+              'generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp)':
+              'generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp RESIDENT_BRIDGE)',
+              'generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp)':
+              'generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp RESIDENT_BRIDGE)',
+          }
+          for old, new in replacements.items():
+              if s.count(old) != 1:
+                  raise SystemExit(f'expected one anchor: {old}')
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff -- ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/temporary-resident-enable.diff"
+
+      - name: Generate and compile normal wrappers
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1 \
+            || { tail -n 280 "$R/cmake-guest.log"; exit 1; }
+          cmake --build guest --target wayland-client-guest cuda-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 560 "$R/build-guest.log"; exit 1; }
+
+      - name: Record resident signature direction sets
+        shell: bash
+        run: |
+          set -euxo pipefail
+          for lib in libwayland-client libcuda; do
+            normal="guest/gen/thunkgen_guest_${lib}.inl"
+            bridge="guest/gen/thunkgen_guest_${lib}_bridge.inl"
+            accessors="guest/gen/thunkgen_guest_${lib}_bridge_accessors.inl"
+            test -f "$normal"
+            test -f "$bridge"
+            test -f "$accessors"
+
+            awk '/^[[:space:]]*MAKE_CALLBACK_THUNK/{sub(/^[[:space:]]*/, ""); print}' "$normal" > "$R/${lib}-normal-signatures.txt"
+            awk '/^[[:space:]]*MAKE_CALLBACK_THUNK/{sub(/^[[:space:]]*/, ""); print}' "$bridge" > "$R/${lib}-resident-signatures.txt"
+            diff -u "$R/${lib}-normal-signatures.txt" "$R/${lib}-resident-signatures.txt" > "$R/${lib}-signature-set.diff"
+            wc -l < "$R/${lib}-normal-signatures.txt" | tr -d ' ' | tee "$R/${lib}-signature-count.txt"
+
+            awk '/^extern "C" uintptr_t fex_bridge_.*_unpacker_/{n++} END{print n+0}' "$bridge" \
+              | tee "$R/${lib}-resident-unpacker-count.txt"
+            awk '/^template<> struct FEXResidentBridgeUnpacker</{n++} END{print n+0}' "$accessors" \
+              | tee "$R/${lib}-accessor-unpacker-count.txt"
+            awk '/^template<> struct FEXResidentBridgeInvoker</{n++} END{print n+0}' "$accessors" \
+              | tee "$R/${lib}-accessor-invoker-count.txt"
+
+            test "$(cat "$R/${lib}-resident-unpacker-count.txt")" = "$(cat "$R/${lib}-accessor-unpacker-count.txt")"
+            test "$(cat "$R/${lib}-signature-count.txt")" = "$(cat "$R/${lib}-accessor-invoker-count.txt")"
+            ! grep -q 'FEXResidentBridgeCanUnpack' "$bridge"
+            ! grep -q 'FEXResidentBridgeCanUnpack' "$accessors"
+            sha256sum "$normal" "$bridge" "$accessors" | tee "$R/${lib}-generated-sha256.txt"
+          done
+
+          {
+            echo "wayland_signatures=$(cat "$R/libwayland-client-signature-count.txt")"
+            echo "wayland_unpackers=$(cat "$R/libwayland-client-resident-unpacker-count.txt")"
+            echo "cuda_signatures=$(cat "$R/libcuda-signature-count.txt")"
+            echo "cuda_unpackers=$(cat "$R/libcuda-resident-unpacker-count.txt")"
+            echo RESIDENT_ESCAPE_INVENTORY_OK
+          } | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resident-escape-inventory-v1-${{ github.run_id }}
+          path: receipts-resident-escape-inventory-v1
+          retention-days: 30
