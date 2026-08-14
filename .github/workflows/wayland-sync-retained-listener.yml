@@ -1,0 +1,181 @@
+name: Wayland synchronous retained listener lifetime
+
+on:
+  push:
+    branches: [diagnostic/wayland-resident-listener-20260814]
+    paths:
+      - LinuxFieldwork/apply_wayland_sync_retained_test_hook.py
+      - LinuxFieldwork/apply_wayland_resident_u_listener.py
+      - .github/workflows/wayland-sync-retained-listener.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  listener:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [local, resident]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      MODE: ${{ matrix.mode }}
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      R: ${{ github.workspace }}/sync-${{ matrix.mode }}
+      H: ${{ github.workspace }}/host-wayland-${{ matrix.mode }}
+      ROOTFS: ${{ github.workspace }}/rootfs-wayland-${{ matrix.mode }}
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config python3 \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev libwayland-dev binutils
+
+      - name: Apply synchronous retained-listener hook
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_wayland_sync_retained_test_hook.py
+          if [ "$MODE" = resident ]; then
+            python3 LinuxFieldwork/apply_wayland_resident_u_listener.py
+          fi
+          git diff --check
+          git diff -- ThunkLibs/libwayland-client ThunkLibs/libwayland-client_bridge ThunkLibs/GuestLibs/CMakeLists.txt \
+            | tee "$R/product.diff"
+
+      - name: Build FEX host and selected Wayland guest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer wayland-client-host-64 -- -j"$(nproc)" \
+            > "$R/build-host.log" 2>&1 || { tail -n 300 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libwayland-client-host.so "$H/libwayland-client-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          if [ "$MODE" = resident ]; then
+            cmake --build guest --target wayland-client-guest wayland-client_bridge-guest -- -j"$(nproc)" \
+              > "$R/build-guest.log" 2>&1 || { tail -n 300 "$R/build-guest.log"; exit 1; }
+            readelf -d guest/libwayland-client-guest.so > "$R/wrapper.dynamic"
+            readelf -d guest/libfex-wayland-client-bridge.so > "$R/bridge.dynamic"
+            ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+            grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          else
+            cmake --build guest --target wayland-client-guest -- -j"$(nproc)" \
+              > "$R/build-guest.log" 2>&1 || { tail -n 300 "$R/build-guest.log"; exit 1; }
+          fi
+
+      - name: Prepare rootfs and moved-reload probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libwayland-client-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libwayland-client.so.0.20.0"
+          if [ "$MODE" = resident ]; then
+            cp guest/libfex-wayland-client-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-wayland-client-bridge.so"
+          fi
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/mman.h>
+          typedef void (*raw_cb)(void);
+          typedef int (*add_fn)(void*,raw_cb*,void*);
+          typedef void (*trigger_fn)(uint32_t);
+          struct msg { const char *name; const char *signature; const void **types; };
+          struct iface { const char *name; int version; int method_count; const struct msg *methods; int event_count; const struct msg *events; };
+          struct proxy { const struct iface *interface; };
+          struct range { uintptr_t lo, hi; };
+          static volatile unsigned count;
+          static volatile uint32_t last;
+          static void listener(void*d,void*p,uint32_t v){(void)p;++count;last=v;fprintf(stderr,"WAYLAND_GUEST_CALLBACK count=%u value=%u data=%p\n",count,v,d);fflush(stderr);}
+          static int line_for(uintptr_t x,char*path,size_t n){FILE*f=fopen("/proc/self/maps","r");char l[4096];if(!f)return-1;while(fgets(l,sizeof l,f)){unsigned long long lo,hi,off,inode;char perms[8],dev[32],mapped[2048]={0};int k=sscanf(l,"%llx-%llx %7s %llx %31s %llu %2047[^\n]",&lo,&hi,perms,&off,dev,&inode,mapped);if(k>=6&&x>=lo&&x<hi){if(k==7){char*q=mapped;while(*q==' '||*q=='\t')++q;snprintf(path,n,"%s",q);}else path[0]=0;fclose(f);return 0;}}fclose(f);return-1;}
+          static int collect(const char*path,struct range*out,int cap){FILE*f=fopen("/proc/self/maps","r");char l[4096];int c=0;if(!f)return-1;while(fgets(l,sizeof l,f)){unsigned long long lo,hi,off,inode;char perms[8],dev[32],mapped[2048]={0};int k=sscanf(l,"%llx-%llx %7s %llx %31s %llu %2047[^\n]",&lo,&hi,perms,&off,dev,&inode,mapped);if(k!=7)continue;char*q=mapped;while(*q==' '||*q=='\t')++q;if(strcmp(q,path))continue;if(c>=cap){fclose(f);return-2;}out[c++]=(struct range){lo,hi};}fclose(f);return c;}
+          static int mapped(uintptr_t x){char p[2048];return line_for(x,p,sizeof p)==0;}
+          static int reserve(struct range*r,int n){for(int i=0;i<n;++i){size_t z=r[i].hi-r[i].lo;void*p=mmap((void*)r[i].lo,z,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);if(p==MAP_FAILED){fprintf(stderr,"RESERVE_FAIL %p-%p errno=%d\n",(void*)r[i].lo,(void*)r[i].hi,errno);return-1;}fprintf(stderr,"RESERVED %p-%p\n",(void*)r[i].lo,(void*)r[i].hi);}return 0;}
+          int main(void){
+            static const struct msg event={"tick","u",0}; static const struct iface iface={"fex_test",1,0,0,1,&event}; struct proxy proxy={&iface}; raw_cb table[1]={(raw_cb)listener};
+            void*h1=dlopen("libwayland-client.so.0.20.0",RTLD_NOW|RTLD_LOCAL);if(!h1){fprintf(stderr,"DLOPEN1 %s\n",dlerror());return 2;}
+            add_fn add1=(add_fn)dlsym(h1,"wl_proxy_add_listener"); trigger_fn trig1=(trigger_fn)dlsym(h1,"fex_wayland_test_trigger");if(!add1||!trig1)return 3;
+            char path[2048];if(line_for((uintptr_t)add1,path,sizeof path))return 4;struct range ranges[32];int nr=collect(path,ranges,32);if(nr<=0)return 5;
+            fprintf(stderr,"WAYLAND_GEN1 wrapper=%s add=%p trigger=%p ranges=%d\n",path,(void*)add1,(void*)trig1,nr);
+            if(add1(&proxy,table,(void*)(uintptr_t)0x12345678))return 6;
+            fprintf(stderr,"WAYLAND_TRIGGER1_ENTER\n");trig1(41);fprintf(stderr,"WAYLAND_TRIGGER1_RETURN count=%u value=%u\n",count,last);if(count!=1||last!=41)return 7;
+            uintptr_t old_add=(uintptr_t)add1;if(dlclose(h1))return 8;fprintf(stderr,"WAYLAND_CLOSE1 add_mapped=%d\n",mapped(old_add));if(mapped(old_add))return 9;if(reserve(ranges,nr))return 10;
+            void*h2=dlopen("libwayland-client.so.0.20.0",RTLD_NOW|RTLD_LOCAL);if(!h2){fprintf(stderr,"DLOPEN2 %s\n",dlerror());return 11;} add_fn add2=(add_fn)dlsym(h2,"wl_proxy_add_listener");trigger_fn trig2=(trigger_fn)dlsym(h2,"fex_wayland_test_trigger");if(!add2||!trig2)return 12;
+            fprintf(stderr,"WAYLAND_GEN2 add=%p trigger=%p moved=%d\n",(void*)add2,(void*)trig2,add2!=add1);if(add2==add1)return 13;
+            fprintf(stderr,"WAYLAND_TRIGGER2_ENTER retained-registration-only\n");trig2(42);fprintf(stderr,"WAYLAND_TRIGGER2_RETURN count=%u value=%u\n",count,last);if(count!=2||last!=42)return 14;
+            fprintf(stderr,"WAYLAND_SYNC_RETAINED_OK\n");return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/probe.c -ldl -o "$ROOTFS/opt/fex-ci/probe"
+
+      - name: Execute synchronous retained-listener arm
+        shell: bash
+        run: |
+          set -uxo pipefail
+          set +e
+          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 30s build/Bin/FEX /opt/fex-ci/probe > "$R/fex.out" 2> "$R/fex.err"
+          rc=$?
+          set -e
+          printf 'mode=%s\nfex=%s\n' "$MODE" "$rc" | tee "$R/matrix.txt"
+          cat "$R/fex.err"
+          grep -q 'WAYLAND_TRIGGER1_RETURN count=1 value=41' "$R/fex.err"
+          grep -q 'WAYLAND_CLOSE1 add_mapped=0' "$R/fex.err"
+          grep -q 'WAYLAND_GEN2 .* moved=1' "$R/fex.err"
+          grep -q 'WAYLAND_TRIGGER2_ENTER retained-registration-only' "$R/fex.err"
+          if [ "$MODE" = local ]; then
+            test "$rc" -eq 139
+            ! grep -q 'WAYLAND_TRIGGER2_RETURN' "$R/fex.err"
+          else
+            test "$rc" -eq 0
+            grep -q 'WAYLAND_TRIGGER2_RETURN count=2 value=42' "$R/fex.err"
+            grep -q 'WAYLAND_SYNC_RETAINED_OK' "$R/fex.err"
+          fi
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayland-sync-retained-${{ matrix.mode }}-${{ github.run_id }}
+          path: sync-${{ matrix.mode }}
+          retention-days: 30
