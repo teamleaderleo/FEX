@@ -85,8 +85,6 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Foreign debootstrap resolves/downloads the amd64 package closure and extracts
-          # the base runtime, without executing amd64 maintainer scripts on the ARM host.
           sudo debootstrap \
             --arch=amd64 \
             --foreign \
@@ -96,12 +94,22 @@ jobs:
             noble "$ROOTFS" http://archive.ubuntu.com/ubuntu \
             >"$R/debootstrap.log" 2>&1
 
-          # Included packages are downloaded for the second stage. Extract every retained
-          # amd64 .deb payload natively so the guest gets the real distro binary/library
-          # closure without needing dpkg/apt execution or procfs emulation.
           find "$ROOTFS" -type f -name '*.deb' -print | sort | tee "$R/rootfs-debs.txt"
           test -s "$R/rootfs-debs.txt"
+
+          # Foreign debootstrap already unpacked the base set. Re-extracting those payloads
+          # can fail on package hardlinks that are normally completed by maintainer scripts.
+          # Parse debootstrap's own extraction receipt and add only its deferred packages.
+          sed -n 's/^I: Extracting \([^ ]*\).*/\1/p' "$R/debootstrap.log" \
+            | sort -u | tee "$R/rootfs-already-extracted.txt"
+          : > "$R/rootfs-deferred-extracted.txt"
           while IFS= read -r deb; do
+            pkg="$(dpkg-deb -f "$deb" Package)"
+            if grep -Fxq "$pkg" "$R/rootfs-already-extracted.txt"; then
+              echo "skip already-extracted $pkg $deb" >> "$R/rootfs-deferred-extracted.txt"
+              continue
+            fi
+            echo "extract deferred $pkg $deb" | tee -a "$R/rootfs-deferred-extracted.txt"
             sudo dpkg-deb -x "$deb" "$ROOTFS"
           done < "$R/rootfs-debs.txt"
 
@@ -110,11 +118,9 @@ jobs:
           test -x "$ROOTFS/usr/bin/vulkaninfo"
           test -e "$ROOTFS/lib64/ld-linux-x86-64.so.2" -o -e "$ROOTFS/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
 
-          # Replace only the guest Vulkan loader with the generated thunk.
           sudo cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
           sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
 
-          # Verify the real distro X11 runtime supplies the Vulkan thunk constructor helpers.
           X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
           test -e "$X11"
           x86_64-linux-gnu-readelf -Ws "$X11" | grep -E ' XSync(@|$)' | head -1
@@ -122,7 +128,7 @@ jobs:
           x86_64-linux-gnu-readelf -Ws "$X11" | grep -E ' XDisplayString(@|$)' | head -1
 
           {
-            echo 'rootfs_builder=debootstrap amd64 foreign package resolution + host dpkg-deb extraction'
+            echo 'rootfs_builder=debootstrap amd64 foreign resolution + host extraction of deferred packages only'
             echo 'guest_execution_during_rootfs_build=none'
             echo 'guest_vulkaninfo=/usr/bin/vulkaninfo'
             sha256sum "$ROOTFS/usr/bin/vulkaninfo" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1" "$X11"
@@ -156,8 +162,6 @@ jobs:
           sed -n '1,240p' "$R/fex-vulkaninfo.out"
           sed -n '1,240p' "$R/fex-vulkaninfo.err"
 
-          # Integration success means the real x86 tool reached Vulkan enumeration.
-          # Exit remains a separate receipt because Finding B may still own teardown.
           grep -E 'deviceName|driverName|GPU|llvmpipe|lavapipe|Vulkan Instance Version' \
             "$R/fex-vulkaninfo.out" | tee "$R/fex-vulkaninfo-enumeration.txt"
           test -s "$R/fex-vulkaninfo-enumeration.txt"
