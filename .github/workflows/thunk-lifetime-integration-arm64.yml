@@ -1,5 +1,6 @@
 name: Thunk lifetime integrated FEX-2608 ARM64
 
+# Corrected carrier trigger: exact FEX-2608 + lock-clean retirement.
 on:
   push:
     branches: [ci/thunk-lifetime-integration-fex2608-20260814]
