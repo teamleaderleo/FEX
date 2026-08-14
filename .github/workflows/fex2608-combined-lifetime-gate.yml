@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 90
     env:
       FEX_BASE: e869aa644a16e4332cdc15c1ea0b4d13d482385d
-      FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
+      FIELDWORK_REF: probe/fex-vulkan-combined-repair
       ROOTFS: ${{ github.workspace }}/rootfs-amd64
       R: ${{ github.workspace }}/receipts-combined-lifetime
       H: ${{ github.workspace }}/host-vulkan
@@ -217,8 +217,9 @@ jobs:
         run: |
           set -euxo pipefail
           FIXTURE_HOST=/tmp/repro/fex-full-thunk-pair/host
-          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 30s \
-            "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/guest/callback_inflight \
+          (cd "$ROOTFS/opt/fex-ci" && \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 30s \
+              "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/guest/callback_inflight) \
             > "$R/callback-inflight.out" 2> "$R/callback-inflight.err"
           cat "$R/callback-inflight.err"
           grep -q 'INFLIGHT close-done-before-release=0' "$R/callback-inflight.err"
@@ -232,8 +233,9 @@ jobs:
         run: |
           set -euxo pipefail
           FIXTURE_HOST=/tmp/repro/fex-full-thunk-pair/host
-          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 30s \
-            "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/guest/callback_transaction_wait \
+          (cd "$ROOTFS/opt/fex-ci" && \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$FIXTURE_HOST" timeout 30s \
+              "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/guest/callback_transaction_wait) \
             > "$R/callback-transaction-wait.out" 2> "$R/callback-transaction-wait.err"
           cat "$R/callback-transaction-wait.err"
           grep -q 'TXWAIT before-release munmap-done=0 B-done=0' "$R/callback-transaction-wait.err"
