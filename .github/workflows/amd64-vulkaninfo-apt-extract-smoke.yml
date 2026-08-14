@@ -54,6 +54,15 @@ jobs:
           done
           file /tmp/rootfs-amd64/usr/bin/vulkaninfo
           test -x /tmp/rootfs-amd64/usr/bin/vulkaninfo
-          test -x /tmp/rootfs-amd64/lib64/ld-linux-x86-64.so.2 -o -x /tmp/rootfs-amd64/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
-          ls -l /tmp/rootfs-amd64/usr/bin/vulkaninfo
+
+          # Extract-only assembly does not run the distro step that creates the
+          # merged-/usr compatibility interpreter path expected by amd64 ELF.
+          find /tmp/rootfs-amd64 -name 'ld-linux-x86-64.so.2' -ls | tee /tmp/loaders.txt
+          loader="$(find /tmp/rootfs-amd64 -type f -name 'ld-linux-x86-64.so.2' | head -1)"
+          test -n "$loader"
+          sudo mkdir -p /tmp/rootfs-amd64/lib64
+          sudo cp -L "$loader" /tmp/rootfs-amd64/lib64/ld-linux-x86-64.so.2
+          test -x /tmp/rootfs-amd64/lib64/ld-linux-x86-64.so.2
+
+          ls -l /tmp/rootfs-amd64/usr/bin/vulkaninfo /tmp/rootfs-amd64/lib64/ld-linux-x86-64.so.2
           find /tmp/rootfs-amd64/usr/lib/x86_64-linux-gnu -maxdepth 1 \( -name 'libX11.so.6*' -o -name 'libvulkan.so.1*' -o -name 'libstdc++.so.6*' \) -print | sort
