@@ -29,7 +29,7 @@ def main() -> None:
     replace_once(
         analysis_cpp,
         '''        thunked_funcptrs[type.getAsString()] = std::pair {type.getTypePtr(), no_param_annotations};\n''',
-        '''        // Explicit function-pointer type declarations predate directional\n        // bridge roles, so conservatively keep both capabilities.\n        thunked_funcptrs[type.getAsString()] = {type.getTypePtr(), no_param_annotations, true, true};\n''',
+        '''        // Store the function prototype rather than the pointer type so all\n        // bridge consumers see the same representation as generated callbacks.\n        auto funcptr = type->getPointeeType()->getAs<clang::FunctionProtoType>();\n        if (!funcptr) {\n          throw report_error(template_arg_loc, "Expected a prototype function-pointer type");\n        }\n        // Explicit function-pointer type declarations predate directional\n        // bridge roles, so conservatively keep both capabilities.\n        thunked_funcptrs[type.getAsString()] = {context.getCanonicalType(funcptr), no_param_annotations, true, true};\n''',
         "explicit function-pointer registration")
     replace_once(
         analysis_cpp,
@@ -42,6 +42,14 @@ def main() -> None:
         '''            thunked_funcptrs[emitted_function->getNameAsString()] =\n              {context.getCanonicalType(emitted_function->getFunctionType()), data.param_annotations, true, false};\n''',
         "indirect call registration")
 
+    # The nested callback_member prototype may be applied before this transform
+    # on CUDA/DRM research branches. Preserve that provenance as unpacker-only.
+    analysis_text = analysis_cpp.read_text()
+    callback_member_old = '''            thunked_funcptrs["callback_member_" + annotated_member->getQualifiedNameAsString()] =\n              std::pair {context.getCanonicalType(funcptr), no_param_annotations};\n'''
+    callback_member_new = '''            thunked_funcptrs["callback_member_" + annotated_member->getQualifiedNameAsString()] =\n              {context.getCanonicalType(funcptr), no_param_annotations, false, true};\n'''
+    if callback_member_old in analysis_text:
+        analysis_cpp.write_text(analysis_text.replace(callback_member_old, callback_member_new, 1))
+
     replace_once(
         data_layout_cpp,
         '''    auto& [type, param_annotations] = funcptr_type_it->second;\n    auto func_type = type->getAs<clang::FunctionProtoType>();\n''',
@@ -51,7 +59,7 @@ def main() -> None:
     text = gen_cpp.read_text()
     old = "auto* type = type_it->second.first;"
     if text.count(old) != 2:
-        raise SystemExit(f"gen.cpp type access: expected two anchors after -guest-bridge transform, got {text.count(old)}")
+        raise SystemExit(f"gen.cpp type access: expected two anchors after bridge-output transform, got {text.count(old)}")
     text = text.replace(old, "auto* type = type_it->second.type;")
     old = '''      auto& [type, param_annotations] = host_funcptr_entry.second;\n      auto func_type = type->getAs<clang::FunctionProtoType>();\n'''
     new = '''      auto& funcptr_info = host_funcptr_entry.second;\n      auto* type = funcptr_info.type;\n      auto& param_annotations = funcptr_info.param_annotations;\n      auto func_type = type->getAs<clang::FunctionProtoType>();\n'''
@@ -60,8 +68,8 @@ def main() -> None:
     text = text.replace(old, new, 1)
     gen_cpp.write_text(text)
 
-    # Replace the first research -guest-bridge emission loop with role-aware
-    # canonical-signature aggregation. Ordinary -guest output remains unchanged.
+    # Replace the research -guest-bridge loop with role-aware canonical-signature
+    # aggregation and hash-stable exported caller/unpacker entrypoints.
     old = r'''    std::vector<std::vector<unsigned char>> sha256s;
     for (auto type_it = thunked_funcptrs.begin(); type_it != thunked_funcptrs.end(); ++type_it) {
       auto* type = type_it->second.type;
@@ -101,16 +109,25 @@ def main() -> None:
 
     for (std::size_t bridge_idx = 0; bridge_idx < bridge_signatures.size(); ++bridge_idx) {
       const auto& bridge = bridge_signatures[bridge_idx];
-      fmt::print(file, "  // FEX_BRIDGE_ROLE index={} caller={} unpacker={} {}\n", bridge_idx,
-                 bridge.needs_caller ? 1 : 0, bridge.needs_unpacker ? 1 : 0, bridge.signature);
+      auto cb_sha256 = get_sha256("fexcallback_" + bridge.signature, false);
+      std::string symbol_hash;
+      for (auto byte : cb_sha256) {
+        symbol_hash += fmt::format("{:02x}", byte);
+      }
+
+      fmt::print(file, "  // FEX_BRIDGE_ROLE index={} caller={} unpacker={} hash={} {}\n", bridge_idx,
+                 bridge.needs_caller ? 1 : 0, bridge.needs_unpacker ? 1 : 0, symbol_hash, bridge.signature);
 
       if (bridge.needs_caller) {
-        auto cb_sha256 = get_sha256("fexcallback_" + bridge.signature, false);
         fmt::print(file, "  MAKE_CALLBACK_THUNK(callback_{}, {}, \"{:#02x}\");\n", bridge_idx, bridge.signature, fmt::join(cb_sha256, ", "));
+        fmt::print(file, "  using fex_bridge_caller_signature_{} = {};\n", bridge_idx, bridge.signature);
+        fmt::print(file, "  extern \"C\" uintptr_t fex_bridge_invoker_{}() {{\n", symbol_hash);
+        fmt::print(file, "    return reinterpret_cast<uintptr_t>(GetCallerForHostFunction((fex_bridge_caller_signature_{}*)nullptr));\n", bridge_idx);
+        file << "  }\n";
       }
       if (bridge.needs_unpacker) {
         fmt::print(file, "  using fex_bridge_unpacker_signature_{} = {};\n", bridge_idx, bridge.signature);
-        fmt::print(file, "  extern \"C\" uintptr_t fex_bridge_unpacker_{}() {{\n", bridge_idx);
+        fmt::print(file, "  extern \"C\" uintptr_t fex_bridge_unpacker_{}() {{\n", symbol_hash);
         fmt::print(file, "    return reinterpret_cast<uintptr_t>(&CallbackUnpack<fex_bridge_unpacker_signature_{}>::Unpack);\n", bridge_idx);
         file << "  }\n";
       }
@@ -118,7 +135,84 @@ def main() -> None:
 '''
     replace_once(gen_cpp, old, new, "role-aware guest bridge emission")
 
-    print("Applied thunkgen caller/unpacker bridge-role prototype")
+    # Replace the accessor placeholder with an independently generated, typed
+    # declaration fragment. Stable hash-based symbol names allow this to be a
+    # separate thunkgen invocation without relying on unordered-map iteration.
+    accessor_old = r'''  // Companion declaration fragment. The role-aware transform replaces this
+  // placeholder with typed caller/unpacker accessors keyed by canonical
+  // signature hash. Keeping this as a separate generator mode avoids parsing
+  // generated guest C++ in consumers.
+  if (!output_filenames.guest_bridge_accessors.empty()) {
+    std::ofstream file(output_filenames.guest_bridge_accessors);
+    file << "// thunkgen guest bridge accessors require role-aware emission\\n";
+  }
+'''
+    accessor_new = r'''  if (!output_filenames.guest_bridge_accessors.empty()) {
+    std::ofstream file(output_filenames.guest_bridge_accessors);
+    file << "// Generated by thunkgen -guest-bridge-accessors. Do not edit.\n";
+    file << "#pragma once\n#include <cstdint>\n\n";
+    file << "template<typename Signature> struct FEXResidentBridgeInvoker;\n";
+    file << "template<typename Signature> struct FEXResidentBridgeUnpacker;\n\n";
+
+    struct BridgeAccessorSignature {
+      const clang::Type* type;
+      std::string signature;
+      bool needs_caller;
+      bool needs_unpacker;
+    };
+    std::vector<BridgeAccessorSignature> bridge_signatures;
+    for (const auto& [source_key, info] : thunked_funcptrs) {
+      (void)source_key;
+      std::string signature = clang::QualType {info.type, 0}.getAsString();
+      auto existing = std::find_if(bridge_signatures.begin(), bridge_signatures.end(),
+                                   [&](const BridgeAccessorSignature& entry) { return entry.signature == signature; });
+      if (existing == bridge_signatures.end()) {
+        bridge_signatures.push_back({info.type, std::move(signature), info.needs_caller, info.needs_unpacker});
+      } else {
+        existing->needs_caller |= info.needs_caller;
+        existing->needs_unpacker |= info.needs_unpacker;
+      }
+    }
+
+    for (std::size_t bridge_idx = 0; bridge_idx < bridge_signatures.size(); ++bridge_idx) {
+      const auto& bridge = bridge_signatures[bridge_idx];
+      auto cb_sha256 = get_sha256("fexcallback_" + bridge.signature, false);
+      std::string symbol_hash;
+      for (auto byte : cb_sha256) {
+        symbol_hash += fmt::format("{:02x}", byte);
+      }
+      fmt::print(file, "// FEX_BRIDGE_ROLE caller={} unpacker={} hash={} {}\n",
+                 bridge.needs_caller ? 1 : 0, bridge.needs_unpacker ? 1 : 0, symbol_hash, bridge.signature);
+      fmt::print(file, "using fex_bridge_accessor_signature_{} = {};\n", bridge_idx, bridge.signature);
+      if (bridge.needs_caller) {
+        fmt::print(file, "extern \"C\" uintptr_t fex_bridge_invoker_{}();\n", symbol_hash);
+        fmt::print(file, "template<> struct FEXResidentBridgeInvoker<fex_bridge_accessor_signature_{}> {{\n", bridge_idx);
+        fmt::print(file, "  static fex_bridge_accessor_signature_{}* Get() {{ return reinterpret_cast<fex_bridge_accessor_signature_{}*>(fex_bridge_invoker_{}()); }}\n", bridge_idx, bridge_idx, symbol_hash);
+        file << "};\n";
+      }
+      if (bridge.needs_unpacker) {
+        fmt::print(file, "extern \"C\" uintptr_t fex_bridge_unpacker_{}();\n", symbol_hash);
+        fmt::print(file, "template<> struct FEXResidentBridgeUnpacker<fex_bridge_accessor_signature_{}> {{\n", bridge_idx);
+        fmt::print(file, "  static void (*Get())(uintptr_t, void*) {{ return reinterpret_cast<void (*)(uintptr_t, void*)>(fex_bridge_unpacker_{}()); }}\n", symbol_hash);
+        file << "};\n";
+      }
+      file << "\n";
+    }
+
+    file << "template<typename Result, typename... Args>\n";
+    file << "static Result (*FEXGetResidentCallerForHostFunction(Result (*)(Args...)))(Args...) {\n";
+    file << "  return FEXResidentBridgeInvoker<Result(Args...)>::Get();\n}\n\n";
+    file << "template<typename Result, typename... Args>\n";
+    file << "static void (*FEXGetResidentCallbackUnpacker(Result (*)(Args...)))(uintptr_t, void*) {\n";
+    file << "  return FEXResidentBridgeUnpacker<Result(Args...)>::Get();\n}\n\n";
+    file << "template<typename Target>\n";
+    file << "static Target* FEXAllocateResidentHostTrampolineForGuestFunction(Target* GuestTarget) {\n";
+    file << "  return AllocateHostTrampolineForGuestFunction(FEXGetResidentCallbackUnpacker(GuestTarget), GuestTarget);\n}\n";
+  }
+'''
+    replace_once(gen_cpp, accessor_old, accessor_new, "role-aware bridge accessor emission")
+
+    print("Applied thunkgen caller/unpacker bridge-role and accessor prototype")
 
 
 if __name__ == "__main__":
