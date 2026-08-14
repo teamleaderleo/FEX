@@ -1,4 +1,4 @@
-name: NODELETE Vulkan LoadLib count
+name: NODELETE Vulkan guest constructor count
 
 on:
   push:
@@ -41,23 +41,7 @@ jobs:
           echo "$LVP" > "$R/lvp.txt"
           VK_DRIVER_FILES="$LVP" vulkaninfo --summary > "$R/native-vulkaninfo.out" 2> "$R/native-vulkaninfo.err"
           git rev-parse HEAD | tee "$R/fex-candidate-sha.txt"
-
-      - name: Instrument guest-constructor LoadLib edge
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('Source/Tools/LinuxEmulation/Thunks.cpp')
-          s = p.read_text()
-          old = '  LogMan::Msg::DFmt("LoadLib: {} -> {}", Name, SOName);\n'
-          new = '  LogMan::Msg::IFmt("FIELDWORK_LOADLIB name={} path={}", Name, SOName);\n'
-          if s.count(old) != 1:
-              raise SystemExit(f'expected one LoadLib log anchor, found {s.count(old)}')
-          p.write_text(s.replace(old, new, 1))
-          PY
           git diff --check
-          git diff -- Source/Tools/LinuxEmulation/Thunks.cpp | tee "$R/loadlib-instrumentation.diff"
 
       - name: Build FEX runtime and Vulkan host thunk
         shell: bash
@@ -155,13 +139,13 @@ jobs:
             }
 
             fprintf(stderr, "STRESS_CYCLES=%u\n", (unsigned)CYCLES);
-            fprintf(stderr, "NODELETE_LOADLIB_COUNT_PROBE_OK\n");
+            fprintf(stderr, "NODELETE_CONSTRUCTOR_COUNT_PROBE_OK\n");
             return 0;
           }
           EOF
           x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/pfn.c -ldl -o "$ROOTFS/opt/fex-ci/pfn"
 
-      - name: Run and count guest constructor to host LoadLib calls
+      - name: Run and count Vulkan guest OnInit executions
         shell: bash
         run: |
           set -uxo pipefail
@@ -176,15 +160,15 @@ jobs:
           cat "$R/pfn.err"
           test "$rc" -eq 0
           grep -q 'STRESS_CYCLES=256' "$R/pfn.err"
-          grep -q 'NODELETE_LOADLIB_COUNT_PROBE_OK' "$R/pfn.err"
-          count="$(grep -c '^FIELDWORK_LOADLIB name=vulkan ' "$R/pfn.err" || true)"
-          echo "VULKAN_LOADLIB_COUNT=$count" | tee "$R/loadlib-count.txt"
+          grep -q 'NODELETE_CONSTRUCTOR_COUNT_PROBE_OK' "$R/pfn.err"
+          count="$(grep -c '^FIELDWORK_VULKAN_ONINIT$' "$R/pfn.err" || true)"
+          echo "VULKAN_ONINIT_COUNT=$count" | tee "$R/oninit-count.txt"
           test "$count" -eq 1
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nodelete-loadlib-count-${{ github.run_id }}
+          name: nodelete-constructor-count-${{ github.run_id }}
           path: receipts
           retention-days: 30
