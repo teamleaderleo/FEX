@@ -38,7 +38,7 @@ jobs:
           git diff --check
           git diff -- ThunkLibs/libwayland-client ThunkLibs/libwayland-client_bridge ThunkLibs/GuestLibs/CMakeLists.txt \
             > "$R/product.diff"
-          grep -q 'applied to 40 typed allocation sites' "$R/transform.txt"
+          grep -q 'applied to 41 typed allocation sites' "$R/transform.txt"
 
       - name: Build thunkgen and Wayland pair
         shell: bash
