@@ -63,7 +63,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          ./build/unittests/ThunkLibs/thunkgentest 'StructRepacking' -s 2>&1 | tee "$R/struct-repacking.log"
+          ./build/Bin/thunkgentest 'StructRepacking' -s 2>&1 | tee "$R/struct-repacking.log"
 
       - name: Run complete thunkgen suite
         shell: bash
