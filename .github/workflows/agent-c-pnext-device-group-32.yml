@@ -46,7 +46,7 @@ jobs:
           } | tee "$R/identity.txt"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            cmake ninja-build clang clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
             gcc-i686-linux-gnu g++-i686-linux-gnu \
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools debootstrap
@@ -222,6 +222,7 @@ jobs:
 
           cmake -S src/ThunkLibs/GuestLibs -B guest32 -G Ninja \
             -DBITNESS=32 \
+            -DENABLE_CLANG_THUNKS=ON \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_32.cmake" \
             -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
