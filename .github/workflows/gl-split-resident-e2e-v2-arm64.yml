@@ -27,7 +27,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Extract original experiment shell steps unchanged except probe warning policy
+      - name: Extract original experiment shell steps with probe-only fixes
         shell: bash
         run: |
           set -euxo pipefail
@@ -56,12 +56,19 @@ jobs:
                       block.append(row[base + 2:])
                   i += 1
               text = '\n'.join(block) + '\n'
-              # The original experiment's tiny C probe has two same-line ifs.
-              # Change only that probe compilation policy; all FEX/GL source,
-              # runtime assertions, and ownership changes remain identical.
+
+              # Probe-only fix 1: keep the tiny C formatting warning from
+              # aborting the experiment under -Werror.
               text = text.replace(
                   'x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/glprobe.c',
                   'x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -Wno-error=misleading-indentation /tmp/glprobe.c')
+
+              # Probe-only fix 2: before dlclose(), glXGetProcAddress itself
+              # must still belong to the wrapper. The original assertion was
+              # accidentally inverted and returned 10 on the expected mapping.
+              bad = 'if(map_has((void*)get0,"/usr/lib/x86_64-linux-gnu/libGL.so.1",1)!=0)return 10;if(map_has(T,"/libfex-GL-bridge.so",1)!=1)return 11;'
+              good = 'if(map_has((void*)get0,"/usr/lib/x86_64-linux-gnu/libGL.so.1",1)!=1)return 10;if(map_has(T,"/libfex-GL-bridge.so",1)!=1)return 11;'
+              text = text.replace(bad, good)
               scripts.append(text)
 
           if len(scripts) < 5:
