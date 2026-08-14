@@ -12,7 +12,7 @@ TEST_CASE_METHOD(Fixture, "Custom repack function-pointer member") {
   INFO(guest_abi);
 
   const char* prelude = "using callback = void (*)(void*);\n"
-                        "struct A { void* userdata; callback fn; };\n";
+                        "struct A { callback fn; };\n";
   const char* code = "#include <thunks_common.h>\n"
                      "void func(const A*);\n"
                      "template<auto> struct fex_gen_config {};\n"
