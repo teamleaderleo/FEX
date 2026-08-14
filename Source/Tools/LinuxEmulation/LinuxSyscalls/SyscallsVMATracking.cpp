@@ -535,6 +535,20 @@ void VMATracking::ChangeProtectionFlags(uintptr_t Base, uintptr_t Length, VMAPro
   }
 }
 
+uintptr_t VMATracking::GetSHMRegionSize(uintptr_t Base) const {
+  auto Entry = VMAs.lower_bound(Base);
+
+  for (; Entry != VMAs.end(); ++Entry) {
+    LOGMAN_THROW_A_FMT(Entry->second.Base >= Base, "VMA tracking corruption");
+    if (Entry->second.Base - Base == Entry->second.Offset && Entry->second.Resource &&
+        Entry->second.Resource->Iterator->first.dev == SpecialDev::SHM) {
+      return Entry->second.Resource->Iterator->second.Length;
+    }
+  }
+
+  return 0;
+}
+
 // This matches the peculiarities algorithm used in linux ksys_shmdt (linux kernel 5.16, ipc/shm.c)
 uintptr_t VMATracking::DeleteSHMRegion(FEXCore::Context::Context* CTX, uintptr_t Base) {
 

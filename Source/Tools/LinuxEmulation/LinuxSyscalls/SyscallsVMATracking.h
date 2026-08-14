@@ -130,6 +130,11 @@ struct VMATracking {
   // - Mutex must be unique_locked before calling
   void ChangeProtectionFlags(uintptr_t Base, uintptr_t Length, VMAProt Prot);
 
+  // Returns the size of the SHM region attached at Base, or 0 if no matching
+  // SysV attachment is tracked.
+  // - Mutex must be locked before calling
+  uintptr_t GetSHMRegionSize(uintptr_t Base) const;
+
   // Deletes the SHM region mapped at Base from tracking.
   // Matches `shmdt` semantics.
   // - Mutex must be unique_locked before calling
