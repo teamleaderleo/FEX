@@ -1,0 +1,105 @@
+name: Agent B NODELETE guest-thunk footprint
+
+on:
+  push:
+    branches: [ci/agent-b-nodelete-footprint-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  footprint64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      R: ${{ github.workspace }}/receipts
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libasound2-dev libdrm-dev libgl-dev libegl-dev libwayland-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            binutils python3
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+          git diff --check
+          git diff 8fe2f3d1e2fd29d78b1927616daf0e973df54816 -- ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/nodelete-candidate.diff"
+          grep -q 'LINKER:-z,nodelete' "$R/nodelete-candidate.diff"
+
+      - name: Build thunk generator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" -v > "$R/build-thunkgen.log" 2>&1
+
+      - name: Build complete 64-bit guest-thunk set
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest64 -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest64.log" 2>&1
+          cmake --build guest64 -- -j"$(nproc)" -v > "$R/build-guest64.log" 2>&1 || { tail -n 240 "$R/build-guest64.log"; exit 1; }
+          find guest64 -maxdepth 1 -type f -name 'lib*-guest.so' -print | sort | tee "$R/dso-list.txt"
+          test "$(wc -l < "$R/dso-list.txt")" -ge 8
+
+      - name: Measure ELF footprints
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' > "$R/footprint.tsv"
+          import os, subprocess
+          files = sorted(x.strip() for x in open(os.environ['R'] + '/dso-list.txt') if x.strip())
+          print('file\tfile_bytes\tload_filesz_sum\tload_memsz_sum\tload_page_span\tnodelete')
+          total = [0,0,0,0]
+          for path in files:
+              out = subprocess.check_output(['readelf','-W','-l',path], text=True)
+              dyn = subprocess.check_output(['readelf','-W','-d',path], text=True)
+              fs = os.path.getsize(path)
+              fsum=msum=span=0
+              for line in out.splitlines():
+                  fields=line.split()
+                  if fields and fields[0]=='LOAD':
+                      filesz=int(fields[4],16); memsz=int(fields[5],16); align=int(fields[-1],16)
+                      vaddr=int(fields[2],16)
+                      fsum += filesz; msum += memsz
+                      a=max(align,4096)
+                      lo=vaddr//a*a; hi=(vaddr+memsz+a-1)//a*a
+                      span += hi-lo
+              nd = 'yes' if ('FLAGS_1' in dyn and 'NODELETE' in dyn) else 'no'
+              print(f'{os.path.basename(path)}\t{fs}\t{fsum}\t{msum}\t{span}\t{nd}')
+              total[0]+=fs; total[1]+=fsum; total[2]+=msum; total[3]+=span
+          print(f'TOTAL\t{total[0]}\t{total[1]}\t{total[2]}\t{total[3]}\t-')
+          PY
+          cat "$R/footprint.tsv"
+          awk -F '\t' 'NR>1 && $1!="TOTAL" { if ($6!="yes") bad=1 } END { exit bad }' "$R/footprint.tsv"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-b-nodelete-footprint-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
