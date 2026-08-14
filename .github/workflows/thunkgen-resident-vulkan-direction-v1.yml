@@ -2,10 +2,10 @@ name: First-class direction-aware Vulkan resident output v1
 
 on:
   push:
-    branches: [diagnostic/thunkgen-resident-output-v1]
+    branches: [diagnostic/thunkgen-resident-output-clean-v1]
     paths:
       - .github/workflows/thunkgen-resident-vulkan-direction-v1.yml
-      - ThunkLibs/Generator/apply_resident_vulkan_first_class_candidate.py
+      - .github/clean-resident-trigger
   workflow_dispatch:
 
 permissions:
@@ -38,23 +38,17 @@ jobs:
             libwayland-dev
           git rev-parse HEAD | tee "$R/carrier-sha.txt"
 
-      - name: Apply one-pass direction-aware Vulkan candidate
+      - name: Verify committed one-pass direction-aware Vulkan generator
         shell: bash
         run: |
           set -euxo pipefail
-          python3 ThunkLibs/Generator/apply_resident_output_candidate.py
-          python3 ThunkLibs/Generator/apply_resident_output_candidate_fixups.py
-          python3 ThunkLibs/Generator/apply_resident_direction_candidate.py
-          python3 ThunkLibs/Generator/apply_resident_vulkan_first_class_candidate.py
           git diff --check
+          git show --stat --oneline HEAD | tee "$R/committed-vulkan-resident-output.txt"
           grep -q 'generate(libvulkan .* RESIDENT_BRIDGE)' ThunkLibs/GuestLibs/CMakeLists.txt
           grep -q 'host_to_guest_callback_funcptrs' ThunkLibs/Generator/analysis.cpp
           ! grep -q 'FEXResidentBridgeCanUnpack' ThunkLibs/Generator/gen.cpp
-          rm ThunkLibs/Generator/extract_guest_bridge.py
           test ! -e ThunkLibs/Generator/extract_guest_bridge.py
-          git diff -- ThunkLibs/Generator/analysis.h ThunkLibs/Generator/analysis.cpp \
-            ThunkLibs/Generator/interface.h ThunkLibs/Generator/main.cpp ThunkLibs/Generator/gen.cpp \
-            ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/vulkan-one-pass-direction.diff"
+          test ! -e ThunkLibs/Generator/apply_resident_vulkan_first_class_candidate.py
 
       - name: Build thunkgen
         shell: bash

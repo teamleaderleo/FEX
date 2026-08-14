@@ -2,9 +2,10 @@ name: Positive callback-direction resident output v1
 
 on:
   push:
-    branches: [diagnostic/thunkgen-resident-output-v1]
+    branches: [diagnostic/thunkgen-resident-output-clean-v1]
     paths:
       - .github/workflows/thunkgen-resident-direction-positive-v1.yml
+      - .github/clean-resident-trigger
   workflow_dispatch:
 
 permissions:
@@ -36,14 +37,10 @@ jobs:
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev
           git rev-parse HEAD | tee "$R/carrier-sha.txt"
 
-      - name: Apply generator candidate and one-callback fixture
+      - name: Use committed generator and one-callback fixture
         shell: bash
         run: |
           set -euxo pipefail
-          python3 ThunkLibs/Generator/apply_resident_output_candidate.py
-          python3 ThunkLibs/Generator/apply_resident_output_candidate_fixups.py
-          python3 ThunkLibs/Generator/apply_resident_direction_candidate.py
-          rm ThunkLibs/Generator/extract_guest_bridge.py
 
           python3 - <<'PY'
           from pathlib import Path
