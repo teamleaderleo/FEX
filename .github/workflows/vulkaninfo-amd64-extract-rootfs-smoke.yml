@@ -1,0 +1,42 @@
+name: amd64 vulkaninfo extract rootfs smoke
+
+on:
+  push:
+    branches: [ci/nodelete-real-vulkaninfo-20260814]
+    paths:
+      - .github/workflows/vulkaninfo-amd64-extract-rootfs-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rootfs:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build amd64 rootfs without executing amd64 code
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mmdebstrap binutils file
+          mkdir -p rootfs
+          sudo mmdebstrap \
+            --variant=extract \
+            --architectures=amd64 \
+            --include=vulkan-tools,libx11-6 \
+            noble rootfs \
+            'deb http://archive.ubuntu.com/ubuntu noble main universe' \
+            'deb http://archive.ubuntu.com/ubuntu noble-updates main universe' \
+            'deb http://security.ubuntu.com/ubuntu noble-security main universe'
+          test -x rootfs/usr/bin/vulkaninfo
+          file rootfs/usr/bin/vulkaninfo
+          readelf -l rootfs/usr/bin/vulkaninfo | grep 'Requesting program interpreter'
+          interp="$(readelf -l rootfs/usr/bin/vulkaninfo | sed -n 's@.*Requesting program interpreter: \(.*\)]@\1@p')"
+          echo "interpreter=$interp"
+          test -e "rootfs$interp"
+          test -e rootfs/lib/x86_64-linux-gnu/libc.so.6 -o -e rootfs/usr/lib/x86_64-linux-gnu/libc.so.6
+          find rootfs -maxdepth 4 -type f -o -type l | grep -E 'vulkaninfo|ld-linux|libc\.so|libX11\.so' | sort | head -80
+          echo AMD64_VULKANINFO_EXTRACT_ROOTFS_OK
