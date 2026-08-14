@@ -1,0 +1,53 @@
+name: Native direct-symbol Vulkan debug allocator survey
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/vulkan-debug-allocator-forwarding-clean-20260814]
+    paths:
+      - .github/workflows/vulkan-debug-allocator-direct-native-survey.yml
+      - LinuxFieldwork/vk_allocator_debug_dual.c
+
+permissions:
+  contents: read
+
+jobs:
+  survey:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan headers and Lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvulkan-dev mesa-vulkan-drivers
+      - name: Convert probe to direct symbols and run native
+        run: |
+          set -euxo pipefail
+          cp LinuxFieldwork/vk_allocator_debug_dual.c direct.c
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('direct.c')
+          s=p.read_text()
+          s=s.replace('  LOAD(vkDestroyInstance);\n  LOAD(vkGetInstanceProcAddr);', '  LOAD(vkDestroyInstance);')
+          s=s.replace(' || !vkDestroyInstance || !vkGetInstanceProcAddr)', ' || !vkDestroyInstance)')
+          for name in ['vkCreateDebugUtilsMessengerEXT','vkDestroyDebugUtilsMessengerEXT','vkCreateDebugReportCallbackEXT','vkDestroyDebugReportCallbackEXT']:
+              s=s.replace(f'vkGetInstanceProcAddr(instance, "{name}")', f'dlsym(h, "{name}")')
+          assert 'vkGetInstanceProcAddr(instance,' not in s
+          p.write_text(s)
+          PY
+          cc -O0 -g -Wall -Wextra -Werror direct.c -ldl -o direct-probe
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          VK_DRIVER_FILES="$ICD" ./direct-probe 2>native-direct.stderr
+          cat native-direct.stderr
+          grep -q 'PASS debug dual allocator matrix' native-direct.stderr
+          grep -E -q 'DEBUG_UTILS_CREATE .*object_alloc_delta=[1-9]' native-direct.stderr
+          grep -E -q 'DEBUG_REPORT_CREATE .*object_alloc_delta=[1-9]' native-direct.stderr
+      - name: Upload survey
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-direct-debug-allocator-${{ github.run_id }}
+          path: native-direct.stderr
+          retention-days: 30
