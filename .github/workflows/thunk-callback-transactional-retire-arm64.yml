@@ -1,0 +1,183 @@
+name: Thunk callback transactional retirement ARM64
+
+on:
+  push:
+    branches: [ci/thunk-callback-transactional-retire-20260814]
+    paths:
+      - .github/fieldwork/add_callback_retirement_transaction.py
+      - .github/fieldwork/patch_callback_transaction_fixture.py
+      - .github/workflows/thunk-callback-transactional-retire-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  callback-transaction:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-transaction
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout retirement helpers
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Checkout retained fixture
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_REF }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and transaction fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 .github/fieldwork/patch_callback_inflight_fixture.py /tmp/repro/fex-full-thunk-pair
+          python3 .github/fieldwork/patch_callback_transaction_fixture.py /tmp/repro/fex-full-thunk-pair
+          (cd /tmp/repro/fex-full-thunk-pair && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) \
+            > "$R/build-fixture.log" 2>&1
+          file /tmp/repro/fex-full-thunk-pair/guest/callback_transaction | tee "$R/callback-transaction.file"
+          grep -q 'ELF 64-bit.*x86-64' "$R/callback-transaction.file"
+
+      - name: Apply descriptor plus eager execution drain baseline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          python3 .github/fieldwork/add_callback_descriptor.py src
+          python3 .github/fieldwork/add_callback_descriptor_drain.py src
+          git -C src diff --check
+          git -C src diff > "$R/eager-retirement.diff"
+
+      - name: Build eager-retirement baseline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B build-eager -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-eager.log" 2>&1
+          cmake --build build-eager --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-eager.log" 2>&1
+
+      - name: Apply transaction and build candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/add_callback_retirement_transaction.py src
+          git -C src diff --check
+          git -C src diff > "$R/transactional-retirement.diff"
+          CC=clang-18 CXX=clang++-18 cmake -S src -B build-transaction -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-transaction.log" 2>&1
+          cmake --build build-transaction --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-transaction.log" 2>&1
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute failed-munmap rollback A-B
+        shell: bash
+        run: |
+          set -uxo pipefail
+          HOST="/tmp/repro/fex-full-thunk-pair/host"
+          run_case() {
+            name="$1"; fex="$2"
+            set +e
+            (cd "$ROOTFS/opt/fex-ci" && \
+              FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+              "$fex" /opt/fex-ci/guest/callback_transaction) \
+              > "$R/$name.stdout" 2> "$R/$name.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            echo "===== $name rc=$rc ====="
+            grep -E 'TXFIX|DIAG_CALLBACK_(DESCRIPTOR|TX)|DIAG_MULTI|DIAG_LOCKED' \
+              "$R/$name.stdout" "$R/$name.stderr" || true
+          }
+
+          run_case eager "$GITHUB_WORKSPACE/build-eager/Bin/FEX"
+          run_case transaction "$GITHUB_WORKSPACE/build-transaction/Bin/FEX"
+
+          test "$(cat "$R/eager.exit")" = 0
+          test "$(cat "$R/transaction.exit")" = 0
+
+          # Eager irreversible pre-unmap retirement falsely revokes the callback
+          # even though the intentionally unaligned host munmap failed with EINVAL.
+          grep -q 'TXFIX failed-munmap .* rc=-1 errno=22' "$R/eager.stderr"
+          grep -q 'TXFIX callback-after-failed-munmap-exit=113' "$R/eager.stderr"
+
+          # Transactional retirement rolls Draining back to Live on the same real
+          # EINVAL, so the still-mapped retained callback executes normally.
+          grep -q 'TXFIX failed-munmap .* rc=-1 errno=22' "$R/transaction.stderr"
+          grep -q 'DIAG_CALLBACK_TX_ROLLBACK_RANGE' "$R/transaction.stderr"
+          grep -q 'TXFIX child after-failed-munmap rv=70063' "$R/transaction.stderr"
+          grep -q 'TXFIX callback-after-failed-munmap-exit=0' "$R/transaction.stderr"
+
+          # A later valid dlclose must commit retirement and tombstone the old
+          # escaped host trampoline in the candidate.
+          grep -q 'DIAG_CALLBACK_TX_COMMIT_RANGE' "$R/transaction.stderr"
+          grep -q 'TXFIX callback-after-real-close-exit=113' "$R/transaction.stderr"
+          grep -q 'TXFIX RESULT after-failed=0 after-close=113' "$R/transaction.stderr"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunk-callback-transactional-retire-${{ github.run_id }}
+          path: receipts-transaction
+          retention-days: 30
