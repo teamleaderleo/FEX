@@ -1,0 +1,206 @@
+name: FEX-2608 Vulkan split bridge PFN lifetime
+
+on:
+  push:
+    branches: [ci/fex2608-nodelete-vulkaninfo-ab-clean-20260814]
+    paths:
+      - .github/workflows/fex2608-vulkan-split-bridge-pfn.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  split-bridge-pfn:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      FEX_BASE: e869aa644a16e4332cdc15c1ea0b4d13d482385d
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-split-pfn
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 80
+
+      - name: Checkout split-bridge transformer
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-callback-descriptor-20260814
+          path: split-helper
+          fetch-depth: 1
+
+      - name: Prove committed product source is FEX-2608
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          git diff --exit-code "$FEX_BASE" -- ':!AGENTS.md' ':!CONTRIBUTING.md' ':!.github/**'
+          git rev-parse "$FEX_BASE" | tee "$R/fex-base-sha.txt"
+
+      - name: Dependencies and split transform
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan1 binutils
+          python3 split-helper/.github/fieldwork/apply_vulkan_split_bridge.py "$GITHUB_WORKSPACE"
+          git diff --check
+          git diff -- ThunkLibs/libvulkan/Guest.cpp ThunkLibs/GuestLibs/CMakeLists.txt \
+            > "$R/split-bridge.diff"
+
+      - name: Build FEX, Vulkan host thunk, wrapper, and resident bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer vulkan-host-64 thunkgen -- -j"$(nproc)" \
+            > "$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest-split -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-split --target vulkan-guest vulkan-bridge-guest -- -j"$(nproc)" \
+            > "$R/build-guest.log" 2>&1
+
+          readelf -d guest-split/libvulkan-guest.so > "$R/wrapper.dynamic"
+          readelf -d guest-split/libfex-vulkan-bridge.so > "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+
+      - name: Prepare rootfs and split-lifetime probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-split/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp guest-split/libfex-vulkan-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-vulkan-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d,int x){(void)d;(void)x;return 0;}
+          void *XGetVisualInfo(void*d,long m,void*t,int*c){(void)d;(void)m;(void)t;if(c)*c=0;return 0;}
+          char *XDisplayString(void*d){(void)d;return ":0";}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libX11.so.6 /tmp/x11stub.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat >/tmp/split_probe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+
+          typedef void* (*gipa_t)(void*, const char*);
+          typedef int (*enum_version_t)(uint32_t*);
+
+          static int address_mapped(const void* p) {
+            FILE* f = fopen("/proc/self/maps", "r");
+            if (!f) return -1;
+            uintptr_t a=(uintptr_t)p, lo=0, hi=0;
+            char line[1024];
+            while (fgets(line,sizeof(line),f)) {
+              if (sscanf(line,"%lx-%lx",&lo,&hi)==2 && a>=lo && a<hi) { fclose(f); return 1; }
+            }
+            fclose(f); return 0;
+          }
+
+          static int mapping_contains(const char* needle) {
+            FILE* f=fopen("/proc/self/maps","r"); if(!f)return -1;
+            char line[1024];
+            while(fgets(line,sizeof(line),f)) if(strstr(line,needle)){fclose(f);return 1;}
+            fclose(f); return 0;
+          }
+
+          static void* must_sym(void* h,const char*n){
+            void*p=dlsym(h,n); if(!p){fprintf(stderr,"SPLIT dlsym %s: %s\n",n,dlerror());exit(3);} return p;
+          }
+
+          int main(void) {
+            void* h=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);
+            if(!h){fprintf(stderr,"SPLIT dlopen: %s\n",dlerror());return 2;}
+            gipa_t gipa=(gipa_t)must_sym(h,"vkGetInstanceProcAddr");
+            enum_version_t version=(enum_version_t)gipa(NULL,"vkEnumerateInstanceVersion");
+            if(!version){fprintf(stderr,"SPLIT no version PFN\n");return 4;}
+            uint32_t v=0; int rc=version(&v);
+            fprintf(stderr,"SPLIT before-close rc=%d version=%u gipa-mapped=%d bridge=%d\n",
+                    rc,v,address_mapped((void*)gipa),mapping_contains("libfex-vulkan-bridge.so"));
+            if(rc!=0)return 5;
+            if(dlclose(h)!=0)return 6;
+            int gm=address_mapped((void*)gipa);
+            int bm=mapping_contains("libfex-vulkan-bridge.so");
+            fprintf(stderr,"SPLIT after-close gipa-mapped=%d bridge=%d\n",gm,bm);
+            if(gm!=0 || bm!=1)return 7;
+
+            v=0; rc=version(&v);
+            fprintf(stderr,"SPLIT saved-pfn-after-close rc=%d version=%u\n",rc,v);
+            if(rc!=0)return 8;
+
+            void* h2=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);
+            if(!h2){fprintf(stderr,"SPLIT reopen: %s\n",dlerror());return 9;}
+            gipa_t gipa2=(gipa_t)must_sym(h2,"vkGetInstanceProcAddr");
+            enum_version_t version2=(enum_version_t)gipa2(NULL,"vkEnumerateInstanceVersion");
+            if(!version2)return 10;
+            v=0; rc=version2(&v);
+            fprintf(stderr,"SPLIT reopen rc=%d version=%u old-pfn=%p new-pfn=%p bridge=%d\n",
+                    rc,v,(void*)version,(void*)version2,mapping_contains("libfex-vulkan-bridge.so"));
+            if(rc!=0)return 11;
+            if(dlclose(h2)!=0)return 12;
+            fprintf(stderr,"SPLIT final bridge=%d wrapper-gipa-mapped=%d\n",
+                    mapping_contains("libfex-vulkan-bridge.so"),address_mapped((void*)gipa2));
+            if(mapping_contains("libfex-vulkan-bridge.so")!=1)return 13;
+            fprintf(stderr,"SPLIT PFN_PASS\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/split_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/split_probe"
+
+      - name: Run unloadable-wrapper resident-bridge probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 30s \
+            "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/split_probe \
+            > "$R/probe.out" 2> "$R/probe.err"
+          cat "$R/probe.err"
+          grep -q 'SPLIT after-close gipa-mapped=0 bridge=1' "$R/probe.err"
+          grep -q 'SPLIT saved-pfn-after-close rc=0' "$R/probe.err"
+          grep -q 'SPLIT PFN_PASS' "$R/probe.err"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex2608-vulkan-split-bridge-pfn-${{ github.run_id }}
+          path: receipts-split-pfn
+          retention-days: 30
