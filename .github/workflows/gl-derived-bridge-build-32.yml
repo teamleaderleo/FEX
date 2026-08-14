@@ -1,0 +1,104 @@
+name: Derived GL resident bridge build 32-bit
+
+on:
+  push:
+    branches: [ci/gl-derived-bridge-32-build-20260814]
+    paths:
+      - .github/workflows/gl-derived-bridge-build-32.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gl-bridge-32:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 55
+    env:
+      R: ${{ github.workspace }}/receipts-gl-bridge-32
+      DEBIAN_FRONTEND: noninteractive
+      PROTOTYPE_SHA: 9bfbf20080cc58a12d3fc5ace127893940a0b035
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            gcc-multilib-x86-64-linux-gnu g++-multilib-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev binutils
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+          git merge-base --is-ancestor "$PROTOTYPE_SHA" HEAD
+          git diff --name-only "$PROTOTYPE_SHA" HEAD -- ThunkLibs FEXCore Source | tee "$R/product-source-diff.txt"
+          test ! -s "$R/product-source-diff.txt"
+
+      - name: Build thunk generator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" -v > "$R/build-thunkgen.log" 2>&1
+
+      - name: Wire and build 32-bit GL bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f ThunkLibs/Generator/extract_guest_bridge.py
+          test -f ThunkLibs/libGL_bridge/Guest.cpp
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s=p.read_text()
+          anchor='''generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp)\ntarget_include_directories_from_pkgconfig(libGL-guest-deps gl)\ntarget_include_directories_from_pkgconfig(libGL-guest-deps "xcb;x11;xrandr;xrender")\nadd_guest_lib(GL "libGL.so.1")\n'''
+          block='''generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp)\ntarget_include_directories_from_pkgconfig(libGL-guest-deps gl)\ntarget_include_directories_from_pkgconfig(libGL-guest-deps "xcb;x11;xrandr;xrender")\nset(GL_GUEST_INL "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libGL.inl")\nset(GL_BRIDGE_INL "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libGL_bridge.inl")\nset(GL_BRIDGE_ACCESSORS "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libGL_bridge_accessors.inl")\nadd_custom_command(OUTPUT "${GL_BRIDGE_INL}" "${GL_BRIDGE_ACCESSORS}"\n  DEPENDS "${GL_GUEST_INL}" "${FEX_PROJECT_SOURCE_DIR}/ThunkLibs/Generator/extract_guest_bridge.py"\n  COMMAND "${Python3_EXECUTABLE}" "${FEX_PROJECT_SOURCE_DIR}/ThunkLibs/Generator/extract_guest_bridge.py"\n    "${GL_GUEST_INL}" "${GL_BRIDGE_INL}" "${GL_BRIDGE_ACCESSORS}" --prefix libGL VERBATIM)\nadd_custom_target(GL-bridge-generated DEPENDS "${GL_BRIDGE_INL}" "${GL_BRIDGE_ACCESSORS}")\nadd_library(libGL_bridge-guest-deps INTERFACE)\ntarget_link_libraries(libGL_bridge-guest-deps INTERFACE libGL-guest-deps)\nset(GEN_libGL_bridge "${GL_BRIDGE_INL}" "${GL_BRIDGE_ACCESSORS}")\nadd_guest_lib(GL_bridge "libfex-GL-bridge.so")\nset_target_properties(GL_bridge-guest PROPERTIES OUTPUT_NAME "fex-GL-bridge")\ntarget_link_options(GL_bridge-guest PRIVATE "LINKER:-z,nodelete")\nadd_dependencies(GL_bridge-guest GL-bridge-generated)\nadd_guest_lib(GL "libGL.so.1")\ntarget_link_libraries(GL-guest PRIVATE GL_bridge-guest)\nadd_dependencies(GL-guest GL-bridge-generated)\n'''
+          if s.count(anchor)!=1: raise SystemExit(f'GL anchor count={s.count(anchor)}')
+          p.write_text(s.replace(anchor,block,1))
+          PY
+          git diff --check
+          cmake -S ThunkLibs/GuestLibs -B guest32 -G Ninja \
+            -DBITNESS=32 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_32.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest32.log" 2>&1
+          cmake --build guest32 --target GL-guest GL_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest32.log" 2>&1 || { tail -n 400 "$R/build-guest32.log"; exit 1; }
+
+          file guest32/libGL-guest.so guest32/libfex-GL-bridge.so | tee "$R/files.txt"
+          readelf -h guest32/libfex-GL-bridge.so | tee "$R/bridge.elf"
+          readelf -d guest32/libGL-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest32/libfex-GL-bridge.so | tee "$R/bridge.dynamic"
+          grep -q 'Class:.*ELF32' "$R/bridge.elf"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-GL-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          grep '^MAKE_CALLBACK_THUNK' guest32/gen/thunkgen_guest_libGL.inl > "$R/source-thunks.txt"
+          grep '^MAKE_CALLBACK_THUNK' guest32/gen/thunkgen_guest_libGL_bridge.inl > "$R/bridge-thunks.txt"
+          diff -u "$R/source-thunks.txt" "$R/bridge-thunks.txt"
+          wc -l "$R/source-thunks.txt" | tee "$R/signature-count.txt"
+          grep -q 'FEXGetResidentCallerForHostFunction' guest32/gen/thunkgen_guest_libGL_bridge_accessors.inl
+          grep -q 'FEXAllocateResidentHostTrampolineForGuestFunction' guest32/gen/thunkgen_guest_libGL_bridge_accessors.inl
+          echo DERIVED_GL_BRIDGE_32_BUILD_OK | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-derived-bridge-32-${{ github.run_id }}
+          path: receipts-gl-bridge-32
+          retention-days: 30
