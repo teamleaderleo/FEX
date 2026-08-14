@@ -1,0 +1,295 @@
+name: DRM resident callback in-flight wrapper close
+
+on:
+  push:
+    branches: [diagnostic/callback-inflight-current-clean-20260814]
+    paths:
+      - .github/workflows/drm-resident-inflight-wrapper-close.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drm-resident-race:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    env:
+      SOURCE_SHA: 1e8b042e7d50335cdbf2b1b6bfd0c888296dd73a
+      ROOTFS: ${{ github.workspace }}/rootfs-drm-resident-race
+      R: ${{ github.workspace }}/drm-resident-race-receipts
+      H: ${{ github.workspace }}/host-drm-resident-race
+      NATIVE: ${{ github.workspace }}/native-drm-resident-race
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout diagnostic carrier
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout exact clean source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.SOURCE_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H" "$NATIVE"
+          test "$(git -C src rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C src status --porcelain | tee "$R/pre-patch-status.txt"
+          test ! -s "$R/pre-patch-status.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libdrm-dev libgl-dev binutils
+
+      - name: Apply runtime-only FEX pause/tombstone and DRM unpacker getter
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/apply_callback_tombstone_diag.py src
+          python3 .github/fieldwork/apply_callback_inflight_pause.py src
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/ThunkLibs/libdrm_bridge/Guest.cpp')
+          s = p.read_text()
+          old = '#include "thunkgen_bridge_libdrm.inl"\n'
+          new = '''#include "thunkgen_bridge_libdrm.inl"\n#include "thunkgen_bridge_accessors_libdrm.inl"\n\nextern "C" uintptr_t FEXDRMDiagVBlankUnpacker() {\n  using Callback = decltype(drmEventContext::vblank_handler);\n  Callback callback = nullptr;\n  return reinterpret_cast<uintptr_t>(FEXGetResidentCallbackUnpacker(callback));\n}\n'''
+          if s.count(old) != 1:
+              raise SystemExit(f'bridge include anchor count={s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git -C src diff --check
+          git -C src diff > "$R/runtime-only.diff"
+          git -C src diff --name-only | tee "$R/runtime-only-files.txt"
+          grep -q 'ThunkLibs/libdrm_bridge/Guest.cpp' "$R/runtime-only-files.txt"
+
+      - name: Build FEX and DRM thunk pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEX FEXServer drm-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 520 "$R/build-host.log"; exit 1; }
+          cp src/build/HostLibs_64/libdrm-host.so "$H/libdrm-host.so"
+
+          cmake -S src/ThunkLibs/GuestLibs -B src/guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build src/guest --target drm-guest drm_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 520 "$R/build-guest.log"; exit 1; }
+          readelf -d src/guest/libdrm-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d src/guest/libfex-drm-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-drm-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'RUNPATH.*\$ORIGIN' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          nm -D src/guest/libfex-drm-bridge.so | tee "$R/bridge.symbols"
+          grep -q FEXDRMDiagVBlankUnpacker "$R/bridge.symbols"
+
+      - name: Build asynchronous native DRM retention target
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat >/tmp/fake_drm_race.c <<'EOF'
+          #include <xf86drm.h>
+          #include <pthread.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <unistd.h>
+
+          typedef void (*vblank_cb_t)(int, unsigned, unsigned, unsigned, void *);
+          static vblank_cb_t saved;
+          static pthread_t worker;
+
+          static void *fire_thread(void *opaque) {
+            (void)opaque;
+            usleep(100000);
+            fprintf(stderr, "HOST_DRM_ASYNC_ENTER trampoline=%p\n", (void*)saved);
+            fflush(stderr);
+            saved(77, 51, 52, 53, (void*)(uintptr_t)0x33334444);
+            fprintf(stderr, "HOST_DRM_ASYNC_RETURN trampoline=%p\n", (void*)saved);
+            fflush(stderr);
+            return NULL;
+          }
+
+          int drmHandleEvent(int fd, drmEventContextPtr ctx) {
+            if (!ctx || !ctx->vblank_handler) return -10;
+            saved = ctx->vblank_handler;
+            fprintf(stderr, "HOST_DRM_SAVE trampoline=%p\n", (void*)saved);
+            saved(fd, 41, 42, 43, (void*)(uintptr_t)0x11112222);
+            return 0;
+          }
+
+          int drmAvailable(void) {
+            if (!saved) return -11;
+            if (pthread_create(&worker, NULL, fire_thread, NULL) != 0) return -12;
+            pthread_detach(worker);
+            fprintf(stderr, "HOST_DRM_ASYNC_STARTED trampoline=%p\n", (void*)saved);
+            fflush(stderr);
+            return 17;
+          }
+          EOF
+          cc -shared -fPIC -O2 -Wall -Wextra -Werror -I/usr/include/libdrm -pthread \
+            -Wl,-soname,libdrm.so.2 /tmp/fake_drm_race.c -o "$NATIVE/libdrm.so.2"
+
+      - name: Prepare amd64 rootfs and race probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp src/guest/libdrm-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libdrm.so.2"
+          cp src/guest/libfex-drm-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-drm-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/drm_resident_race.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <xf86drm.h>
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <unistd.h>
+
+          typedef int (*handle_t)(int, drmEventContextPtr);
+          typedef int (*available_t)(void);
+          typedef uintptr_t (*getaddr_t)(void);
+          static volatile unsigned callbacks;
+
+          __attribute__((used,noinline))
+          static void cb(int fd, unsigned seq, unsigned sec, unsigned usec, void *user) {
+            ++callbacks;
+            fprintf(stderr, "DRM_RESIDENT_RACE_CALLBACK count=%u fd=%d seq=%u tv=%u.%u user=%p\n",
+                    callbacks, fd, seq, sec, usec, user);
+            fflush(stderr);
+          }
+
+          static int map_has(void *p, const char *needle) {
+            FILE *f=fopen("/proc/self/maps","r"); char l[1024]; uintptr_t x=(uintptr_t)p;
+            if(!f)return -1;
+            while(fgets(l,sizeof l,f)){
+              unsigned long a,b;
+              if(sscanf(l,"%lx-%lx",&a,&b)==2&&x>=a&&x<b){
+                int ok=strstr(l,needle)!=0; fprintf(stderr,"MAP %p %s",p,l); fclose(f); return ok;
+              }
+            }
+            fclose(f); fprintf(stderr,"UNMAPPED %p\n",p); return 0;
+          }
+
+          static void *req(void *h, const char *n) {
+            void *p=dlsym(h,n); if(!p)fprintf(stderr,"DLSYM_FAIL %s %s\n",n,dlerror()); return p;
+          }
+
+          int main(void) {
+            void *h=dlopen("libdrm.so.2",RTLD_NOW|RTLD_LOCAL);
+            if(!h){fprintf(stderr,"OPEN_FAIL %s\n",dlerror());return 2;}
+            handle_t handle=(handle_t)req(h,"drmHandleEvent");
+            available_t available=(available_t)req(h,"drmAvailable");
+            if(!handle||!available)return 3;
+            void *bh=dlopen("libfex-drm-bridge.so",RTLD_NOW|RTLD_NOLOAD);
+            if(!bh){fprintf(stderr,"BRIDGE_NOLOAD_FAIL %s\n",dlerror());return 4;}
+            getaddr_t get_unpack=(getaddr_t)req(bh,"FEXDRMDiagVBlankUnpacker");
+            if(!get_unpack)return 5;
+            void *unpack=(void*)get_unpack();
+            fprintf(stderr,"DRM_RESIDENT_RACE_ADDR handle=%p available=%p unpacker=%p target=%p\n",
+                    (void*)handle,(void*)available,unpack,(void*)cb);
+            if(map_has(unpack,"/libfex-drm-bridge.so")!=1)return 6;
+
+            drmEventContext ctx; memset(&ctx,0,sizeof(ctx));
+            ctx.version=DRM_EVENT_CONTEXT_VERSION; ctx.vblank_handler=cb;
+            if(handle(5,&ctx)!=0||callbacks!=1)return 7;
+            int arc=available();
+            fprintf(stderr,"DRM_RESIDENT_RACE_TRIGGER_RETURN rc=%d callbacks=%u\n",arc,callbacks);
+            if(arc!=17)return 8;
+
+            // Native worker fires after 100ms. FEX diagnostic pauses callback
+            // entry #2 for up to 1.5s. Close the ordinary wrapper while that
+            // selected callback is in flight.
+            usleep(350000);
+            fprintf(stderr,"DRM_RESIDENT_RACE_DLCLOSE_BEGIN callbacks=%u\n",callbacks);
+            fflush(stderr);
+            dlclose(bh);
+            if(dlclose(h)!=0)return 9;
+            fprintf(stderr,"DRM_RESIDENT_RACE_DLCLOSE_RETURN callbacks=%u\n",callbacks);
+            fflush(stderr);
+            if(map_has((void*)handle,"/usr/lib/x86_64-linux-gnu/libdrm.so.2")!=0)return 10;
+            if(map_has(unpack,"/libfex-drm-bridge.so")!=1)return 11;
+            if(map_has((void*)cb,"/opt/fex-ci/drm-resident-race")!=1)return 12;
+
+            for(unsigned i=0;i<3000 && callbacks<2;i++) usleep(1000);
+            fprintf(stderr,"DRM_RESIDENT_RACE_FINAL callbacks=%u\n",callbacks);
+            if(callbacks!=2)return 13;
+            if(map_has(unpack,"/libfex-drm-bridge.so")!=1)return 14;
+            fprintf(stderr,"DRM_RESIDENT_INFLIGHT_WRAPPER_CLOSE_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
+            /tmp/drm_resident_race.c -ldl -o "$ROOTFS/opt/fex-ci/drm-resident-race"
+
+      - name: Execute resident callback race
+        shell: bash
+        run: |
+          set +e
+          LD_LIBRARY_PATH="$NATIVE${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 40s \
+            src/build/Bin/FEX /opt/fex-ci/drm-resident-race > "$R/probe.out" 2> "$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          test "$rc" -eq 0
+          grep -q 'HOST_DRM_ASYNC_STARTED' "$R/probe.err"
+          grep -q 'HOST_DRM_ASYNC_ENTER' "$R/probe.err"
+          grep -q 'DIAG_CALLBACK_INFLIGHT_SELECTED entry=2' "$R/probe.err"
+          grep -q 'DRM_RESIDENT_RACE_DLCLOSE_BEGIN' "$R/probe.err"
+          grep -q 'DRM_RESIDENT_RACE_DLCLOSE_RETURN' "$R/probe.err"
+          grep -q 'UNMAPPED ' "$R/probe.err"
+          grep -q 'DIAG_CALLBACK_INFLIGHT_PIN_TIMEOUT_RESUME' "$R/probe.err"
+          grep -q 'HOST_DRM_ASYNC_RETURN' "$R/probe.err"
+          grep -q 'DRM_RESIDENT_RACE_FINAL callbacks=2' "$R/probe.err"
+          grep -q 'DRM_RESIDENT_INFLIGHT_WRAPPER_CLOSE_OK' "$R/probe.err"
+          python3 - <<'PY'
+          from pathlib import Path
+          text=Path('drm-resident-race-receipts/probe.err').read_text()
+          keys=['DIAG_CALLBACK_INFLIGHT_SELECTED entry=2','DRM_RESIDENT_RACE_DLCLOSE_BEGIN','DRM_RESIDENT_RACE_DLCLOSE_RETURN','DIAG_CALLBACK_INFLIGHT_PIN_TIMEOUT_RESUME','HOST_DRM_ASYNC_RETURN','DRM_RESIDENT_INFLIGHT_WRAPPER_CLOSE_OK']
+          pos=[text.find(k) for k in keys]
+          print('ordering',list(zip(keys,pos)))
+          if any(p<0 for p in pos) or pos!=sorted(pos): raise SystemExit(1)
+          # The retiring wrapper range must not release this selected callback;
+          # its selected unpacker/target are outside that range.
+          if 'DIAG_CALLBACK_POST_UNMAP_RELEASE' in text: raise SystemExit('unexpected selected callback release by wrapper unmap')
+          Path('drm-resident-race-receipts/ordering.txt').write_text('\n'.join(f'{k}={p}' for k,p in zip(keys,pos))+'\n')
+          PY
+          echo DRM_RESIDENT_INFLIGHT_GATE_OK | tee "$R/gate.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drm-resident-inflight-wrapper-close-${{ github.run_id }}
+          path: drm-resident-race-receipts
+          retention-days: 30
