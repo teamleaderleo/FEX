@@ -28,13 +28,15 @@ insert = '''    EmitLayoutWrappers(context, file, type_compat);
         continue;
       }
 
-      file << "#define FOREACH_" << ns.name << (ns.name.empty() ? "" : "_") << "CUSTOM_HOST_SYMBOL(EXPAND) \\\\n";
+      // Keep the macro on one physical line. This avoids continuation-line
+      // escaping and is still consumed like the existing FOREACH symbol macros.
+      file << "#define FOREACH_" << ns.name << (ns.name.empty() ? "" : "_") << "CUSTOM_HOST_SYMBOL(EXPAND)";
       for (const auto& symbol : thunked_api) {
         if (symbol.symtable_namespace.value_or(0) == namespace_idx && has_custom_host_impl(symbol)) {
-          file << "  EXPAND(" << symbol.function_name << ", \\\"TODO\\\") \\\\n";
+          file << " EXPAND(" << symbol.function_name << ")";
         }
       }
-      file << "\\n";
+      file << "\\n\\n";
     }
 
     // Forward declarations for symbols loaded from the native host library
@@ -67,7 +69,7 @@ for required in (
         raise SystemExit(f"V3 lookup anchor missing required symbol {required}")
 
 new = '''static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
-#define LOOKUP_CUSTOM_HOST(symbol, unused) \\
+#define LOOKUP_CUSTOM_HOST(symbol) \\
   if (std::string_view {a_1} == #symbol) { \\
     return reinterpret_cast<PFN_vkVoidFunction>(FEXFN_IMPL(symbol)); \\
   }
