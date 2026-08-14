@@ -1,0 +1,19 @@
+Generated Vulkan split bridge prototype seam
+
+Goal: prove real generated Vulkan can physically unload its ordinary wrapper while the escaped H->T adapter and fixed X11 callback unpackers remain process-resident.
+
+Minimal prototype:
+1. Add a tiny libvulkan_bridge thunkgen interface declaring one function with the exact VkResult(uint32_t*) signature used by vkEnumerateInstanceVersion, under indirect_guest_calls. The callback hash is signature-derived, so thunkgen emits the same special callback thunk used by Vulkan for that signature.
+2. Build libfex-vulkan-bridge.so as a guest x86 DSO with DF_1_NODELETE.
+3. The sidecar exports accessor functions returning addresses of:
+   - CallHostFunction<fexthunks_invoke_callback<VkResult(uint32_t*)>, VkResult, uint32_t*>;
+   - CallbackUnpack<decltype(XSync)>::Unpack;
+   - CallbackUnpack<decltype(XGetVisualInfo)>::Unpack;
+   - CallbackUnpack<decltype(XDisplayString)>::Unpack.
+4. Link vulkan-guest against the sidecar.
+5. In Vulkan Guest.cpp, override HostPtrInvokers["vkEnumerateInstanceVersion"] with the resident adapter address returned by the sidecar accessor, and publish the resident X11 unpackers during OnInit().
+6. Keep every other Vulkan generated adapter in the ordinary wrapper for this discriminator.
+
+Important ABI detail: do not add an ordinary C wrapper around CallHostFunction. FEX transfers H to the selected guest adapter with the native H value in the custom r11/mm0 path. An extra C wrapper could clobber that register before CallHostFunction reads it. The sidecar accessor must return the address of the exact CallHostFunction template instantiation.
+
+If real GIPA -> vkEnumerateInstanceVersion remains callable after physical libvulkan-guest.so unmap, and the X11 callback path also remains callable, the generator/build direction is validated without changing FEX core.
