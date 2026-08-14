@@ -42,7 +42,7 @@ jobs:
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
             gcc-multilib-x86-64-linux-gnu g++-multilib-x86-64-linux-gnu \
-            libcap-dev libwayland-dev binutils
+            libcap-dev libwayland-dev libgl-dev binutils
 
       - name: Add runtime-only array-unpacker observability
         shell: bash
