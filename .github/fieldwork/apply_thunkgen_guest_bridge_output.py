@@ -57,7 +57,7 @@ def main() -> None:
 
       file << "  // " << funcptr_signature << "\n";
       auto funcptr_idx = std::distance(thunked_funcptrs.begin(), type_it);
-      fmt::print(file, "  MAKE_CALLBACK_THUNK(callback_{}, {}, \\\"{:#02x}\\\");\n", funcptr_idx, funcptr_signature, fmt::join(cb_sha256, ", "));
+      fmt::print(file, "  MAKE_CALLBACK_THUNK(callback_{}, {}, \"{:#02x}\");\n", funcptr_idx, funcptr_signature, fmt::join(cb_sha256, ", "));
     }
 
     for (std::size_t namespace_idx = 0; namespace_idx < namespaces.size(); ++namespace_idx) {
@@ -65,7 +65,7 @@ def main() -> None:
       file << "#define FOREACH_" << ns.name << (ns.name.empty() ? "" : "_") << "SYMBOL(EXPAND) \\\n";
       for (auto& symbol : thunked_api) {
         if (symbol.symtable_namespace.value_or(0) == namespace_idx) {
-          file << "  EXPAND(" << symbol.function_name << ", \\\"TODO\\\") \\\n";
+          file << "  EXPAND(" << symbol.function_name << ", \"TODO\") \\\n";
         }
       }
       file << "\n";
