@@ -1,0 +1,201 @@
+name: Thunk multithread retirement A/B ARM64
+
+on:
+  push:
+    branches: [ci/thunk-lifetime-race-20260814]
+    paths:
+      - .github/fieldwork/apply_multithread_owner_retire_diag.py
+      - .github/workflows/thunk-multithread-retire-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  multithread-retire:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [local, all]
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-${{ matrix.mode }}
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact FEX source under test
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout retained synthetic fixture
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_REF }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Install dependencies and prepare threaded fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('/tmp/repro/fex-full-thunk-pair/guest/main.cpp')
+          s = p.read_text()
+          s = s.replace('#include <algorithm>\n', '#include <algorithm>\n#include <atomic>\n#include <thread>\n', 1)
+          s = s.replace('  bool pin = false;\n  int cycles = 1;', '  bool pin = false;\n  bool thread_cache = false;\n  int cycles = 1;', 1)
+          s = s.replace('    else if (!std::strcmp(argv[i], "--pin")) pin = true;\n', '    else if (!std::strcmp(argv[i], "--pin")) pin = true;\n    else if (!std::strcmp(argv[i], "--thread-cache")) thread_cache = true;\n', 1)
+          anchor = '  if (!host_a || host_a != host_b) return 3;\n\n'
+          block = r'''  if (!host_a || host_a != host_b) return 3;
+
+  if (thread_cache) {
+    DSO d = load_guest(1);
+    d.register_a(host_a);
+    const int want_before = (5 * 3 + 7) + 1000 + 1;
+    const int want_after = (9 * 3 + 7) + 1001 * 1000 + 1;
+    std::atomic<int> phase {0};
+    std::atomic<int> before {0};
+    std::atomic<int> after {0};
+
+    std::thread worker([&] {
+      before.store(reinterpret_cast<LinkedHostFn>(host_a)(5), std::memory_order_release);
+      phase.store(1, std::memory_order_release);
+      while (phase.load(std::memory_order_acquire) == 1) std::this_thread::yield();
+      after.store(reinterpret_cast<LinkedHostFn>(host_a)(9), std::memory_order_release);
+      phase.store(3, std::memory_order_release);
+    });
+
+    while (phase.load(std::memory_order_acquire) != 1) std::this_thread::yield();
+    std::printf("thread-cache preheat             rv=%d want=%d\n", before.load(), want_before);
+    if (before.load() != want_before) return 40;
+
+    const uintptr_t old_invoker = d.invoker_a;
+    const Span old_span = d.span;
+    if (dlclose(d.h) != 0) { std::fprintf(stderr, "thread-cache dlclose: %s\n", dlerror()); return 41; }
+    print_mapping("thread-cache old invoker", old_invoker);
+    if (executable(old_invoker)) return 42;
+
+    const size_t reservation_len = old_span.hi - old_span.lo;
+    void* reservation = reserve_span(old_span);
+    if (reservation == MAP_FAILED) {
+      std::fprintf(stderr, "thread-cache reserve: %s\n", std::strerror(errno));
+      return 43;
+    }
+    std::printf("thread-cache reserved old span   %p len=0x%zx\n", reservation, reservation_len);
+
+    DSO newer = load_guest(1001);
+    std::printf("thread-cache reload invoker      old=0x%016" PRIxPTR " new=0x%016" PRIxPTR " %s\n",
+                old_invoker, newer.invoker_a, old_invoker == newer.invoker_a ? "SAME" : "DIFFERENT");
+    newer.register_a(host_a);
+    phase.store(2, std::memory_order_release);
+    while (phase.load(std::memory_order_acquire) != 3) std::this_thread::yield();
+    worker.join();
+
+    std::printf("thread-cache post-reload         rv=%d want=%d\n", after.load(), want_after);
+    if (dlclose(newer.h) != 0) return 44;
+    munmap(reservation, reservation_len);
+    return after.load() == want_after ? 0 : 45;
+  }
+
+'''
+          if anchor not in s:
+              raise SystemExit('main insertion anchor missing')
+          p.write_text(s.replace(anchor, block, 1))
+
+          m = Path('/tmp/repro/fex-full-thunk-pair/Makefile')
+          ms = m.read_text()
+          old = '$(GUEST_CXX) $(GUEST_CXXFLAGS) -o $@ $< -ldl\n'
+          if old not in ms:
+              raise SystemExit('Makefile guest executable anchor missing')
+          m.write_text(ms.replace(old, '$(GUEST_CXX) $(GUEST_CXXFLAGS) -o $@ $< -ldl -pthread\n', 1))
+          PY
+          grep -n 'thread-cache' /tmp/repro/fex-full-thunk-pair/guest/main.cpp | tee "$R/fixture-sites.txt"
+
+      - name: Apply owner retirement mode
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/apply_multithread_owner_retire_diag.py src '${{ matrix.mode }}'
+          git -C src diff --check
+          git -C src diff > "$R/fex-${{ matrix.mode }}.diff"
+
+      - name: Build diagnostic FEX and threaded thunk pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
+          cd /tmp/repro/fex-full-thunk-pair
+          make clean
+          make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/build-fixture.log" 2>&1
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci/full"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/full/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute cross-thread cache discriminator
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          HOST="/tmp/repro/fex-full-thunk-pair/host"
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/full" && \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime --thread-cache) \
+            > "$R/run.stdout" 2> "$R/run.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/run.exit"
+          grep -E 'DIAG_MT|thread-cache|native host' "$R/run.stdout" "$R/run.stderr" > "$R/key-lines.txt" || true
+          cat "$R/key-lines.txt"
+          echo "mode=${{ matrix.mode }} rc=$rc"
+          exit 0
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunk-multithread-retire-${{ matrix.mode }}-${{ github.run_id }}
+          path: receipts-${{ matrix.mode }}
+          retention-days: 30
