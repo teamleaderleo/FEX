@@ -116,11 +116,26 @@ int main() {
     return 5;
   }
 
-  if (!PublishTarget(reinterpret_cast<uintptr_t>(Target))) {
+  // Break any direct H->T exit link established by the warm call while keeping
+  // the same VMA generation. This forces the next old-H redirect through
+  // ExitFunctionLink(T), where the deterministic pre-selection barrier lives.
+  if (::mprotect(Target, PageSize, PROT_READ | PROT_WRITE) != 0) {
+    std::fprintf(stderr, "INFLIGHT relink-reset RW mprotect failed errno=%d (%s)\n", errno, std::strerror(errno));
     return 6;
   }
-  if (!Touch(ArmPath)) {
+  EmitReturn(Target, 111);
+  if (::mprotect(Target, PageSize, PROT_READ | PROT_EXEC) != 0) {
+    std::fprintf(stderr, "INFLIGHT relink-reset RX mprotect failed errno=%d (%s)\n", errno, std::strerror(errno));
     return 7;
+  }
+  std::fprintf(stderr, "INFLIGHT relink-reset H=%p T=%p sentinel=111 owner-preserved\n",
+               reinterpret_cast<void*>(SyntheticH), Target);
+
+  if (!PublishTarget(reinterpret_cast<uintptr_t>(Target))) {
+    return 8;
+  }
+  if (!Touch(ArmPath)) {
+    return 9;
   }
   std::fprintf(stderr, "INFLIGHT armed H=%p T=%p stage=before-target-selection\n",
                reinterpret_cast<void*>(SyntheticH), Target);
@@ -128,11 +143,11 @@ int main() {
   pthread_t Worker {};
   if (::pthread_create(&Worker, nullptr, WorkerMain, nullptr) != 0) {
     std::fprintf(stderr, "INFLIGHT pthread_create failed\n");
-    return 8;
+    return 10;
   }
 
   if (!WaitFor(SelectedPath)) {
-    return 9;
+    return 11;
   }
   std::fprintf(stderr, "INFLIGHT old-H-redirect-pending H=%p T=%p\n",
                reinterpret_cast<void*>(SyntheticH), Target);
@@ -142,22 +157,22 @@ int main() {
   if (Replacement == MAP_FAILED || Replacement != Target) {
     std::fprintf(stderr, "INFLIGHT MAP_FIXED failed result=%p errno=%d (%s)\n",
                  Replacement, errno, std::strerror(errno));
-    return 10;
+    return 12;
   }
   EmitReturn(Target, 222);
   if (::mprotect(Target, PageSize, PROT_READ | PROT_EXEC) != 0) {
     std::fprintf(stderr, "INFLIGHT replacement mprotect failed errno=%d (%s)\n", errno, std::strerror(errno));
-    return 11;
+    return 13;
   }
   std::fprintf(stderr, "INFLIGHT replacement-committed H=%p T=%p generation=2 sentinel=222\n",
                reinterpret_cast<void*>(SyntheticH), Target);
 
   if (!Touch(ResumePath)) {
-    return 12;
+    return 14;
   }
   if (::pthread_join(Worker, nullptr) != 0) {
     std::fprintf(stderr, "INFLIGHT pthread_join failed\n");
-    return 13;
+    return 15;
   }
 
   const int Result = WorkerValue.load(std::memory_order_acquire);
@@ -168,5 +183,5 @@ int main() {
   (void)::unlink(SelectedPath);
   (void)::unlink(ResumePath);
 
-  return Result == 222 ? 0 : 14;
+  return Result == 222 ? 0 : 16;
 }
