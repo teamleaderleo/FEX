@@ -1,0 +1,127 @@
+name: First-class direction-aware Vulkan resident output v1
+
+on:
+  push:
+    branches: [diagnostic/thunkgen-resident-output-v1]
+    paths:
+      - .github/workflows/thunkgen-resident-vulkan-direction-v1.yml
+      - ThunkLibs/Generator/apply_resident_vulkan_first_class_candidate.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vulkan-direction:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    env:
+      R: ${{ github.workspace }}/receipts-thunkgen-vulkan-direction-v1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
+            libcap-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libwayland-dev
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+
+      - name: Apply one-pass direction-aware Vulkan candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 ThunkLibs/Generator/apply_resident_output_candidate.py
+          python3 ThunkLibs/Generator/apply_resident_output_candidate_fixups.py
+          python3 ThunkLibs/Generator/apply_resident_direction_candidate.py
+          python3 ThunkLibs/Generator/apply_resident_vulkan_first_class_candidate.py
+          git diff --check
+          grep -q 'generate(libvulkan .* RESIDENT_BRIDGE)' ThunkLibs/GuestLibs/CMakeLists.txt
+          grep -q 'host_to_guest_callback_funcptrs' ThunkLibs/Generator/analysis.cpp
+          ! grep -q 'FEXResidentBridgeCanUnpack' ThunkLibs/Generator/gen.cpp
+          rm ThunkLibs/Generator/extract_guest_bridge.py
+          test ! -e ThunkLibs/Generator/extract_guest_bridge.py
+          git diff -- ThunkLibs/Generator/analysis.h ThunkLibs/Generator/analysis.cpp \
+            ThunkLibs/Generator/interface.h ThunkLibs/Generator/main.cpp ThunkLibs/Generator/gen.cpp \
+            ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/vulkan-one-pass-direction.diff"
+
+      - name: Build thunkgen
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 420 "$R/build-host.log"; exit 1; }
+          test -x build/Bin/thunkgen
+
+      - name: Build Vulkan wrapper and resident companion
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest vulkan_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 560 "$R/build-guest.log"; exit 1; }
+
+          test -f guest/libvulkan-guest.so
+          test -f guest/libfex-vulkan-bridge.so
+          test -f guest/gen/thunkgen_guest_libvulkan.inl
+          test -f guest/gen/thunkgen_guest_libvulkan_bridge.inl
+          test -f guest/gen/thunkgen_guest_libvulkan_bridge_accessors.inl
+
+          grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libvulkan.inl | tee "$R/guest-callback-count.txt"
+          grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libvulkan_bridge.inl | tee "$R/bridge-callback-count.txt"
+          test "$(cat "$R/guest-callback-count.txt")" = 476
+          test "$(cat "$R/bridge-callback-count.txt")" = 476
+          diff -u <(grep -E '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libvulkan.inl | sed -E 's/^[[:space:]]+//') \
+                  <(grep -E '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libvulkan_bridge.inl | sed -E 's/^[[:space:]]+//') \
+                  > "$R/callback-set.diff"
+
+          awk '/^extern "C" uintptr_t fex_bridge_libvulkan_unpacker_/{n++} END{print n+0}' \
+            guest/gen/thunkgen_guest_libvulkan_bridge.inl | tee "$R/resident-unpacker-count.txt"
+          awk '/^template<> struct FEXResidentBridgeUnpacker</{n++} END{print n+0}' \
+            guest/gen/thunkgen_guest_libvulkan_bridge_accessors.inl | tee "$R/accessor-unpacker-count.txt"
+          test "$(cat "$R/resident-unpacker-count.txt")" = "$(cat "$R/accessor-unpacker-count.txt")"
+          test "$(cat "$R/resident-unpacker-count.txt")" -gt 0
+          ! grep -q 'FEXResidentBridgeCanUnpack' guest/gen/thunkgen_guest_libvulkan_bridge.inl
+          ! grep -q 'FEXResidentBridgeCanUnpack' guest/gen/thunkgen_guest_libvulkan_bridge_accessors.inl
+
+          readelf -d guest/libvulkan-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest/libfex-vulkan-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-vulkan-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          stat -c 'bridge_file_bytes=%s' guest/libfex-vulkan-bridge.so | tee "$R/bridge-size.txt"
+          sha256sum guest/gen/thunkgen_guest_libvulkan_bridge.inl \
+                    guest/gen/thunkgen_guest_libvulkan_bridge_accessors.inl \
+                    guest/libfex-vulkan-bridge.so | tee "$R/product-sha256.txt"
+          echo FIRST_CLASS_DIRECTION_AWARE_VULKAN_BUILD_OK | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunkgen-vulkan-direction-v1-${{ github.run_id }}
+          path: receipts-thunkgen-vulkan-direction-v1
+          retention-days: 30
