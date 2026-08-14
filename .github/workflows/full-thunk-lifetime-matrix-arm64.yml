@@ -182,19 +182,21 @@ jobs:
                'custom exact retire')
 
           p=Path(core); s=p.read_text()
-          old='''    if (Result->Data != (void*)GuestThunkEntrypoint) {
-              // NOTE: This may happen in Vulkan thunks if the Vulkan driver resolves two different symbols
-              //       to the same function (e.g. vkGetPhysicalDeviceFeatures2/vkGetPhysicalDeviceFeatures2KHR)
-              LogMan::Msg::EFmt("Input address for AddThunkTrampoline is already linked elsewhere");
-            }'''
-          if old not in s: raise SystemExit('duplicate block missing')
+          fn=s.find('void ContextImpl::AddThunkTrampolineIRHandler')
+          if fn < 0: raise SystemExit('thunk handler function missing')
+          start=s.find('    if (Result->Data != (void*)GuestThunkEntrypoint) {', fn)
+          if start < 0: raise SystemExit('duplicate block start missing')
+          tail='\n    }\n  }\n}\n\nvoid ContextImpl::AddForceTSOInformation'
+          close=s.find(tail, start)
+          if close < 0: raise SystemExit('duplicate block end missing')
+          end=close + len('\n    }')
           new='''    if (Result->Data != (void*)GuestThunkEntrypoint) {
               fprintf(stderr, "DIAG_DUP H=%#lx OLD=%p NEW=%#lx\\n", Entrypoint, Result->Data, GuestThunkEntrypoint);
               RemoveCustomIREntrypoint(nullptr, Entrypoint);
               AddThunkTrampolineIRHandler(Entrypoint, GuestThunkEntrypoint);
               return;
             }'''
-          p.write_text(s.replace(old,new,1))
+          p.write_text(s[:start] + new + s[end:])
           PY
           git -C src diff --check
           git -C src diff > "$R/exact-all-cache.diff"
