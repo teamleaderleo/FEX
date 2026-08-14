@@ -1,0 +1,144 @@
+name: Real Vulkan direct thunkgen bridge ARM64
+
+on:
+  push:
+    branches: [diagnostic/thunkgen-resident-bridge-output-20260814]
+    paths:
+      - .github/fieldwork/apply_thunkgen_guest_bridge_output.py
+      - .github/fieldwork/apply_vulkan_direct_thunkgen_bridge.py
+      - .github/workflows/vulkan-direct-thunkgen-bridge-runtime-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vulkan-direct-bridge:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 80
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs-direct-vulkan
+      R: ${{ github.workspace }}/receipts-direct-vulkan
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout owned FEX branch
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - name: Checkout retained Vulkan PFN probe
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-customir-retirement
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and direct-generator source transform
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config ccache \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers
+          python3 .github/fieldwork/apply_thunkgen_guest_bridge_output.py .
+          python3 .github/fieldwork/apply_vulkan_direct_thunkgen_bridge.py .
+          git diff --check
+          git diff -- ThunkLibs/Generator/interface.h ThunkLibs/Generator/main.cpp ThunkLibs/Generator/gen.cpp \
+            ThunkLibs/GuestLibs/CMakeLists.txt ThunkLibs/libvulkan/Guest.cpp ThunkLibs/libvulkan/GuestBridgeDirect.cpp \
+            > "$R/direct-generator-source.diff"
+
+      - name: Build FEX and direct-generated split Vulkan pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build-direct -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build-direct --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 300 "$R/build-host.log"; exit 1; }
+
+          cmake -S ThunkLibs/GuestLibs -B guest-direct -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build-direct/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-direct --target vulkan-guest vulkan-bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 320 "$R/build-guest.log"; exit 1; }
+
+          test -f guest-direct/gen/thunkgen_bridge_libvulkan.inl
+          test -f guest-direct/libvulkan-guest.so
+          test -f guest-direct/libfex-vulkan-bridge.so
+          grep -q 'MAKE_CALLBACK_THUNK' guest-direct/gen/thunkgen_bridge_libvulkan.inl
+          grep -q 'FOREACH_internal_SYMBOL' guest-direct/gen/thunkgen_bridge_libvulkan.inl
+          ! grep -q 'fexfn_pack_' guest-direct/gen/thunkgen_bridge_libvulkan.inl
+          readelf -d guest-direct/libvulkan-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest-direct/libfex-vulkan-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          grep -q 'NEEDED.*libfex-vulkan-bridge.so' "$R/wrapper.dynamic"
+
+      - name: Prepare amd64 rootfs and real PFN probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-direct/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp guest-direct/libfex-vulkan-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void*d,int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void*d,long mask,void*t,int*n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void*d){(void)d;static char s[]=":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 \
+            /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_pfn_unload_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/vulkan-pfn-probe"
+
+      - name: Execute real Vulkan direct-generated split matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build-direct/Bin/FEX"
+          HOST="$GITHUB_WORKSPACE/build-direct/HostLibs_64"
+          run_case(){ mode="$1"; set +e; FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s "$FEX" /opt/fex-ci/vulkan-pfn-probe "$mode" > "$R/$mode.out" 2> "$R/$mode.err"; rc=$?; set -e; echo "$rc" > "$R/$mode.exit"; echo "===== $mode rc=$rc ====="; grep -E 'PROBE |direct-generated resident host invoker|Linking address|signal|SIG' "$R/$mode.err" || true; }
+          run_case hold
+          run_case close
+          run_case reload
+          printf 'hold=%s\nclose=%s\nreload=%s\n' "$(cat "$R/hold.exit")" "$(cat "$R/close.exit")" "$(cat "$R/reload.exit")" | tee "$R/matrix.txt"
+          test "$(cat "$R/hold.exit")" = 0
+          test "$(cat "$R/close.exit")" = 0
+          test "$(cat "$R/reload.exit")" = 0
+          grep -q 'PROBE return where=after-real-close result=0' "$R/close.err"
+          grep -q 'PROBE acquired generation=2' "$R/reload.err"
+          grep -q 'same-pfn=1' "$R/reload.err"
+          grep -q 'PROBE return where=after-reload-new-pfn result=0' "$R/reload.err"
+          grep -q 'direct-generated resident host invoker' "$R/reload.err"
+          echo REAL_VULKAN_DIRECT_THUNKGEN_BRIDGE_OK
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-vulkan-direct-thunkgen-bridge-${{ github.run_id }}
+          path: receipts-direct-vulkan
+          retention-days: 30
