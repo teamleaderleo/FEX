@@ -1,0 +1,214 @@
+name: Thunk callback owner-generation lease ARM64
+
+on:
+  push:
+    branches: [ci/callback-owner-generation-lease-20260814]
+    paths:
+      - .github/fieldwork/add_callback_owner_generation_lease.py
+      - .github/workflows/thunk-callback-owner-generation-lease-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  callback-owner-generation-lease:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-owner-generation
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout retirement helper
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Checkout owner identity helper
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-owner-claim-id-20260814
+          path: owner-helper
+          fetch-depth: 1
+
+      - name: Checkout retained fieldwork fixture
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_REF }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          printf 'carrier=%s\nproduct=%s\nretirement_helper=%s\nowner_helper=%s\nfieldwork=%s\n' \
+            "$(git rev-parse HEAD)" \
+            "$(git -C src rev-parse HEAD)" \
+            "$(git -C retirement-helper rev-parse HEAD)" \
+            "$(git -C owner-helper rev-parse HEAD)" \
+            "$(git -C fieldwork rev-parse HEAD)" | tee "$R/identity.txt"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+
+          python3 .github/fieldwork/patch_callback_inflight_fixture.py /tmp/repro/fex-full-thunk-pair
+          python3 .github/fieldwork/patch_callback_selfdrain_fixture.py /tmp/repro/fex-full-thunk-pair
+          python3 .github/fieldwork/patch_callback_deferred_expectations.py /tmp/repro/fex-full-thunk-pair
+          (cd /tmp/repro/fex-full-thunk-pair && make clean && make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++) \
+            > "$R/build-fixture.log" 2>&1
+          file /tmp/repro/fex-full-thunk-pair/guest/callback_inflight | tee "$R/callback-inflight.file"
+          file /tmp/repro/fex-full-thunk-pair/guest/callback_selfdrain | tee "$R/callback-selfdrain.file"
+          grep -q 'ELF 64-bit.*x86-64' "$R/callback-inflight.file"
+          grep -q 'ELF 64-bit.*x86-64' "$R/callback-selfdrain.file"
+
+      - name: Apply retirement, OwnerID, and owner-generation lease diagnostic
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          python3 owner-helper/.github/fieldwork/add_vma_owner_id.py src
+          python3 owner-helper/.github/fieldwork/add_owner_claim_identity.py src
+          python3 .github/fieldwork/add_callback_descriptor.py src
+          python3 .github/fieldwork/add_callback_owner_generation_lease.py src
+          git -C src diff --check
+          git -C src diff > "$R/owner-generation.diff"
+
+      - name: Build candidate FEX
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute owner-generation lease matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          HOST="/tmp/repro/fex-full-thunk-pair/host"
+          run_case() {
+            name="$1"; binary="$2"
+            set +e
+            (cd "$ROOTFS/opt/fex-ci" && \
+              FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 15s \
+              "$FEX" "$binary") \
+              > "$R/$name.stdout" 2> "$R/$name.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            echo "===== $name rc=$rc ====="
+            grep -E 'INFLIGHT|SELF_DRAIN|DIAG_CALLBACK_(OWNER|DESCRIPTOR)' "$R/$name.stdout" "$R/$name.stderr" || true
+          }
+
+          set -e
+          run_case inflight /opt/fex-ci/guest/callback_inflight
+          run_case selfdrain /opt/fex-ci/guest/callback_selfdrain
+          inflight_rc="$(cat "$R/inflight.exit")"
+          selfdrain_rc="$(cat "$R/selfdrain.exit")"
+          printf 'inflight=%s\nselfdrain=%s\n' "$inflight_rc" "$selfdrain_rc" | tee "$R/matrix.txt"
+          test "$inflight_rc" = 0
+          test "$selfdrain_rc" = 0
+
+          grep -q 'INFLIGHT close-done-before-release=1 target-mapped-before-release=1 unpacker-mapped-before-release=1' "$R/inflight.stderr"
+          grep -q 'INFLIGHT mapped-after-release target=0 unpacker=0' "$R/inflight.stderr"
+          grep -q 'INFLIGHT child stale-first-callback exit=113' "$R/inflight.stderr"
+          grep -q 'INFLIGHT DEFERRED_LEASE_PASS' "$R/inflight.stderr"
+          grep -Eq 'DIAG_CALLBACK_OWNER_ACQUIRE owner=0x[1-9a-f][0-9a-f]* active=1' "$R/inflight.stderr"
+          grep -Eq 'DIAG_CALLBACK_OWNER_RETIRE owner=0x[1-9a-f][0-9a-f]* active=1 defer=1' "$R/inflight.stderr"
+          grep -q 'DIAG_CALLBACK_OWNER_DEFER_HOST_UNMAP' "$R/inflight.stderr"
+          grep -Eq 'DIAG_CALLBACK_OWNER_RELEASE owner=0x[1-9a-f][0-9a-f]* active=0 deferred=1' "$R/inflight.stderr"
+          grep -q 'DIAG_CALLBACK_OWNER_RECLAIM_DONE' "$R/inflight.stderr"
+
+          grep -q 'SELF_DRAIN returned rv=80053' "$R/selfdrain.stderr"
+          grep -q 'SELF_DRAIN survived rv=80053' "$R/selfdrain.stderr"
+          grep -Eq 'DIAG_CALLBACK_OWNER_ACQUIRE owner=0x[1-9a-f][0-9a-f]* active=1' "$R/selfdrain.stderr"
+          grep -Eq 'DIAG_CALLBACK_OWNER_RETIRE owner=0x[1-9a-f][0-9a-f]* active=1 defer=1' "$R/selfdrain.stderr"
+          grep -q 'DIAG_CALLBACK_OWNER_DEFER_HOST_UNMAP' "$R/selfdrain.stderr"
+          grep -Eq 'DIAG_CALLBACK_OWNER_RELEASE owner=0x[1-9a-f][0-9a-f]* active=0 deferred=1' "$R/selfdrain.stderr"
+          grep -q 'DIAG_CALLBACK_OWNER_RECLAIM_DONE' "$R/selfdrain.stderr"
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          rows = []
+          for name in ('inflight', 'selfdrain'):
+              text = Path(f'receipts-owner-generation/{name}.stderr').read_text()
+              creates = re.findall(r'DIAG_CALLBACK_DESCRIPTOR_CREATE .* owner=(0x[0-9a-f]+) unpacker=(0x[0-9a-f]+) target=(0x[0-9a-f]+)', text)
+              acquires = re.findall(r'DIAG_CALLBACK_OWNER_ACQUIRE owner=(0x[0-9a-f]+)', text)
+              retires = re.findall(r'DIAG_CALLBACK_OWNER_RETIRE owner=(0x[0-9a-f]+)', text)
+              if not creates or not acquires or not retires:
+                  raise SystemExit(f'{name}: missing owner-generation markers')
+              owner = creates[0][0]
+              if owner == '0x0' or owner not in acquires or owner not in retires:
+                  raise SystemExit(f'{name}: inconsistent owner identity: {creates!r} {acquires!r} {retires!r}')
+              rows.append((name, owner, creates[0][1], creates[0][2]))
+          Path('receipts-owner-generation/owner-summary.txt').write_text('\n'.join(
+              f'{name} owner={owner} unpacker={unpacker} target={target}' for name, owner, unpacker, target in rows
+          ) + '\n')
+          print('CALLBACK_OWNER_IDENTITY_OK', rows)
+          PY
+
+          echo CALLBACK_OWNER_GENERATION_LEASE_OK | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: callback-owner-generation-lease-${{ github.run_id }}
+          path: receipts-owner-generation
+          retention-days: 30
