@@ -22,6 +22,11 @@ $end_info$
 
 #include "thunkgen_guest_libvulkan.inl"
 
+extern "C" uintptr_t FEXVulkanBridgeEnumerateInstanceVersionInvoker();
+extern "C" uintptr_t FEXVulkanBridgeXSyncUnpacker();
+extern "C" uintptr_t FEXVulkanBridgeXGetVisualInfoUnpacker();
+extern "C" uintptr_t FEXVulkanBridgeXDisplayStringUnpacker();
+
 extern "C" {
 
 // Maps Vulkan API function names to the address of a guest function which is
@@ -30,6 +35,10 @@ const std::unordered_map<std::string_view, uintptr_t /* guest function address *
 #define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(GetCallerForHostFunction(name));
   std::unordered_map<std::string_view, uintptr_t> Ret;
   FOREACH_internal_SYMBOL(PAIR);
+  // This one signature is deliberately moved out of the unloadable wrapper for
+  // the generated split-bridge discriminator. Other dynamic Vulkan signatures
+  // remain wrapper-owned in this experiment.
+  Ret["vkEnumerateInstanceVersion"] = FEXVulkanBridgeEnumerateInstanceVersionInvoker();
   return Ret;
 #undef PAIR
 });
@@ -87,9 +96,9 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
 void OnInit() {
   // TODO: Load libX11 on-demand instead
   void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);
-  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
-  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
-  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+  fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), FEXVulkanBridgeXSyncUnpacker());
+  fexfn_pack_Vulkan_SetGuestXGetVisualInfo((uintptr_t)dlsym(libx11, "XGetVisualInfo"), FEXVulkanBridgeXGetVisualInfoUnpacker());
+  fexfn_pack_Vulkan_SetGuestXDisplayString((uintptr_t)dlsym(libx11, "XDisplayString"), FEXVulkanBridgeXDisplayStringUnpacker());
 }
 
 LOAD_LIB_INIT(libvulkan, OnInit)
