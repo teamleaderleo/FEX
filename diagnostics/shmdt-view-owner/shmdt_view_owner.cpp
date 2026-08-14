@@ -48,9 +48,6 @@ int Run(bool Reregister, bool InspectOnly) {
     return 4;
   }
 
-  // Mark the segment for deletion once all three views exist. The remaining
-  // attachments keep it alive for the duration of the probe without leaking a
-  // persistent SysV segment if the process exits abnormally.
   if (::shmctl(shmid, IPC_RMID, nullptr) != 0) {
     std::fprintf(stderr, "SHMDT_VIEW IPC_RMID failed errno=%d (%s)\n", errno, std::strerror(errno));
     return 5;
@@ -115,9 +112,9 @@ int Run(bool Reregister, bool InspectOnly) {
   }
 
   const int value = linked();
-  std::fprintf(stderr, "SHMDT_VIEW final H-value=%d reregister=%d expected-current-gap=333\n",
-               value, Reregister ? 1 : 0);
-  return value == 333 ? 0 : 13;
+  std::fprintf(stderr, "SHMDT_VIEW final H-value=%d reregister=%d repaired-expected=%d\n",
+               value, Reregister ? 1 : 0, Reregister ? 111 : -1);
+  return Reregister ? (value == 111 ? 0 : 13) : (value == 333 ? 0 : 14);
 }
 } // namespace
 
