@@ -1,0 +1,212 @@
+name: Agent B CUDA derived resident bridge moved reload
+
+on:
+  push:
+    branches: [ci/agent-b-cuda-derived-resident-bridge-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      R: ${{ github.workspace }}/receipts
+      HOST: ${{ github.workspace }}/host-thunks
+      SYNTH: ${{ github.workspace }}/synthetic-cuda
+      ROOT_LOCAL: ${{ github.workspace }}/rootfs-local
+      ROOT_RESIDENT: ${{ github.workspace }}/rootfs-resident
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 12
+
+      - name: Dependencies and exact-product provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST" "$SYNTH"
+          git log --oneline -12 | tee "$R/lineage.txt"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config python3 \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev binutils
+
+      - name: Build synthetic retained CUDA endpoint and native deferred control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libcuda.so.1 \
+            LinuxFieldwork/synthetic_libcuda_retained_hostnode.c -o "$SYNTH/libcuda.so.1"
+          cat > /tmp/native-deferred.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stddef.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          typedef int R; typedef void* H; typedef void(*CB)(void*);
+          typedef struct { CB fn; void* user; } P;
+          typedef R(*ADD)(H*,H,const H*,size_t,const P*); typedef R(*LAUNCH)(H,H);
+          static unsigned count; static void cb(void*u){++count;fprintf(stderr,"NATIVE_DEFERRED_CALLBACK count=%u user=%p\n",count,u);}
+          int main(void){void*l=dlopen("libcuda.so.1",RTLD_NOW|RTLD_LOCAL);if(!l)return 2;ADD a=(ADD)dlsym(l,"cuGraphAddHostNode");LAUNCH x=(LAUNCH)dlsym(l,"cuGraphLaunch");if(!a||!x)return 3;P p={cb,(void*)(uintptr_t)0x12345678};H n=0;if(a(&n,(H)0x1111,0,0,&p)||count)return 4;if(x((H)0x2222,(H)0x3333)||count!=1)return 5;return 0;}
+          EOF
+          cc -O2 -Wall -Wextra -Werror /tmp/native-deferred.c -ldl -o "$R/native-deferred"
+          LD_LIBRARY_PATH="$SYNTH" "$R/native-deferred" > "$R/native.stdout" 2> "$R/native.stderr"
+          echo $? > "$R/native.exit"
+          cat "$R/native.stderr"
+          grep -q 'SYNTH_CUDA_RETAIN' "$R/native.stderr"
+          grep -q 'SYNTH_CUDA_LAUNCH' "$R/native.stderr"
+          grep -q 'NATIVE_DEFERRED_CALLBACK count=1 user=0x12345678' "$R/native.stderr"
+
+      - name: Apply generated callback_member to CUDA
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_nested_callback_member_generator.py
+          git checkout "$PRODUCT_SHA" -- ThunkLibs/libdrm/libdrm_interface.cpp
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/libcuda/libcuda_interface.cpp'); s=p.read_text()
+          old='''template<>\nstruct fex_gen_type<CUDA_HOST_NODE_PARAMS_st> : fexgen::opaque_type {};\n'''
+          new='''template<>\nstruct fex_gen_type<CUDA_HOST_NODE_PARAMS_st> {};\ntemplate<>\nstruct fex_gen_config<&CUDA_HOST_NODE_PARAMS_st::_0> : fexgen::callback_member {};\n'''
+          assert s.count(old)==1, s.count(old); p.write_text(s.replace(old,new,1))
+          PY
+          git diff --check
+
+      - name: Build FEX host and local-unpacker CUDA wrapper
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer cuda-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 260 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libcuda-host.so "$HOST/libcuda-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest-local -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-local.log" 2>&1
+          cmake --build guest-local --target cuda-guest -- -j"$(nproc)" -v \
+            > "$R/build-local.log" 2>&1 || { tail -n 260 "$R/build-local.log"; exit 1; }
+          test -f guest-local/libcuda-guest.so
+          readelf -d guest-local/libcuda-guest.so > "$R/local.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/local.dynamic"
+
+      - name: Apply derived resident CUDA bridge and build resident variant
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_cuda_derived_bridge.py
+          git diff --check
+          git diff -- ThunkLibs/Generator ThunkLibs/include/common/GeneratorInterface.h \
+            ThunkLibs/libcuda ThunkLibs/libcuda_bridge ThunkLibs/GuestLibs/CMakeLists.txt \
+            | tee "$R/resident-product.diff"
+
+          cmake -S ThunkLibs/GuestLibs -B guest-resident -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-resident.log" 2>&1
+          cmake --build guest-resident --target cuda-guest cuda_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-resident.log" 2>&1 || { tail -n 300 "$R/build-resident.log"; exit 1; }
+          test -f guest-resident/libcuda-guest.so
+          test -f guest-resident/libfex-cuda-bridge.so
+          readelf -d guest-resident/libcuda-guest.so > "$R/resident-wrapper.dynamic"
+          readelf -d guest-resident/libfex-cuda-bridge.so > "$R/resident-bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/resident-wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-cuda-bridge.so' "$R/resident-wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/resident-bridge.dynamic"
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          n=Path('guest-resident/gen/thunkgen_guest_libcuda.inl').read_text()
+          b=Path('guest-resident/gen/thunkgen_guest_libcuda_bridge.inl').read_text()
+          pat=re.compile(r'^\s*MAKE_CALLBACK_THUNK\([^,]+,\s*(.*),\s*"',re.M)
+          ns=set(pat.findall(n)); bs=set(pat.findall(b))
+          Path('receipts/signature-count.txt').write_text(f'normal_unique_signatures={len(ns)}\nbridge_unique_signatures={len(bs)}\n')
+          print('normal_unique_signatures',len(ns)); print('bridge_unique_signatures',len(bs))
+          assert ns == bs
+          PY
+
+      - name: Prepare local and resident amd64 rootfs images
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base="$GITHUB_WORKSPACE/rootfs-base"
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir -p "$base"
+          docker export "$cid" | tar -C "$base" -xf -
+          docker rm "$cid"
+          mkdir -p "$ROOT_LOCAL" "$ROOT_RESIDENT"
+          cp -a "$base/." "$ROOT_LOCAL/"
+          cp -a "$base/." "$ROOT_RESIDENT/"
+          for root in "$ROOT_LOCAL" "$ROOT_RESIDENT"; do
+            mkdir -p "$root/usr/lib/x86_64-linux-gnu" "$root/opt/fex-ci"
+            cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$root/usr/lib/x86_64-linux-gnu/" || true
+            cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$root/usr/lib/x86_64-linux-gnu/" || true
+            x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror \
+              LinuxFieldwork/cuda_hostnode_moved_reload_probe.c -ldl \
+              -o "$root/opt/fex-ci/cuda-retained-moved-probe"
+          done
+          cp guest-local/libcuda-guest.so "$ROOT_LOCAL/usr/lib/x86_64-linux-gnu/libcuda.so.1"
+          cp guest-resident/libcuda-guest.so "$ROOT_RESIDENT/usr/lib/x86_64-linux-gnu/libcuda.so.1"
+          cp guest-resident/libfex-cuda-bridge.so "$ROOT_RESIDENT/usr/lib/x86_64-linux-gnu/libfex-cuda-bridge.so"
+
+      - name: Execute local and resident moved-reload matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          set +e
+          LD_LIBRARY_PATH="$SYNTH" FEX_ROOTFS="$ROOT_LOCAL" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/cuda-retained-moved-probe \
+            > "$R/local.stdout" 2> "$R/local.stderr"
+          local_rc=$?
+          LD_LIBRARY_PATH="$SYNTH" FEX_ROOTFS="$ROOT_RESIDENT" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/cuda-retained-moved-probe \
+            > "$R/resident.stdout" 2> "$R/resident.stderr"
+          resident_rc=$?
+          set -e
+          printf 'native_deferred=%s\nlocal_unpacker=%s\nresident_unpacker=%s\n' \
+            "$(cat "$R/native.exit")" "$local_rc" "$resident_rc" | tee "$R/final-matrix.txt"
+          printf '%s\n' '--- local ---'; cat "$R/local.stderr"
+          printf '%s\n' '--- resident ---'; cat "$R/resident.stderr"
+
+          test "$local_rc" -eq 139
+          grep -q 'MARK close1-return old_add_mapped=0' "$R/local.stderr"
+          grep -q 'GEN2 .* moved=1' "$R/local.stderr"
+          grep -q 'MARK launch2-enter retained-registration-only' "$R/local.stderr"
+          ! grep -q 'CUDA_RETAINED_CALLBACK count=1' "$R/local.stderr"
+          ! grep -q 'MARK launch2-return' "$R/local.stderr"
+
+          test "$resident_rc" -eq 0
+          grep -q 'MARK close1-return old_add_mapped=0' "$R/resident.stderr"
+          grep -q 'GEN2 .* moved=1' "$R/resident.stderr"
+          grep -q 'MARK launch2-enter retained-registration-only' "$R/resident.stderr"
+          grep -q 'CUDA_RETAINED_CALLBACK count=1 user=0x12345678' "$R/resident.stderr"
+          grep -q 'MARK launch2-return rc=0 callbacks=1' "$R/resident.stderr"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-b-cuda-derived-resident-bridge-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
