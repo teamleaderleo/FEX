@@ -40,3 +40,9 @@ jobs:
               cat "$f"
             fi
           done
+      - name: Upload decoded fixture sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: retained-thunk-fixture-${{ github.run_id }}
+          path: /tmp/repro/fex-full-thunk-pair
+          retention-days: 7
