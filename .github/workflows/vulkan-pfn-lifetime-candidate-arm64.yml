@@ -1,0 +1,192 @@
+name: Vulkan PFN lifetime candidate ARM64
+
+on:
+  push:
+    branches: [ci/vulkan-pfn-lifetime-candidate-20260814]
+    paths:
+      - .github/workflows/vulkan-pfn-lifetime-candidate-arm64.yml
+      - .github/fieldwork/add_revoked_h_state.py
+      - .github/fieldwork/merge_callback_tombstone.py
+      - .github/fieldwork/fix_retirement_lock_order.py
+      - .github/fieldwork/promote_multiowner_claims.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-vulkan-pfn:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact FEX source under test
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout exact-retirement helper
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Checkout retained Vulkan PFN probe
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-customir-retirement
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config ccache \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers
+          printf 'fex=%s\ncarrier=%s\nprobe=%s\n' \
+            "$(git -C src rev-parse HEAD)" "$GITHUB_SHA" "$(git -C fieldwork rev-parse HEAD)" \
+            > "$R/identity.txt"
+
+      - name: Apply lock-clean revoked-H lifetime candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/merge_callback_tombstone.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          git -C src diff --check
+          git -C src diff > "$R/lifetime-candidate.diff"
+          grep -R -n -E 'DIAG_MT|DIAG_MULTI|DIAG_INTEGRATED|DIAG_LOCKED|DIAG_REVOKED_H' \
+            src/FEXCore src/Source/Tools/LinuxEmulation | head -260 > "$R/instrumentation-sites.txt" || true
+
+      - name: Build FEX and real Vulkan thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" \
+            > "$R/build-host.log" 2>&1
+          cmake -S src/ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" \
+            > "$R/build-guest.log" 2>&1
+          test -x src/build/Bin/FEX
+          test -x src/build/Bin/FEXServer
+          test -f src/build/HostLibs_64/libvulkan-host.so
+          test -f guest-build/libvulkan-guest.so
+          readelf -d guest-build/libvulkan-guest.so > "$R/vulkan-guest.dynamic.txt"
+
+      - name: Prepare amd64 rootfs, x86 X11 bootstrap, and Vulkan PFN probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_pfn_unload_probe.c \
+            -ldl -o "$ROOTFS/opt/fex-ci/vulkan-pfn-probe"
+          file "$ROOTFS/opt/fex-ci/vulkan-pfn-probe" > "$R/probe.file"
+          file "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6" > "$R/x11-stub.file"
+
+      - name: Execute real Vulkan PFN lifecycle matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          HOST="$GITHUB_WORKSPACE/src/build/HostLibs_64"
+
+          run_case() {
+            mode="$1"
+            set +e
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+              "$FEX" /opt/fex-ci/vulkan-pfn-probe "$mode" \
+              > "$R/$mode.stdout" 2> "$R/$mode.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$mode.exit"
+            echo "===== $mode rc=$rc ====="
+            grep -E 'PROBE |DIAG_REVOKED_H|DIAG_LOCKED|DIAG_MULTI|DIAG_INTEGRATED' \
+              "$R/$mode.stdout" "$R/$mode.stderr" || true
+          }
+
+          run_case hold
+          run_case close
+          run_case reload
+
+          printf 'hold=%s\nclose=%s\nreload=%s\n' \
+            "$(cat "$R/hold.exit")" "$(cat "$R/close.exit")" "$(cat "$R/reload.exit")" \
+            | tee "$R/matrix.txt"
+
+          test "$(cat "$R/hold.exit")" = 0
+          test "$(cat "$R/close.exit")" = 139
+          test "$(cat "$R/reload.exit")" = 0
+
+          grep -q 'PROBE return where=after-close-with-extra-ref result=0' "$R/hold.stderr"
+          grep -q 'PROBE after-close' "$R/close.stderr"
+          grep -q 'DIAG_REVOKED_H_COMPILE' "$R/close.stderr"
+          grep -q 'PROBE reserved-old-generation-ranges=' "$R/reload.stderr"
+          grep -q 'PROBE acquired generation=2' "$R/reload.stderr"
+          grep -q 'PROBE return where=after-reload-new-pfn result=0' "$R/reload.stderr"
+          grep -q 'DIAG_REVOKED_H_ACTIVATE' "$R/reload.stderr"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-pfn-lifetime-candidate-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
