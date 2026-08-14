@@ -94,9 +94,11 @@ jobs:
         run: |
           set -euxo pipefail
           normal_inl=guest-build/gen/thunkgen_guest_libdrm.inl
-          host_inl=build/ThunkLibs/libdrm/thunkgen_host_libdrm.inl
+          host_inl="$(find build -name 'thunkgen_host_libdrm.inl' -print -quit)"
           bridge_inl=guest-build/gen/thunkgen_guest_libdrm_bridge.inl
           accessors=guest-build/gen/thunkgen_guest_libdrm_bridge_accessors.inl
+          test -n "$host_inl"
+          printf 'host_inl=%s\n' "$host_inl" | tee "$R/host-inl-path.txt"
           normal_count="$(grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' "$normal_inl")"
           bridge_count="$(grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' "$bridge_inl")"
           printf 'normal_callback_signatures=%s\nbridge_callback_signatures=%s\n' "$normal_count" "$bridge_count" | tee "$R/signature-counts.txt"
