@@ -1,4 +1,4 @@
-name: Agent C materialize minimal callback routing fix
+name: Agent C amend minimal callback routing fix
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  materialize:
+  amend:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +20,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Add only missing custom callback routes
+      - name: Fix source indentation and amend commit
         shell: bash
         run: |
           set -euxo pipefail
@@ -28,27 +28,29 @@ jobs:
           from pathlib import Path
           p = Path('ThunkLibs/libvulkan/Host.cpp')
           s = p.read_text()
-          anchor = '  } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {'
-          insertion = '''  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {
-            return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;
+          bad = '''  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {
+          return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;
           } else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {
-            return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;
+          return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;
           } else if (a_1 == "vkCreateDebugUtilsMessengerEXT"sv) {
-            return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugUtilsMessengerEXT;
+          return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugUtilsMessengerEXT;
           } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {'''
-          if s.count(anchor) != 1:
-              raise SystemExit(f'expected one routing anchor, found {s.count(anchor)}')
-          p.write_text(s.replace(anchor, insertion, 1))
+          # YAML removes the common block indentation above, yielding exactly the malformed source block.
+          good = '''  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {
+              return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;
+            } else if (a_1 == "vkDestroyDebugReportCallbackEXT"sv) {
+              return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkDestroyDebugReportCallbackEXT;
+            } else if (a_1 == "vkCreateDebugUtilsMessengerEXT"sv) {
+              return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugUtilsMessengerEXT;
+            } else if (a_1 == "vkAcquireXlibDisplayEXT"sv) {'''
+          if s.count(bad) != 1:
+              raise SystemExit(f'expected one malformed callback block, found {s.count(bad)}')
+          p.write_text(s.replace(bad, good, 1))
           PY
           git diff --check
           git diff -- ThunkLibs/libvulkan/Host.cpp
-
-      - name: Commit source-only fix to clean branch
-        shell: bash
-        run: |
-          set -euxo pipefail
           git config user.name 'Agent C internal fieldwork'
           git config user.email 'actions@users.noreply.github.com'
           git add ThunkLibs/libvulkan/Host.cpp
-          git commit -m 'ThunkLibs/vulkan: route callback custom implementations'
-          git push origin HEAD:fix/vulkan-callback-proc-routing
+          git commit --amend --no-edit
+          git push --force-with-lease origin HEAD:fix/vulkan-callback-proc-routing
