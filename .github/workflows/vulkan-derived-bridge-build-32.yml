@@ -17,11 +17,12 @@ jobs:
     env:
       R: ${{ github.workspace }}/receipts-bridge-32
       DEBIAN_FRONTEND: noninteractive
+      PROTOTYPE_SHA: 3288618bdb08cd46b1920d5772e376701e728f70
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 3
+          fetch-depth: 0
 
       - name: Dependencies and source identity
         shell: bash
@@ -36,9 +37,10 @@ jobs:
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxrandr-dev libxrender-dev binutils
           git rev-parse HEAD | tee "$R/carrier-sha.txt"
-          prototype="$(git rev-parse HEAD^^)"
-          printf '%s\n' "$prototype" | tee "$R/prototype-base.txt"
-          test "$prototype" = 3288618bdb08cd46b1920d5772e376701e728f70
+          git merge-base --is-ancestor "$PROTOTYPE_SHA" HEAD
+          git diff --name-only "$PROTOTYPE_SHA" HEAD -- ThunkLibs FEXCore Source | tee "$R/product-source-diff.txt"
+          test ! -s "$R/product-source-diff.txt"
+          printf '%s\n' "$PROTOTYPE_SHA" | tee "$R/prototype-base.txt"
 
       - name: Build thunk generator
         shell: bash
