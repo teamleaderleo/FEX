@@ -5,6 +5,7 @@ on:
     branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
     paths:
       - LINUX_FIELDWORK_INSTANCE_ALLOCATOR_SUPPRESS.py
+      - LINUX_FIELDWORK_INSTANCE_ALLOCATOR_DYNAMIC_PROBE.c
       - .github/workflows/linux-fieldwork-instance-allocator-suppress.yml
 permissions:
   contents: read
@@ -70,23 +71,34 @@ jobs:
           PROBE=fieldwork/investigations/fex-vulkan-thunk-lifecycle/agent-b/vk_allocator_instance_probe.c
           cc -O2 -Wall -Wextra -Werror "$PROBE" -ldl -o receipts/native-probe
           x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror "$PROBE" -ldl -o rootfs-amd64/opt/fex-ci/allocator-instance-probe
-      - name: Execute A/B
+          cc -std=c11 -O2 -Wall -Wextra -Werror -Ifieldwork carrier/LINUX_FIELDWORK_INSTANCE_ALLOCATOR_DYNAMIC_PROBE.c -ldl -o receipts/native-dynamic-probe
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror -Ifieldwork carrier/LINUX_FIELDWORK_INSTANCE_ALLOCATOR_DYNAMIC_PROBE.c -ldl -o rootfs-amd64/opt/fex-ci/allocator-instance-dynamic-probe
+      - name: Execute direct and dynamic matrix
         run: |
           set -uxo pipefail
           ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
           set +e
           VK_DRIVER_FILES="$ICD" timeout 30s receipts/native-probe >receipts/native.stdout 2>receipts/native.stderr
           native_rc=$?
+          VK_DRIVER_FILES="$ICD" timeout 30s receipts/native-dynamic-probe >receipts/native-dynamic.stdout 2>receipts/native-dynamic.stderr
+          native_dynamic_rc=$?
           VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" timeout 30s product/build/Bin/FEX /opt/fex-ci/allocator-instance-probe >receipts/fex.stdout 2>receipts/fex.stderr
           fex_rc=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" timeout 30s product/build/Bin/FEX /opt/fex-ci/allocator-instance-dynamic-probe >receipts/fex-dynamic.stdout 2>receipts/fex-dynamic.stderr
+          fex_dynamic_rc=$?
           set -e
-          printf 'native=%s\nfex=%s\n' "$native_rc" "$fex_rc" | tee receipts/final-matrix.txt
-          cat receipts/native.stderr receipts/fex.stderr
-          # Safety discriminator: candidate should return from destroy instead of SIGILL.
+          printf 'native=%s\nnative_dynamic=%s\nfex_direct=%s\nfex_dynamic=%s\n' "$native_rc" "$native_dynamic_rc" "$fex_rc" "$fex_dynamic_rc" | tee receipts/final-matrix.txt
+          printf '%s\n' '--- native direct ---'; cat receipts/native.stderr
+          printf '%s\n' '--- native dynamic ---'; cat receipts/native-dynamic.stderr
+          printf '%s\n' '--- FEX direct ---'; cat receipts/fex.stderr
+          printf '%s\n' '--- FEX dynamic ---'; cat receipts/fex-dynamic.stderr
+          # Established controls: native direct/dynamic honor the allocator; FEX direct suppression returns safely but is lossy.
           test "$native_rc" -eq 0
+          test "$native_dynamic_rc" -eq 0
           test "$fex_rc" -eq 10
           grep -q 'MARK destroy-return' receipts/fex.stderr
           grep -q 'FAIL allocator callbacks not observed' receipts/fex.stderr
+          # fex_dynamic_rc is intentionally observational: it distinguishes whether GIPA reaches the new custom wrapper.
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
