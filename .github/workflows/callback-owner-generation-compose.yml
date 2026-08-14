@@ -1,0 +1,58 @@
+name: Callback owner-generation patch composition
+
+on:
+  push:
+    branches: [ci/callback-owner-generation-lease-20260814]
+    paths:
+      - .github/workflows/callback-owner-generation-compose.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compose:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+      - name: Checkout exact FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: 71afe476751deac24adabd1adb575fd2337b6e0a
+          path: src
+          fetch-depth: 1
+      - name: Checkout retirement helper
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+      - name: Checkout owner helper
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-owner-claim-id-20260814
+          path: owner-helper
+          fetch-depth: 1
+      - name: Apply retirement base
+        run: python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+      - name: Apply multiowner promotion
+        run: python3 .github/fieldwork/promote_multiowner_claims.py src
+      - name: Apply retirement lock-order fix
+        run: python3 .github/fieldwork/fix_retirement_lock_order.py src
+      - name: Apply revoked-H state
+        run: python3 .github/fieldwork/add_revoked_h_state.py src
+      - name: Apply VMA OwnerID
+        run: python3 owner-helper/.github/fieldwork/add_vma_owner_id.py src
+      - name: Apply owner-aware retained claims
+        run: python3 owner-helper/.github/fieldwork/add_owner_claim_identity.py src
+      - name: Apply callback descriptor
+        run: python3 .github/fieldwork/add_callback_descriptor.py src
+      - name: Apply callback owner-generation lease
+        run: python3 .github/fieldwork/add_callback_owner_generation_lease.py src
+      - name: Diff check
+        run: git -C src diff --check
