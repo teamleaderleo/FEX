@@ -131,16 +131,35 @@ jobs:
             return count;
           }
 
-          static int collect_vulkan_ranges(struct range *out, int cap) {
+          static int collect_wrapper_ranges(void *needle, struct range *out, int cap) {
             FILE *f = fopen("/proc/self/maps", "r");
             char line[1024];
-            int n = 0;
+            char target_path[512] = {0};
+            uintptr_t x = (uintptr_t)needle;
             if (!f) return -1;
+
             while (fgets(line, sizeof(line), f)) {
               unsigned long a, b;
               char path[512] = {0};
               int fields = sscanf(line, "%lx-%lx %*s %*s %*s %*s %511s", &a, &b, path);
-              if (fields == 3 && strstr(path, "libvulkan.so.1") && n < cap) {
+              if (fields == 3 && x >= a && x < b) {
+                snprintf(target_path, sizeof(target_path), "%s", path);
+                break;
+              }
+            }
+            if (!target_path[0]) {
+              fclose(f);
+              return -2;
+            }
+
+            fprintf(stderr, "WRAPPER_PATH %s\n", target_path);
+            rewind(f);
+            int n = 0;
+            while (fgets(line, sizeof(line), f)) {
+              unsigned long a, b;
+              char path[512] = {0};
+              int fields = sscanf(line, "%lx-%lx %*s %*s %*s %*s %511s", &a, &b, path);
+              if (fields == 3 && strcmp(path, target_path) == 0 && n < cap) {
                 out[n++] = (struct range){(uintptr_t)a, (uintptr_t)b};
               }
             }
@@ -179,7 +198,7 @@ jobs:
             ENUMVER p1 = (ENUMVER)g1(0, "vkEnumerateInstanceVersion");
             uint32_t ver1 = 0, stale_after_close = 0, ver2 = 0;
             if (!g1 || !p1 || p1(&ver1) != 0) return 3;
-            int nr = collect_vulkan_ranges(old_ranges, 16);
+            int nr = collect_wrapper_ranges((void*)g1, old_ranges, 16);
             if (nr <= 0) return 4;
             fprintf(stderr,
                     "GEN1 gipa=%p H=%p version=%u ranges=%d bridge_maps=%d\n",
