@@ -82,106 +82,76 @@ void* WorkerMain(void*) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
   setvbuf(stderr, nullptr, _IONBF, 0);
+  const bool Reregister = argc == 2 && std::strcmp(argv[1], "--reregister") == 0;
+  if (argc > 2 || (argc == 2 && !Reregister)) {
+    return 64;
+  }
+
   (void)::unlink(ArmPath);
   (void)::unlink(TargetPath);
   (void)::unlink(SelectedPath);
   (void)::unlink(ResumePath);
 
   const long PageSizeLong = ::sysconf(_SC_PAGESIZE);
-  if (PageSizeLong <= 0) {
-    return 2;
-  }
+  if (PageSizeLong <= 0) return 2;
   const size_t PageSize = static_cast<size_t>(PageSizeLong);
 
   void* Target = ::mmap(nullptr, PageSize, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (Target == MAP_FAILED) {
-    std::fprintf(stderr, "INFLIGHT initial mmap failed errno=%d (%s)\n", errno, std::strerror(errno));
-    return 3;
-  }
+  if (Target == MAP_FAILED) return 3;
   EmitReturn(Target, 111);
-  if (::mprotect(Target, PageSize, PROT_READ | PROT_EXEC) != 0) {
-    std::fprintf(stderr, "INFLIGHT initial mprotect failed errno=%d (%s)\n", errno, std::strerror(errno));
-    return 4;
-  }
+  if (::mprotect(Target, PageSize, PROT_READ | PROT_EXEC) != 0) return 4;
 
   LinkAddressToFunction(SyntheticH, reinterpret_cast<uintptr_t>(Target));
   auto Linked = reinterpret_cast<Fn>(SyntheticH);
   const int Warm = Linked();
-  std::fprintf(stderr, "INFLIGHT warm H=%p T=%p value=%d\n",
-               reinterpret_cast<void*>(SyntheticH), Target, Warm);
-  if (Warm != 111) {
-    return 5;
-  }
+  std::fprintf(stderr, "INFLIGHT warm H=%p T=%p value=%d reregister=%d\n",
+               reinterpret_cast<void*>(SyntheticH), Target, Warm, Reregister ? 1 : 0);
+  if (Warm != 111) return 5;
 
-  // Break any direct H->T exit link established by the warm call while keeping
-  // the same VMA generation. This forces the next old-H redirect through
-  // ExitFunctionLink(T), where the deterministic pre-selection barrier lives.
-  if (::mprotect(Target, PageSize, PROT_READ | PROT_WRITE) != 0) {
-    std::fprintf(stderr, "INFLIGHT relink-reset RW mprotect failed errno=%d (%s)\n", errno, std::strerror(errno));
-    return 6;
-  }
+  // Break the warmed direct H->T link while preserving generation 1.
+  if (::mprotect(Target, PageSize, PROT_READ | PROT_WRITE) != 0) return 6;
   EmitReturn(Target, 111);
-  if (::mprotect(Target, PageSize, PROT_READ | PROT_EXEC) != 0) {
-    std::fprintf(stderr, "INFLIGHT relink-reset RX mprotect failed errno=%d (%s)\n", errno, std::strerror(errno));
-    return 7;
-  }
+  if (::mprotect(Target, PageSize, PROT_READ | PROT_EXEC) != 0) return 7;
   std::fprintf(stderr, "INFLIGHT relink-reset H=%p T=%p sentinel=111 owner-preserved\n",
                reinterpret_cast<void*>(SyntheticH), Target);
 
-  if (!PublishTarget(reinterpret_cast<uintptr_t>(Target))) {
-    return 8;
-  }
-  if (!Touch(ArmPath)) {
-    return 9;
-  }
+  if (!PublishTarget(reinterpret_cast<uintptr_t>(Target))) return 8;
+  if (!Touch(ArmPath)) return 9;
   std::fprintf(stderr, "INFLIGHT armed H=%p T=%p stage=before-target-selection\n",
                reinterpret_cast<void*>(SyntheticH), Target);
 
   pthread_t Worker {};
-  if (::pthread_create(&Worker, nullptr, WorkerMain, nullptr) != 0) {
-    std::fprintf(stderr, "INFLIGHT pthread_create failed\n");
-    return 10;
-  }
-
-  if (!WaitFor(SelectedPath)) {
-    return 11;
-  }
+  if (::pthread_create(&Worker, nullptr, WorkerMain, nullptr) != 0) return 10;
+  if (!WaitFor(SelectedPath)) return 11;
   std::fprintf(stderr, "INFLIGHT old-H-redirect-pending H=%p T=%p\n",
                reinterpret_cast<void*>(SyntheticH), Target);
 
   void* Replacement = ::mmap(Target, PageSize, PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-  if (Replacement == MAP_FAILED || Replacement != Target) {
-    std::fprintf(stderr, "INFLIGHT MAP_FIXED failed result=%p errno=%d (%s)\n",
-                 Replacement, errno, std::strerror(errno));
-    return 12;
-  }
+  if (Replacement == MAP_FAILED || Replacement != Target) return 12;
   EmitReturn(Target, 222);
-  if (::mprotect(Target, PageSize, PROT_READ | PROT_EXEC) != 0) {
-    std::fprintf(stderr, "INFLIGHT replacement mprotect failed errno=%d (%s)\n", errno, std::strerror(errno));
-    return 13;
-  }
-  std::fprintf(stderr, "INFLIGHT replacement-committed H=%p T=%p generation=2 sentinel=222\n",
-               reinterpret_cast<void*>(SyntheticH), Target);
+  if (::mprotect(Target, PageSize, PROT_READ | PROT_EXEC) != 0) return 13;
+  std::fprintf(stderr, "INFLIGHT replacement-committed H=%p T=%p generation=2 sentinel=222 reregister=%d\n",
+               reinterpret_cast<void*>(SyntheticH), Target, Reregister ? 1 : 0);
 
-  if (!Touch(ResumePath)) {
-    return 14;
+  if (Reregister) {
+    LinkAddressToFunction(SyntheticH, reinterpret_cast<uintptr_t>(Target));
+    std::fprintf(stderr, "INFLIGHT reregistered H=%p T=%p generation=2\n",
+                 reinterpret_cast<void*>(SyntheticH), Target);
   }
-  if (::pthread_join(Worker, nullptr) != 0) {
-    std::fprintf(stderr, "INFLIGHT pthread_join failed\n");
-    return 15;
-  }
+
+  if (!Touch(ResumePath)) return 14;
+  if (::pthread_join(Worker, nullptr) != 0) return 15;
 
   const int Result = WorkerValue.load(std::memory_order_acquire);
-  std::fprintf(stderr, "INFLIGHT final worker-value=%d reregister=0\n", Result);
+  std::fprintf(stderr, "INFLIGHT final worker-value=%d reregister=%d\n", Result, Reregister ? 1 : 0);
 
   (void)::unlink(ArmPath);
   (void)::unlink(TargetPath);
   (void)::unlink(SelectedPath);
   (void)::unlink(ResumePath);
-
   return Result == 222 ? 0 : 16;
 }
