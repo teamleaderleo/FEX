@@ -1,0 +1,94 @@
+name: Vulkan allocator trampoline mediation experiment
+on:
+  workflow_dispatch:
+  push:
+    branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
+    paths:
+      - LINUX_FIELDWORK_ALLOCATOR_TRAMPOLINE.py
+      - LINUX_FIELDWORK_ALLOCATOR_BUFFER_PROBE.c
+      - .github/workflows/linux-fieldwork-allocator-trampoline.yml
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      PRODUCT_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: carrier
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers
+      - name: Apply allocator trampoline mediation experiment
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          python3 ../carrier/LINUX_FIELDWORK_ALLOCATOR_TRAMPOLINE.py
+          git diff --check
+          git diff -- ThunkLibs/libvulkan/libvulkan_interface.cpp ThunkLibs/libvulkan/Host.cpp ThunkLibs/libvulkan/Guest.cpp | tee /tmp/trampoline.diff
+      - name: Build FEX and Vulkan thunks
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_x86_64.cmake" -DFEX_PROJECT_SOURCE_DIR="$PWD" -DGENERATOR_EXE="$PWD/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)"
+      - name: Prepare rootfs and probe
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir rootfs-amd64
+          docker export "$cid" | tar -C rootfs-amd64 -xf -
+          docker rm "$cid"
+          mkdir -p rootfs-amd64/usr/lib/x86_64-linux-gnu rootfs-amd64/opt/fex-ci host-thunks receipts
+          cp product/guest-build/libvulkan-guest.so rootfs-amd64/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+          cp product/build/HostLibs_64/libvulkan-host.so host-thunks/libvulkan-host.so
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o rootfs-amd64/usr/lib/x86_64-linux-gnu/libX11.so.6
+          cc -std=c11 -O2 -Wall -Wextra -Werror carrier/LINUX_FIELDWORK_ALLOCATOR_BUFFER_PROBE.c -ldl -lvulkan -o receipts/native-probe
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror carrier/LINUX_FIELDWORK_ALLOCATOR_BUFFER_PROBE.c -ldl -o rootfs-amd64/opt/fex-ci/allocator-buffer-probe
+      - name: Execute native and FEX fidelity discriminator
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$ICD" timeout 30s receipts/native-probe >receipts/native.stdout 2>receipts/native.stderr
+          native_rc=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" timeout 30s product/build/Bin/FEX /opt/fex-ci/allocator-buffer-probe >receipts/fex.stdout 2>receipts/fex.stderr
+          fex_rc=$?
+          set -e
+          printf 'native=%s\nfex=%s\n' "$native_rc" "$fex_rc" | tee receipts/final-matrix.txt
+          printf '%s\n' '--- native ---'; cat receipts/native.stderr
+          printf '%s\n' '--- FEX ---'; cat receipts/fex.stderr
+          test "$native_rc" -eq 0
+          test "$fex_rc" -eq 0
+          grep -q 'PASS allocator callbacks observed' receipts/native.stderr
+          grep -q 'PASS allocator callbacks observed' receipts/fex.stderr
+          grep -q 'MARK create-buffer-return result=0' receipts/fex.stderr
+          grep -q 'MARK destroy-buffer-return' receipts/fex.stderr
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allocator-trampoline-${{ github.run_id }}
+          path: |
+            receipts
+            /tmp/trampoline.diff
+          retention-days: 30
