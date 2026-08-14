@@ -1,0 +1,135 @@
+name: MREMAP_FIXED owner reuse ARM64
+
+on:
+  push:
+    branches: [ci/mremap-fixed-owner-reuse-20260814]
+    paths:
+      - diagnostics/mremap-fixed-owner-reuse/**
+      - .github/workflows/mremap-fixed-owner-reuse-arm64.yml
+      - .github/fieldwork/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mremap-fixed-owner-reuse-20260814
+  cancel-in-progress: true
+
+jobs:
+  mremap-reuse:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-mremap
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang lld pkg-config libcap-dev gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'carrier=%s\nfex=%s\nhelper=%s\n' "$GITHUB_SHA" "$(git -C src rev-parse HEAD)" "$(git -C retirement-helper rev-parse HEAD)" > "$R/identity.txt"
+
+      - name: Apply owner-aware candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/merge_callback_tombstone.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          python3 .github/fieldwork/pre_map_fixed_retire.py src
+          python3 .github/fieldwork/add_map_fixed_rollback_transaction.py src
+          python3 .github/fieldwork/add_vma_owner_id.py src
+          python3 .github/fieldwork/add_owner_claim_identity.py src
+          git -C src diff --check
+          git -C src diff > "$R/candidate.diff"
+
+      - name: Build FEX and probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang CXX=clang++ cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON \
+            -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" > "$R/build.log" 2>&1
+          x86_64-linux-gnu-g++ -std=c++20 -O2 -g -Wall -Wextra -Wpedantic -Werror \
+            -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" diagnostics/mremap-fixed-owner-reuse/mremap_fixed_owner_reuse.cpp \
+            -o "$R/mremap-fixed-owner-reuse"
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci" "$ROOTFS/usr/lib/x86_64-linux-gnu"
+          cp "$R/mremap-fixed-owner-reuse" "$ROOTFS/opt/fex-ci/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+
+      - name: Execute no-reregister and explicit-reregister cases
+        shell: bash
+        run: |
+          set -uxo pipefail
+          run_case() {
+            name="$1"; shift
+            set +e
+            FEX_ROOTFS="$ROOTFS" timeout 20s "$GITHUB_WORKSPACE/src/build/Bin/FEX" /opt/fex-ci/mremap-fixed-owner-reuse "$@" \
+              > "$R/$name.stdout" 2> "$R/$name.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            echo "===== $name rc=$rc ====="
+            grep -E 'MREMAP_REUSE|DIAG_OWNER|DIAG_MULTI|DIAG_REVOKED|DIAG_MT_' "$R/$name.stderr" || true
+          }
+          set -e
+          run_case no-reregister
+          run_case reregister --reregister
+          printf 'no-reregister=%s\nreregister=%s\n' "$(cat "$R/no-reregister.exit")" "$(cat "$R/reregister.exit")" | tee "$R/matrix.txt"
+
+      - name: Assert current destination-owner gap
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(cat "$R/no-reregister.exit")" = 0
+          test "$(cat "$R/reregister.exit")" = 0
+          grep -q 'MREMAP_REUSE final value=222 reregister=0' "$R/no-reregister.stderr"
+          grep -q 'MREMAP_REUSE final value=222 reregister=1' "$R/reregister.stderr"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mremap-fixed-owner-reuse-${{ github.run_id }}
+          path: receipts-mremap
+          retention-days: 30
