@@ -210,19 +210,17 @@ def main() -> None:
     branch = root / "FEXCore/Source/Interface/Core/JIT/BranchOps.cpp"
     repl(
         branch,
-        '''  uint64_t NewRIP {};
-  if (IsInlineConstant(Op->NewRIP, &NewRIP)) {
-    if (Op->Hint == IR::BranchHint::Return) {''',
-        '''  uint64_t NewRIP {};
-  if (IsInlineConstant(Op->NewRIP, &NewRIP)) {
-    if (Op->Hint == IR::BranchHint::ThunkOwnerCheck) {
-      uint64_t OwnerID {};
-      LOGMAN_THROW_A_FMT(IsInlineConstant(Op->CallReturnAddress, &OwnerID) && OwnerID,
-                         "ThunkOwnerCheck requires an inline owner token");
-      EmitLinkedThunkOwnerBranch(NewRIP, Entry, OwnerID);
-      return;
-    }
-    if (Op->Hint == IR::BranchHint::Return) {''',
+        '''      EmitLinkedBranch(NewRIP, Op->Hint == IR::BranchHint::Call);
+      (void)Bind(&l_CallReturn);''',
+        '''      if (Op->Hint == IR::BranchHint::ThunkOwnerCheck) {
+        uint64_t OwnerID {};
+        LOGMAN_THROW_A_FMT(IsInlineConstant(Op->CallReturnAddress, &OwnerID) && OwnerID,
+                           "ThunkOwnerCheck requires an inline owner token");
+        EmitLinkedThunkOwnerBranch(NewRIP, Entry, OwnerID);
+      } else {
+        EmitLinkedBranch(NewRIP, Op->Hint == IR::BranchHint::Call);
+      }
+      (void)Bind(&l_CallReturn);''',
         'lower owner-aware exit',
     )
 
