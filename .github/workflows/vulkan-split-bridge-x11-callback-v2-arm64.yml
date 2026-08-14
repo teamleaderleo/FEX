@@ -1,0 +1,118 @@
+name: Real Vulkan split bridge X11 callback v2 ARM64
+
+on:
+  push:
+    branches: [ci/thunk-callback-descriptor-20260814]
+    paths:
+      - .github/fieldwork/apply_vulkan_split_bridge.py
+      - .github/fieldwork/split_vulkan_x11_probe.c
+      - .github/workflows/vulkan-split-bridge-x11-callback-v2-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vulkan-split-x11:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - name: Dependencies, native control, transform
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers vulkan-tools xvfb x11-utils binutils
+          LVP="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP"
+          echo "$LVP" > "$R/lvp.txt"
+          VK_DRIVER_FILES="$LVP" vulkaninfo --summary > "$R/native-vulkaninfo.out" 2> "$R/native-vulkaninfo.err"
+          python3 .github/fieldwork/apply_vulkan_split_bridge.py src
+          git -C src diff --check
+      - name: Build stock FEX and split Vulkan pair
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" > "$R/build-host.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+          cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest vulkan-bridge-guest -- -j"$(nproc)" > "$R/build-guest.log" 2>&1
+          readelf -d guest/libvulkan-guest.so > "$R/wrapper.dynamic.txt"
+          readelf -d guest/libfex-vulkan-bridge.so > "$R/bridge.dynamic.txt"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic.txt"
+      - name: Rootfs and exact-path X11 probe
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp guest/libfex-vulkan-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          #include <stdio.h>
+          int XSync(void *d,int x){fprintf(stderr,"GUEST_XSYNC display=%p discard=%d\n",d,x);return 0;}
+          void *XGetVisualInfo(void *d,long m,void *t,int *n){fprintf(stderr,"GUEST_XGETVISUALINFO display=%p mask=%ld\n",d,m);(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){fprintf(stderr,"GUEST_XDISPLAYSTRING display=%p\n",d);return ":99";}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror .github/fieldwork/split_vulkan_x11_probe.c -ldl -o "$ROOTFS/opt/fex-ci/x11probe"
+      - name: Execute callbacks after exact guest-wrapper unload
+        run: |
+          set -euxo pipefail
+          Xvfb :99 -screen 0 640x480x24 > "$R/xvfb.log" 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 50); do DISPLAY=:99 xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+          DISPLAY=:99 xdpyinfo >/dev/null
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP="$(cat "$R/lvp.txt")"
+          set +e
+          DISPLAY=:99 VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" "$FEX" /opt/fex-ci/x11probe > "$R/x11probe.out" 2> "$R/x11probe.err"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/x11probe.exit"
+          cat "$R/x11probe.err"
+          test "$rc" = 0
+          grep -q 'MAPS_AFTER exact_wrapper=0 bridge=' "$R/x11probe.err"
+          after_line="$(grep -n 'AFTER_DLCLOSE_BEGIN_CALLBACK_TEST' "$R/x11probe.err" | head -n1 | cut -d: -f1)"
+          tail -n "+$after_line" "$R/x11probe.err" > "$R/after-close-callbacks.txt"
+          grep -q 'GUEST_XSYNC display=0x12346000' "$R/after-close-callbacks.txt"
+          grep -q 'GUEST_XDISPLAYSTRING display=0x12346000' "$R/after-close-callbacks.txt"
+          grep -q 'REAL_SPLIT_VULKAN_X11_CALLBACK_OK' "$R/after-close-callbacks.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-vulkan-split-x11-callback-v2-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
