@@ -36,6 +36,15 @@ def write_bridge(path: Path, callbacks, prefix: str):
         "struct FEXResidentBridgeCanUnpack<Result(Args...)>",
         "  : std::bool_constant<(sizeof...(Args) <= 19 || sizeof...(Args) == 24)> {};",
         "",
+        "template<typename Signature>",
+        "static uintptr_t FEXResidentBridgeUnpackerAddress() {",
+        "  if constexpr (FEXResidentBridgeCanUnpack<Signature>::value) {",
+        "    return reinterpret_cast<uintptr_t>(CallbackUnpack<Signature>::Unpack);",
+        "  } else {",
+        "    return 0;",
+        "  }",
+        "}",
+        "",
     ]
     for index, signature, hash_bytes in callbacks:
         lines.append(f"// {signature}")
@@ -49,11 +58,7 @@ def write_bridge(path: Path, callbacks, prefix: str):
             f"  return reinterpret_cast<uintptr_t>(GetCallerForHostFunction((fex_bridge_signature_{index}*)nullptr));",
             "}",
             f'extern "C" uintptr_t fex_bridge_{prefix}_unpacker_{index}() {{',
-            f"  if constexpr (FEXResidentBridgeCanUnpack<fex_bridge_signature_{index}>::value) {{",
-            f"    return reinterpret_cast<uintptr_t>(CallbackUnpack<fex_bridge_signature_{index}>::Unpack);",
-            "  } else {",
-            "    return 0;",
-            "  }",
+            f"  return FEXResidentBridgeUnpackerAddress<fex_bridge_signature_{index}>();",
             "}",
             "",
         ]
