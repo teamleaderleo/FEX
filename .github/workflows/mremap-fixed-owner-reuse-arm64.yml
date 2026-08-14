@@ -117,14 +117,17 @@ jobs:
           run_case reregister --reregister
           printf 'no-reregister=%s\nreregister=%s\n' "$(cat "$R/no-reregister.exit")" "$(cat "$R/reregister.exit")" | tee "$R/matrix.txt"
 
-      - name: Assert current destination-owner gap
+      - name: Assert split destination-code and owner gaps
         shell: bash
         run: |
           set -euxo pipefail
           test "$(cat "$R/no-reregister.exit")" = 0
           test "$(cat "$R/reregister.exit")" = 0
-          grep -q 'MREMAP_REUSE final value=222 reregister=0' "$R/no-reregister.stderr"
-          grep -q 'MREMAP_REUSE final value=222 reregister=1' "$R/reregister.stderr"
+          grep -q 'MREMAP_REUSE direct-before-invalidate value=111' "$R/no-reregister.stderr"
+          grep -q 'MREMAP_REUSE direct-after-invalidate value=222' "$R/no-reregister.stderr"
+          grep -q 'MREMAP_REUSE final H-value=222 reregister=0 direct-before=111 direct-after=222' "$R/no-reregister.stderr"
+          grep -q 'DIAG_OWNER_CLAIM_STANDBY H=0x700000030000 .* owner=0xf' "$R/reregister.stderr"
+          grep -q 'MREMAP_REUSE final H-value=222 reregister=1 direct-before=111 direct-after=222' "$R/reregister.stderr"
 
       - name: Upload receipts
         if: always()
