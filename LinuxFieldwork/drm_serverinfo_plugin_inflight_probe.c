@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int addr_mapped(uintptr_t addr) {
@@ -91,6 +92,30 @@ int main(void) {
 
   pthread_join(thread, NULL);
   fprintf(stderr, "DRM_PLUGIN_PROBE joined fd=%d mapped-after-join=%d\n", worker.fd, addr_mapped((uintptr_t)callback));
+  fflush(stderr);
+
+  pid_t child = fork();
+  if (child < 0) { perror("fork"); return 10; }
+  if (child == 0) {
+    fprintf(stderr, "DRM_PLUGIN_PROBE stale-child-enter\n");
+    fflush(stderr);
+    int fd = open_fn("fex-second-intentionally-missing-drm-driver", NULL);
+    fprintf(stderr, "DRM_PLUGIN_PROBE stale-child-unexpected-return fd=%d\n", fd);
+    fflush(stderr);
+    _exit(70);
+  }
+
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) { perror("waitpid"); return 11; }
+  int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  int signal_code = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+  fprintf(stderr, "DRM_PLUGIN_PROBE stale-child exit=%d signal=%d\n", exit_code, signal_code);
+  fflush(stderr);
+  if (exit_code != 113 || signal_code != 0) {
+    return 12;
+  }
+
+  fprintf(stderr, "DRM_PLUGIN_PROBE STALE_REVOKE_PASS\n");
   fflush(stderr);
   return 0;
 }
