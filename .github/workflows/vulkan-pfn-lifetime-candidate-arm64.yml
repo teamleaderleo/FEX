@@ -1,8 +1,8 @@
-name: Vulkan PFN lifetime candidate ARM64
+name: Vulkan PFN lifetime candidate FEX-2608 ARM64
 
 on:
   push:
-    branches: [ci/vulkan-pfn-lifetime-candidate-20260814]
+    branches: [ci/vulkan-pfn-lifetime-fex2608-20260814]
     paths:
       - .github/workflows/vulkan-pfn-lifetime-candidate-arm64.yml
       - .github/fieldwork/add_revoked_h_state.py
@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 75
     env:
-      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FEX_SHA: e869aa644a16e4332cdc15c1ea0b4d13d482385d
       ROOTFS: ${{ github.workspace }}/rootfs-amd64
       R: ${{ github.workspace }}/receipts
       FEX_PORTABLE: 1
@@ -29,7 +29,7 @@ jobs:
       - name: Checkout carrier
         uses: actions/checkout@v4
 
-      - name: Checkout exact FEX source under test
+      - name: Checkout exact FEX-2608 source under test
         uses: actions/checkout@v4
         with:
           repository: teamleaderleo/FEX
@@ -83,7 +83,7 @@ jobs:
           grep -R -n -E 'DIAG_MT|DIAG_MULTI|DIAG_INTEGRATED|DIAG_LOCKED|DIAG_REVOKED_H' \
             src/FEXCore src/Source/Tools/LinuxEmulation | head -260 > "$R/instrumentation-sites.txt" || true
 
-      - name: Build FEX and real Vulkan thunks
+      - name: Build FEX-2608 and real Vulkan thunks
         shell: bash
         run: |
           set -euxo pipefail
@@ -187,6 +187,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vulkan-pfn-lifetime-candidate-${{ github.run_id }}
+          name: vulkan-pfn-lifetime-fex2608-${{ github.run_id }}
           path: receipts
           retention-days: 30
