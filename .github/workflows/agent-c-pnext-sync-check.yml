@@ -1,0 +1,51 @@
+name: Agent C Vulkan pNext sync delta
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-pnext-sync-check.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          fetch-depth: 1
+      - name: Print exact inventory delta
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          interface = Path('src/ThunkLibs/libvulkan/libvulkan_interface.cpp').read_text()
+          host = Path('src/ThunkLibs/libvulkan/Host.cpp').read_text()
+          annotations=set()
+          ar=re.compile(r'^\s*struct\s+fex_gen_config<&(?P<name>Vk[A-Za-z0-9_]+)::pNext>\s*:\s*fexgen::custom_repack')
+          for line in interface.splitlines():
+            if line.lstrip().startswith('//'): continue
+            m=ar.match(line)
+            if m: annotations.add(m.group('name'))
+          hooks=set()
+          hr=re.compile(r'^VULKAN_(DEFAULT|NONDEFAULT)_CUSTOM_REPACK\((Vk[A-Za-z0-9_]+)\)')
+          for line in host.splitlines():
+            s=line.strip()
+            if s.startswith('//'): continue
+            m=hr.match(s)
+            if m: hooks.add(m.group(2))
+          print('ANNOTATION_ONLY')
+          print('\n'.join(sorted(annotations-hooks)) or '<none>')
+          print('HOST_ONLY')
+          print('\n'.join(sorted(hooks-annotations)) or '<none>')
+          print(f'annotation_count={len(annotations)} host_count={len(hooks)}')
+          PY
