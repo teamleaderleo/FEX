@@ -1,0 +1,220 @@
+name: FEX-2608 Fedora 44 with Mesa 25.3.6 Lavapipe
+
+on:
+  push:
+    branches: [ci/fex2608-nodelete-vulkaninfo-ab-clean-20260814]
+    paths:
+      - .github/workflows/fex2608-fedora44-mesa2536-vulkaninfo-ab.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mesa2536-vulkaninfo-ab:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 110
+    env:
+      FEX_BASE: e869aa644a16e4332cdc15c1ea0b4d13d482385d
+      MESA_VERSION: 25.3.6
+      MESA_SHA256: 59217efeac3b64e7ced958324b9db7494f1e0741aeb22d780276514cc1b8f206
+      ROOTFS: ${{ github.workspace }}/rootfs-fedora44-amd64
+      R: ${{ github.workspace }}/receipts-mesa2536
+      H: ${{ github.workspace }}/host
+      MESA_PREFIX: ${{ github.workspace }}/mesa-install
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 80
+
+      - name: Prove committed product source is FEX-2608
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          git diff --exit-code "$FEX_BASE" -- \
+            ':!AGENTS.md' ':!CONTRIBUTING.md' \
+            ':!.github/workflows/fex2608-clean-nodelete-vulkaninfo-ab.yml' \
+            ':!.github/workflows/fex2608-fedora44-vulkaninfo-ab.yml' \
+            ':!.github/workflows/fex2608-fedora44-mesa2536-vulkaninfo-ab.yml'
+          git rev-parse "$FEX_BASE" | tee "$R/fex-base-sha.txt"
+
+      - name: Install build dependencies and native loader control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev vulkan-tools libvulkan-dev binutils \
+            meson python3-mako python3-yaml python3-packaging flex bison \
+            libdrm-dev libexpat1-dev libelf-dev libzstd-dev glslang-tools \
+            dnf xz-utils curl file
+          ldconfig -p | grep -F 'libvulkan.so.1' | tee "$R/native-vulkan-loader.txt"
+
+      - name: Build official Mesa 25.3.6 Lavapipe locally
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" -o /tmp/mesa.tar.xz
+          echo "${MESA_SHA256}  /tmp/mesa.tar.xz" | sha256sum -c -
+          tar -C /tmp -xf /tmp/mesa.tar.xz
+          meson setup /tmp/mesa-build "/tmp/mesa-${MESA_VERSION}" \
+            --prefix="$MESA_PREFIX" \
+            --buildtype=release \
+            -Dgallium-drivers=llvmpipe \
+            -Dvulkan-drivers=swrast \
+            -Dplatforms= \
+            -Dglx=disabled \
+            -Degl=disabled \
+            -Dgles1=disabled \
+            -Dgles2=disabled \
+            -Dopengl=false \
+            -Dllvm=enabled \
+            -Dshared-llvm=enabled \
+            > "$R/mesa-configure.log" 2>&1
+          ninja -C /tmp/mesa-build -j"$(nproc)" > "$R/mesa-build.log" 2>&1
+          meson install -C /tmp/mesa-build > "$R/mesa-install.log" 2>&1
+          find "$MESA_PREFIX/share/vulkan/icd.d" -type f -maxdepth 1 -print | tee "$R/mesa-icds.txt"
+          LVP="$(find "$MESA_PREFIX/share/vulkan/icd.d" -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP"
+          echo "$LVP" > "$R/lvp.txt"
+          VK_DRIVER_FILES="$LVP" vulkaninfo --summary > "$R/native-mesa2536.out" 2> "$R/native-mesa2536.err"
+          grep -E 'driverVersion|driverInfo|deviceName|apiVersion' "$R/native-mesa2536.out" | head -20 | tee "$R/native-mesa2536-key.txt" || true
+
+      - name: Apply historical debug-report routing diagnostic at runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/libvulkan/Host.cpp')
+          s=p.read_text()
+          old='  } else if (a_1 == "vkFreeMemory"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkFreeMemory;\n'
+          new=old+'  } else if (a_1 == "vkCreateDebugReportCallbackEXT"sv) {\n    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDebugReportCallbackEXT;\n'
+          if old not in s:
+              raise SystemExit('debug-report route anchor missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          git diff --check
+          git diff -- ThunkLibs/libvulkan/Host.cpp | tee "$R/debug-report-route.diff"
+
+      - name: Build exact FEX-2608 runtime and Vulkan host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" > "$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+
+      - name: Build normal and Vulkan-only NODELETE wrappers
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp ThunkLibs/GuestLibs/CMakeLists.txt "$R/CMakeLists.normal"
+          cmake -S ThunkLibs/GuestLibs -B guest-normal -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-normal.log" 2>&1
+          cmake --build guest-normal --target vulkan-guest -- -j"$(nproc)" > "$R/build-normal.log" 2>&1
+          readelf -d guest-normal/libvulkan-guest.so > "$R/normal.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/normal.dynamic"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s=p.read_text()
+          old='  add_guest_lib(vulkan "libvulkan.so.1")\n'
+          new=old+'  target_link_options(vulkan-guest PRIVATE "LINKER:-z,nodelete")\n'
+          if old not in s:
+              raise SystemExit('Vulkan guest target anchor missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cmake -S ThunkLibs/GuestLibs -B guest-nodelete -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-nodelete.log" 2>&1
+          cmake --build guest-nodelete --target vulkan-guest -- -j"$(nproc)" > "$R/build-nodelete.log" 2>&1
+          readelf -d guest-nodelete/libvulkan-guest.so > "$R/nodelete.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/nodelete.dynamic"
+
+      - name: Build Fedora 44 x86-64 guest rootfs without executing x86-64
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 fedora:44 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 fedora:44 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          FEDORA_KEY="$ROOTFS/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-44-x86_64"
+          test -r "$FEDORA_KEY"
+          sudo dnf -y \
+            --installroot="$ROOTFS" --releasever=44 --forcearch=x86_64 \
+            --setopt=install_weak_deps=False \
+            --setopt=cachedir="$RUNNER_TEMP/dnf-cache" \
+            --setopt="fedora.gpgkey=file://$FEDORA_KEY" \
+            --setopt="updates.gpgkey=file://$FEDORA_KEY" \
+            install vulkan-tools libX11 libX11-xcb libxcb libXrandr libXrender \
+            > "$R/dnf-install.log" 2>&1
+          test -x "$ROOTFS/usr/bin/vulkaninfo"
+          file "$ROOTFS/usr/bin/vulkaninfo" | tee "$R/x86-vulkaninfo.file"
+          sudo dnf -q \
+            --installroot="$ROOTFS" --releasever=44 --forcearch=x86_64 \
+            --setopt="fedora.gpgkey=file://$FEDORA_KEY" \
+            --setopt="updates.gpgkey=file://$FEDORA_KEY" \
+            list installed vulkan-tools glibc libX11 > "$R/fedora-packages.txt" 2>&1 || true
+          sudo chown -R "$(id -u):$(id -g)" "$ROOTFS"
+
+      - name: Run Fedora guest against Mesa 25.3.6 Lavapipe
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          LVP="$(cat "$R/lvp.txt")"
+          LIB="$ROOTFS/usr/lib64/libvulkan.so.1"
+          sudo mkdir -p "$(dirname "$LIB")"
+          run_case() {
+            name="$1"; wrapper="$2"
+            sudo rm -f "$LIB"
+            sudo cp "$wrapper" "$LIB"
+            set +e
+            VK_DRIVER_FILES="$LVP" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 60s \
+              "$FEX" /usr/bin/vulkaninfo --summary > "$R/${name}.out" 2> "$R/${name}.err"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/${name}.exit"
+            echo "===== $name rc=$rc ====="
+            tail -n 100 "$R/${name}.out" || true
+            tail -n 180 "$R/${name}.err" || true
+          }
+          set -e
+          run_case normal guest-normal/libvulkan-guest.so
+          run_case nodelete guest-nodelete/libvulkan-guest.so
+          printf 'normal=%s\nnodelete=%s\n' "$(cat "$R/normal.exit")" "$(cat "$R/nodelete.exit")" | tee "$R/matrix.txt"
+          test "$(cat "$R/nodelete.exit")" = 0
+          grep -Eq 'Vulkan Instance Version|Devices:' "$R/nodelete.out"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex2608-fedora44-mesa2536-${{ github.run_id }}
+          path: receipts-mesa2536
+          retention-days: 30
