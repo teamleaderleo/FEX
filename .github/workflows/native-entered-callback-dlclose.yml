@@ -1,0 +1,85 @@
+name: Native entered callback dlclose baseline
+
+on:
+  push:
+    branches: [ci/native-entered-callback-dlclose-20260814]
+    paths:
+      - diagnostics/native-entered-callback-dlclose/**
+      - .github/workflows/native-entered-callback-dlclose.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-entered:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      R: ${{ github.workspace }}/receipts-${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build native entered-callback fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" build-entered
+          c++ -std=c++20 -O2 -g -fPIC -shared -Wall -Wextra -Wpedantic -Werror \
+            diagnostics/native-entered-callback-dlclose/owner.cpp \
+            -o build-entered/libnative-entered-owner.so
+          c++ -std=c++20 -O2 -g -Wall -Wextra -Wpedantic -Werror -pthread \
+            diagnostics/native-entered-callback-dlclose/main.cpp -ldl \
+            -o build-entered/native-entered-callback
+          file build-entered/native-entered-callback build-entered/libnative-entered-owner.so | tee "$R/file.txt"
+
+      - name: Run pin control and concurrent unload
+        shell: bash
+        run: |
+          set -uxo pipefail
+          run_case() {
+            local name="$1"; shift
+            set +e
+            (cd build-entered && timeout 10s ./native-entered-callback "$@") \
+              > "$R/$name.stdout" 2> "$R/$name.stderr"
+            local rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            echo "===== $name rc=$rc ====="
+            cat "$R/$name.stdout"
+            cat "$R/$name.stderr"
+          }
+          set -e
+          run_case pin --pin
+          run_case unmap
+          printf 'arch=%s\npin=%s\nunmap=%s\n' \
+            '${{ matrix.arch }}' "$(cat "$R/pin.exit")" "$(cat "$R/unmap.exit")" | tee "$R/matrix.txt"
+
+      - name: Assert entered callback lifetime discriminator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(cat "$R/pin.exit")" = 0
+          test "$(cat "$R/unmap.exit")" = 139
+          grep -q 'NATIVE_ENTERED callback-entered' "$R/pin.stdout"
+          grep -q 'NATIVE_ENTERED worker-return value=1023' "$R/pin.stdout"
+          grep -q 'NATIVE_ENTERED callback-entered' "$R/unmap.stdout"
+          grep -q 'NATIVE_ENTERED owner-closed mapped=0' "$R/unmap.stdout"
+          grep -q 'NATIVE_ENTERED callback-released' "$R/unmap.stdout"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-entered-callback-${{ matrix.arch }}-${{ github.run_id }}
+          path: ${{ env.R }}
+          retention-days: 30
