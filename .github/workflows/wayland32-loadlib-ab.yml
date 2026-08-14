@@ -124,14 +124,24 @@ jobs:
           mkdir -p "$ROOTFS/lib" "$ROOTFS/lib32" "$ROOTFS/usr/lib32" "$ROOTFS/opt/fex-ci"
           loader="$(x86_64-linux-gnu-gcc -m32 -print-file-name=ld-linux.so.2)"
           libc="$(x86_64-linux-gnu-gcc -m32 -print-file-name=libc.so.6)"
+          libm="$(x86_64-linux-gnu-gcc -m32 -print-file-name=libm.so.6)"
           libstdcpp="$(x86_64-linux-gnu-g++ -m32 -print-file-name=libstdc++.so.6)"
           libgcc="$(x86_64-linux-gnu-gcc -m32 -print-file-name=libgcc_s.so.1)"
-          for f in "$loader" "$libc" "$libstdcpp" "$libgcc"; do test -e "$f"; done
+          for f in "$loader" "$libc" "$libm" "$libstdcpp" "$libgcc"; do test -e "$f"; done
           cp -L "$loader" "$ROOTFS/lib/ld-linux.so.2"
           cp -L "$loader" "$ROOTFS/lib32/ld-linux.so.2"
           cp -L "$libc" "$ROOTFS/lib32/libc.so.6"
+          cp -L "$libm" "$ROOTFS/lib32/libm.so.6"
           cp -L "$libstdcpp" "$ROOTFS/usr/lib32/libstdc++.so.6"
           cp -L "$libgcc" "$ROOTFS/usr/lib32/libgcc_s.so.1"
+          {
+            echo '=== wrapper ==='
+            readelf -d guest32/libwayland-client-guest.so | grep NEEDED || true
+            echo '=== libstdc++ ==='
+            readelf -d "$libstdcpp" | grep NEEDED || true
+            echo '=== libgcc ==='
+            readelf -d "$libgcc" | grep NEEDED || true
+          } | tee "$R/i386-needed.txt"
           cp guest32/libwayland-client-guest.so "$ROOTFS/usr/lib32/libwayland-client.so.0"
           if [ -f guest32/libfex-wayland-client-bridge.so ]; then
             cp guest32/libfex-wayland-client-bridge.so "$ROOTFS/usr/lib32/libfex-wayland-client-bridge.so"
