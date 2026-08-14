@@ -57,9 +57,16 @@ jobs:
           python3 .github/fieldwork/apply_thunkgen_bridge_roles.py .
           python3 .github/fieldwork/apply_thunkgen_bridge_roles_compat.py .
           python3 LinuxFieldwork/apply_gl_helper_direct_bridge.py | tee "$R/transform.txt"
+          git add -N ThunkLibs/libGL_bridge/Guest.cpp
           git diff --check
           git diff -- ThunkLibs FEXCore Source > "$R/product.diff"
           grep -q 'add_guest_bridge(GL_bridge "libfex-GL-bridge.so"' ThunkLibs/GuestLibs/CMakeLists.txt
+          grep -q '^static void OnInit()' ThunkLibs/libGL/libGL_Guest.cpp
+          ! grep -q 'static extern "C"' ThunkLibs/libGL/libGL_Guest.cpp
+          ! grep -q 'malloc_wrapper' ThunkLibs/libGL/libGL_Guest.cpp
+          grep -q 'fex_gl_bridge_malloc_unpacker()' ThunkLibs/libGL/libGL_Guest.cpp
+          grep -q 'GLXHyperpipeConfigSGIX' ThunkLibs/libGL_bridge/Guest.cpp || true
+          grep -q '#include <GL/glxext.h>' ThunkLibs/libGL_bridge/Guest.cpp
       - name: Build thunkgen and GL pair
         shell: bash
         run: |
