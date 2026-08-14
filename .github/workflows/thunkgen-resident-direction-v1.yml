@@ -93,10 +93,12 @@ jobs:
                   <(grep -E '^[[:space:]]*MAKE_CALLBACK_THUNK' guest/gen/thunkgen_guest_libGL_bridge.inl | sed -E 's/^[[:space:]]+//') \
                   > "$R/callback-set.diff"
 
-          grep -Ec '^extern "C" uintptr_t fex_bridge_libGL_unpacker_' guest/gen/thunkgen_guest_libGL_bridge.inl \
-            | tee "$R/resident-unpacker-count.txt"
-          grep -Ec '^template<> struct FEXResidentBridgeUnpacker<' guest/gen/thunkgen_guest_libGL_bridge_accessors.inl \
-            | tee "$R/accessor-unpacker-count.txt"
+          awk '/^extern "C" uintptr_t fex_bridge_libGL_unpacker_/{n++} END{print n+0}' \
+            guest/gen/thunkgen_guest_libGL_bridge.inl | tee "$R/resident-unpacker-count.txt"
+          awk '/^template<> struct FEXResidentBridgeUnpacker</{n++} END{print n+0}' \
+            guest/gen/thunkgen_guest_libGL_bridge_accessors.inl | tee "$R/accessor-unpacker-count.txt"
+          test "$(cat "$R/resident-unpacker-count.txt")" = "$(cat "$R/accessor-unpacker-count.txt")"
+          test "$(cat "$R/resident-unpacker-count.txt")" = 0
           ! grep -q 'FEXResidentBridgeCanUnpack' guest/gen/thunkgen_guest_libGL_bridge.inl
           ! grep -q 'FEXResidentBridgeCanUnpack' guest/gen/thunkgen_guest_libGL_bridge_accessors.inl
           ! grep -q 'sizeof...(Args) <= 19' guest/gen/thunkgen_guest_libGL_bridge.inl
