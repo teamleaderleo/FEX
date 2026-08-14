@@ -25,15 +25,24 @@ $end_info$
 #include <unordered_map>
 
 #include "common/Guest.h"
+#include "thunkgen_guest_libGL_bridge_accessors.inl"
 
+#define AllocateHostTrampolineForGuestFunction FEXAllocateResidentHostTrampolineForGuestFunction
 #include "thunkgen_guest_libGL.inl"
+#undef AllocateHostTrampolineForGuestFunction
 
 typedef void voidFunc();
 
-// Maps OpenGL API function names to the address of a guest function which is
-// linked to the corresponding host function pointer
+extern "C" void* FEXGLBridgeMalloc(size_t);
+extern "C" uintptr_t FEXGLBridgeMallocUnpacker();
+extern "C" uintptr_t FEXGLBridgeXSyncUnpacker();
+extern "C" uintptr_t FEXGLBridgeXGetVisualInfoUnpacker();
+extern "C" uintptr_t FEXGLBridgeXDisplayStringUnpacker();
+
+// Maps OpenGL API function names to process-resident guest bridge functions
+// linked to the corresponding host function pointer.
 const std::unordered_map<std::string_view, uintptr_t /* guest function address */> HostPtrInvokers = std::invoke([]() {
-#define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(GetCallerForHostFunction(name));
+#define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(FEXGetResidentCallerForHostFunction(name));
   std::unordered_map<std::string_view, uintptr_t> Ret;
   FOREACH_internal_SYMBOL(PAIR);
   return Ret;
@@ -58,9 +67,6 @@ voidFunc* glXGetProcAddress(const GLubyte* procname) {
 
     // Extension found in host but not in our interface definition => Not fatal but warn about it
     // Some games query leaked GLES symbols but don't use them
-    // glFrustrumf : ES 1.x function
-    //  - Papers, Please
-    //  - Dicey Dungeons
     fprintf(stderr, "glXGetProcAddress: not found %s\n", procname);
     return nullptr;
   }
@@ -74,16 +80,14 @@ voidFunc* glXGetProcAddressARB(const GLubyte* procname) {
 }
 }
 
-// Wrapper around malloc() without noexcept specifiers
-static void* malloc_wrapper(size_t size) {
-  return malloc(size);
-}
-
 static void OnInit() {
-  fexfn_pack_GL_SetGuestMalloc((uintptr_t)malloc_wrapper, (uintptr_t)CallbackUnpack<decltype(malloc_wrapper)>::Unpack);
-  fexfn_pack_GL_SetGuestXSync((uintptr_t)XSync, (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
-  fexfn_pack_GL_SetGuestXGetVisualInfo((uintptr_t)XGetVisualInfo, (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
-  fexfn_pack_GL_SetGuestXDisplayString((uintptr_t)XDisplayString, (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+  // GL publishes malloc_wrapper itself to persistent host state, so both the
+  // guest target and its unpacker must be resident; moving only the unpacker
+  // would still leave a dead target after libGL-guest physically unloads.
+  fexfn_pack_GL_SetGuestMalloc((uintptr_t)FEXGLBridgeMalloc, FEXGLBridgeMallocUnpacker());
+  fexfn_pack_GL_SetGuestXSync((uintptr_t)XSync, FEXGLBridgeXSyncUnpacker());
+  fexfn_pack_GL_SetGuestXGetVisualInfo((uintptr_t)XGetVisualInfo, FEXGLBridgeXGetVisualInfoUnpacker());
+  fexfn_pack_GL_SetGuestXDisplayString((uintptr_t)XDisplayString, FEXGLBridgeXDisplayStringUnpacker());
 }
 
 // libGL.so must pull in libX11.so as a dependency. Referencing some libX11
