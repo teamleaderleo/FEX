@@ -4,11 +4,8 @@
 #define VK_USE_PLATFORM_XLIB_KHR
 #include <vulkan/vulkan.h>
 
-VkResult FEXBridgeEnumerateInstanceVersion(uint32_t*);
-VkBool32 FEXBridgeXlibPresentationSupport(VkPhysicalDevice, uint32_t, Display*, VisualID);
-
-template<auto>
-struct fex_gen_config : fexgen::indirect_guest_calls {};
+using EnumerateInstanceVersionSignature = VkResult(uint32_t*);
+using XlibPresentationSupportSignature = VkBool32(VkPhysicalDevice, uint32_t, Display*, VisualID);
 
 template<typename>
 struct fex_gen_type {};
@@ -19,6 +16,6 @@ template<>
 struct fex_gen_type<_XDisplay> : fexgen::opaque_type {};
 
 template<>
-struct fex_gen_config<FEXBridgeEnumerateInstanceVersion> {};
+struct fex_gen_type<EnumerateInstanceVersionSignature> {};
 template<>
-struct fex_gen_config<FEXBridgeXlibPresentationSupport> {};
+struct fex_gen_type<XlibPresentationSupportSignature> {};
