@@ -1,0 +1,200 @@
+name: NODELETE real GL PFN lifetime
+
+on:
+  push:
+    branches: [diagnostic/nodelete-real-gl-pfn-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-gl-pfn:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev binutils
+          git rev-parse HEAD | tee "$R/fex-candidate-sha.txt"
+          git diff --check
+
+      - name: Build FEX runtime and GL host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer GL-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1 || { tail -n 300 "$R/build-host.log"; exit 1; }
+          test -x build/Bin/FEX
+          test -f build/HostLibs_64/libGL-host.so
+          cp build/HostLibs_64/libGL-host.so "$H/libGL-host.so"
+
+      - name: Build candidate GL guest thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DENABLE_CLANG_THUNKS=OFF \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target GL-guest -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1 || { tail -n 300 "$R/build-guest.log"; exit 1; }
+          test -f guest/libGL-guest.so
+          file guest/libGL-guest.so | tee "$R/guest-file.txt"
+          readelf -d guest/libGL-guest.so | tee "$R/guest-dynamic.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/guest-dynamic.txt"
+          grep -Fq 'SONAME)             Library soname: [libGL.so.1]' "$R/guest-dynamic.txt"
+
+      - name: Create amd64 rootfs and GL dynamic-PFN probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libGL-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libGL.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat > /tmp/x11stub.c <<'EOF'
+          typedef int (*XErrorHandler)(void *, void *);
+          int XSync(void *display, int discard) { (void)display; (void)discard; return 0; }
+          void *XGetVisualInfo(void *display, long mask, void *templ, int *count) {
+            (void)display; (void)mask; (void)templ; if (count) *count = 0; return 0;
+          }
+          const char *XDisplayString(void *display) { (void)display; return ":0"; }
+          XErrorHandler XSetErrorHandler(XErrorHandler handler) { return handler; }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat > /tmp/glpfn.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+
+          typedef void (*GLVoidFn)(void);
+          typedef GLVoidFn (*PFN_glXGetProcAddress)(const unsigned char *);
+          typedef unsigned int (*PFN_glGetError)(void);
+
+          static int mapped(void *p) {
+            FILE *f = fopen("/proc/self/maps", "r");
+            char line[512];
+            uintptr_t x = (uintptr_t)p;
+            if (!f) return -1;
+            while (fgets(line, sizeof(line), f)) {
+              unsigned long a, b;
+              if (sscanf(line, "%lx-%lx", &a, &b) == 2 && x >= a && x < b) {
+                fprintf(stderr, "MAP %p %s", p, line);
+                fclose(f);
+                return 1;
+              }
+            }
+            fclose(f);
+            fprintf(stderr, "UNMAPPED %p\n", p);
+            return 0;
+          }
+
+          int main(void) {
+            enum { CYCLES = 256 };
+            void *lib = dlopen("libGL.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!lib) { fprintf(stderr, "DLERROR %s\n", dlerror()); return 2; }
+            PFN_glXGetProcAddress get0 = (PFN_glXGetProcAddress)dlsym(lib, "glXGetProcAddress");
+            if (!get0) return 3;
+            PFN_glGetError pfn0 = (PFN_glGetError)get0((const unsigned char *)"glGetError");
+            if (!pfn0) return 4;
+            unsigned int before = pfn0();
+            fprintf(stderr, "BEFORE_CLOSE get=%p pfn=%p value=%u\n", (void *)get0, (void *)pfn0, before);
+            if (mapped((void *)get0) != 1) return 5;
+            if (dlclose(lib) != 0) return 6;
+            if (mapped((void *)get0) != 1) return 7;
+            unsigned int after = pfn0();
+            fprintf(stderr, "AFTER_CLOSE_CALL pfn=%p value=%u\n", (void *)pfn0, after);
+            if (after != before) return 8;
+
+            for (unsigned i = 0; i < CYCLES; ++i) {
+              void *again = dlopen("libGL.so.1", RTLD_NOW | RTLD_LOCAL);
+              if (!again) return 20;
+              PFN_glXGetProcAddress get = (PFN_glXGetProcAddress)dlsym(again, "glXGetProcAddress");
+              if (get != get0) {
+                fprintf(stderr, "GET_DRIFT cycle=%u old=%p new=%p\n", i, (void *)get0, (void *)get);
+                return 21;
+              }
+              PFN_glGetError pfn = (PFN_glGetError)get((const unsigned char *)"glGetError");
+              if (pfn != pfn0) {
+                fprintf(stderr, "PFN_DRIFT cycle=%u old=%p new=%p\n", i, (void *)pfn0, (void *)pfn);
+                return 22;
+              }
+              if (pfn() != before) return 23;
+              if (dlclose(again) != 0) return 24;
+              if (pfn0() != before) return 25;
+              if ((i % 32) == 0) {
+                if (mapped((void *)get0) != 1) return 26;
+                fprintf(stderr, "STRESS_PROGRESS cycle=%u get=%p pfn=%p value=%u\n", i, (void *)get, (void *)pfn, before);
+              }
+            }
+
+            fprintf(stderr, "STRESS_CYCLES=%u\n", (unsigned)CYCLES);
+            fprintf(stderr, "REAL_NODELETE_GL_PFN_STRESS_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/glpfn.c -ldl -o "$ROOTFS/opt/fex-ci/glpfn"
+          file "$ROOTFS/opt/fex-ci/glpfn" "$ROOTFS/usr/lib/x86_64-linux-gnu/libGL.so.1" > "$R/x86-files.txt"
+
+      - name: Run real GL retained-PFN lifetime stress
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          set +e
+          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" \
+            "$FEX" /opt/fex-ci/glpfn > "$R/glpfn.out" 2> "$R/glpfn.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/glpfn.exit"
+          cat "$R/glpfn.err"
+          test "$rc" -eq 0
+          grep -q 'STRESS_CYCLES=256' "$R/glpfn.err"
+          grep -q 'REAL_NODELETE_GL_PFN_STRESS_OK' "$R/glpfn.err"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodelete-real-gl-pfn-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
