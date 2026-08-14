@@ -1,0 +1,145 @@
+name: Real Vulkan dlmopen recycling under FEX
+
+on:
+  push:
+    branches: [ci/nodelete-vulkan-dlmopen-fex-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-vulkan-dlmopen:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with: {submodules: recursive, fetch-depth: 1}
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev libx11-dev \
+            libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev mesa-vulkan-drivers binutils
+      - name: Build FEX and host Vulkan thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$H/libvulkan-host.so"
+      - name: Build normal and NODELETE Vulkan guest wrappers
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp ThunkLibs/GuestLibs/CMakeLists.txt "$R/CMakeLists.nodelete"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s=p.read_text()
+          s=s.replace('  if (TARGET_TYPE STREQUAL "SHARED")\n    target_link_options(${NAME}-guest PRIVATE "LINKER:-z,nodelete")\n  endif()\n','',1)
+          p.write_text(s)
+          PY
+          cmake -S ThunkLibs/GuestLibs -B guest-normal -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-normal.log" 2>&1
+          cmake --build guest-normal --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-normal.log" 2>&1
+          cp "$R/CMakeLists.nodelete" ThunkLibs/GuestLibs/CMakeLists.txt
+          cmake -S ThunkLibs/GuestLibs -B guest-nodelete -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-nodelete.log" 2>&1
+          cmake --build guest-nodelete --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-nodelete.log" 2>&1
+          readelf -d guest-normal/libvulkan-guest.so > "$R/normal.dynamic"
+          readelf -d guest-nodelete/libvulkan-guest.so > "$R/nodelete.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/normal.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/nodelete.dynamic"
+      - name: Create amd64 rootfs and dlmopen probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 >/dev/null
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d,int x){(void)d;(void)x;return 0;}
+          void *XGetVisualInfo(void*d,long m,void*t,int*c){(void)d;(void)m;(void)t;if(c)*c=0;return 0;}
+          char *XDisplayString(void*d){(void)d;return ":0";}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          cat >/tmp/loop.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <link.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          typedef void (*PFN)(void);
+          typedef PFN (*GIPA)(void*, const char*);
+          typedef int32_t (*ENUMVER)(uint32_t*);
+          int main(void){
+            int ok=0;
+            for(int i=0;i<24;i++){
+              void*h=dlmopen(LM_ID_NEWLM,"libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);
+              if(!h){fprintf(stderr,"DLMOPEN_FAIL iteration=%d error=%s\n",i,dlerror());break;}
+              GIPA g=(GIPA)dlsym(h,"vkGetInstanceProcAddr");
+              if(!g){fprintf(stderr,"DLSYM_FAIL iteration=%d\n",i);return 2;}
+              ENUMVER f=(ENUMVER)g(0,"vkEnumerateInstanceVersion");
+              uint32_t v=0;
+              if(!f || f(&v)!=0){fprintf(stderr,"PFN_FAIL iteration=%d\n",i);return 3;}
+              fprintf(stderr,"ITERATION %d version=%u gipa=%p pfn=%p\n",i,v,(void*)g,(void*)f);
+              ok++;
+              if(dlclose(h)){fprintf(stderr,"DLCLOSE_FAIL iteration=%d\n",i);return 4;}
+            }
+            fprintf(stderr,"DLMOPEN_RESULT ok=%d\n",ok);
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/loop.c -ldl -o "$ROOTFS/opt/fex-ci/loop"
+      - name: Run normal and NODELETE real Vulkan namespace loops
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          cp guest-normal/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          set +e
+          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" "$FEX" /opt/fex-ci/loop >"$R/normal.out" 2>"$R/normal.err"
+          normal_rc=$?
+          set -e
+          cat "$R/normal.err"
+          echo "$normal_rc" > "$R/normal.exit"
+          cp guest-nodelete/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          set +e
+          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" "$FEX" /opt/fex-ci/loop >"$R/nodelete.out" 2>"$R/nodelete.err"
+          nodelete_rc=$?
+          set -e
+          cat "$R/nodelete.err"
+          echo "$nodelete_rc" > "$R/nodelete.exit"
+          test "$normal_rc" -eq 0
+          test "$nodelete_rc" -eq 0
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-vulkan-dlmopen-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
