@@ -1,0 +1,160 @@
+name: Callback in-flight race current clean ARM64
+
+on:
+  push:
+    branches: [diagnostic/callback-inflight-current-clean-20260814]
+    paths:
+      - .github/workflows/callback-inflight-current-clean.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  callback-race:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 55
+    env:
+      FEX_SHA: 1e8b042e7d50335cdbf2b1b6bfd0c888296dd73a
+      FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-callback-race-current-clean
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout exact clean product source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout retained fixture
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          git -C src status --porcelain | tee "$R/pre-patch-status.txt"
+          test ! -s "$R/pre-patch-status.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'carrier=%s\nfex=%s\nfieldwork=%s\n' "$GITHUB_SHA" "$(git -C src rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" > "$R/identity.txt"
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 .github/fieldwork/patch_callback_inflight_fixture.py
+
+      - name: Apply runtime-only tombstone and pause diagnostics
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/apply_callback_tombstone_diag.py src
+          python3 .github/fieldwork/apply_callback_inflight_pause.py src
+          git -C src diff --check
+          git -C src diff > "$R/runtime-only.diff"
+          git -C src diff --name-only | tee "$R/runtime-only-files.txt"
+          test -s "$R/runtime-only-files.txt"
+
+      - name: Build FEX and fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1 \
+            || { tail -n 520 "$R/build-fex.log"; exit 1; }
+          cd /tmp/repro/fex-full-thunk-pair
+          make clean
+          make HOST_CXX=g++ GUEST_CXX='x86_64-linux-gnu-g++ -pthread' > "$R/build-fixture.log" 2>&1 \
+            || { cat "$R/build-fixture.log"; exit 1; }
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci/full"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/full/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Run pin and unmap race arms
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          HOST="/tmp/repro/fex-full-thunk-pair/host"
+          run_case() {
+            name="$1"; arg="$2"
+            set +e
+            (cd "$ROOTFS/opt/fex-ci/full" && \
+              FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+              "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime "$arg") \
+              > "$R/$name.stdout" 2> "$R/$name.stderr"
+            rc=$?
+            set -e
+            echo "$rc" > "$R/$name.exit"
+            printf '%s=%s\n' "$name" "$rc" | tee -a "$R/matrix.txt"
+            grep -E 'DIAG_CALLBACK|CALLBACK_RACE|pre-unload host->guest callback|FAIL' "$R/$name.stdout" "$R/$name.stderr" > "$R/$name.key-lines" || true
+            cat "$R/$name.key-lines"
+          }
+          : > "$R/matrix.txt"
+          run_case pin --callback-race-pin
+          run_case unmap --callback-race-unmap
+          test "$(cat "$R/pin.exit")" = 0
+          test "$(cat "$R/unmap.exit")" = 139
+          grep -q 'DIAG_CALLBACK_INFLIGHT_SELECTED entry=2' "$R/pin.stderr"
+          grep -q 'CALLBACK_RACE_WORKER_RETURN rv=10063' "$R/pin.stderr"
+          grep -q 'DIAG_CALLBACK_INFLIGHT_SELECTED entry=2' "$R/unmap.stderr"
+          grep -q 'CALLBACK_RACE_DLCLOSE_BEGIN' "$R/unmap.stderr"
+          grep -q 'DIAG_CALLBACK_TOMBSTONE' "$R/unmap.stderr"
+          grep -q 'DIAG_CALLBACK_POST_UNMAP_RELEASE' "$R/unmap.stderr"
+          grep -q 'DIAG_CALLBACK_INFLIGHT_RESUME' "$R/unmap.stderr"
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('receipts-callback-race-current-clean/unmap.stderr').read_text()
+          keys = ['DIAG_CALLBACK_INFLIGHT_SELECTED', 'DIAG_CALLBACK_TOMBSTONE', 'DIAG_CALLBACK_POST_UNMAP_RELEASE', 'DIAG_CALLBACK_INFLIGHT_RESUME']
+          pos = [text.find(k) for k in keys]
+          print('ordering', list(zip(keys, pos)))
+          if any(p < 0 for p in pos) or pos != sorted(pos): raise SystemExit(1)
+          Path('receipts-callback-race-current-clean/ordering.txt').write_text('\n'.join(f'{k}={p}' for k,p in zip(keys,pos))+'\n')
+          PY
+          echo CURRENT_CLEAN_CALLBACK_INFLIGHT_RACE_OK | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: callback-inflight-current-clean-${{ github.run_id }}
+          path: receipts-callback-race-current-clean
+          retention-days: 30
