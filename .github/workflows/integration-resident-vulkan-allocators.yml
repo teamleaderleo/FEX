@@ -1,0 +1,283 @@
+name: Integrated resident Vulkan allocator callbacks
+
+on:
+  push:
+    branches: [ci/integration-resident-vulkan-allocators-20260814]
+    paths:
+      - .github/workflows/integration-resident-vulkan-allocators.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  vulkan:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      BASE: 48e28a2ce9da1334feb8d7b77dbade66efa24be2
+      CONST_FIX: 715ff36bff2fd9f2353ab31613dc41ae106f3938
+      ALLOC_CARRIER: 669220a85abf80e34599696dbf102788956e726b
+      OUTPUT_BRANCH: integration/per-library-resident-bridges-vulkan-allocators-20260814
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/integration-vulkan-allocator-receipts
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Checkout integration carrier
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Checkout PFN lifetime probe
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-customir-retirement
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          git cat-file -e "$BASE^{commit}"
+          git merge-base --is-ancestor "$BASE" HEAD
+          git diff --name-only "$BASE" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-diff.txt"
+          test ! -s "$R/pre-patch-product-diff.txt"
+          git fetch origin "$CONST_FIX" "$ALLOC_CARRIER"
+          git cat-file -e "$CONST_FIX^{commit}"
+          git cat-file -e "$ALLOC_CARRIER^{commit}"
+          git show "$ALLOC_CARRIER":LinuxFieldwork/vk_allocator_custom_host_matrix.c > /tmp/vk_allocator_custom_host_matrix.c
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers binutils glslang-tools
+          cat > "$R/min.comp" <<'EOF'
+          #version 450
+          layout(local_size_x = 1) in;
+          void main() {}
+          EOF
+          glslangValidator -V -S comp "$R/min.comp" -o "$R/min.comp.spv"
+
+      - name: Native allocator control
+        shell: bash
+        run: |
+          set -uxo pipefail
+          cc -O0 -g -Wall -Wextra -Werror /tmp/vk_allocator_custom_host_matrix.c -ldl -o "$R/native-allocator-probe"
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$ICD" timeout 30s "$R/native-allocator-probe" "$R/min.comp.spv" > "$R/native.stdout" 2> "$R/native.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/native.exit"
+          cat "$R/native.stderr"
+          test "$rc" -eq 0
+          grep -q 'PASS custom-host allocator forwarding matrix' "$R/native.stderr"
+          grep -E -q 'DEVICE_CREATE_RETURN result=0 alloc_delta=[1-9]' "$R/native.stderr"
+          grep -q 'MEM_ALLOC_RETURN result=0' "$R/native.stderr"
+          grep -q 'SHADER_CREATE_RETURN result=0' "$R/native.stderr"
+          grep -E -q 'DEVICE_DESTROY_RETURN free_delta=[1-9]' "$R/native.stderr"
+
+      - name: Apply const and allocator integration
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git show --format= "$CONST_FIX" -- ThunkLibs/Generator/gen.cpp | git apply -
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_one(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              assert count == 1, (path, count, old[:180])
+              p.write_text(text.replace(old, new, 1))
+
+          replace_one(
+              'ThunkLibs/libvulkan/libvulkan_interface.cpp',
+              '''// TODO: Should not be opaque, but it's usually NULL anyway. Supporting the contained function pointers will need more work.\ntemplate<>\nstruct fex_gen_type<VkAllocationCallbacks> : fexgen::opaque_type {};''',
+              '''// Generate ABI conversion for Vulkan allocation callback members.\ntemplate<>\nstruct fex_gen_type<VkSystemAllocationScope> {};\ntemplate<>\nstruct fex_gen_type<VkInternalAllocationType> {};\ntemplate<>\nstruct fex_gen_type<VkAllocationCallbacks> {};\ntemplate<>\nstruct fex_gen_config<&VkAllocationCallbacks::pUserData> : fexgen::custom_repack {};\ntemplate<>\nstruct fex_gen_config<&VkAllocationCallbacks::pfnAllocation> : fexgen::callback_member {};\ntemplate<>\nstruct fex_gen_config<&VkAllocationCallbacks::pfnReallocation> : fexgen::callback_member {};\ntemplate<>\nstruct fex_gen_config<&VkAllocationCallbacks::pfnFree> : fexgen::callback_member {};\ntemplate<>\nstruct fex_gen_config<&VkAllocationCallbacks::pfnInternalAllocation> : fexgen::callback_member {};\ntemplate<>\nstruct fex_gen_config<&VkAllocationCallbacks::pfnInternalFree> : fexgen::callback_member {};''')
+
+          replace_one(
+              'ThunkLibs/libvulkan/Host.cpp',
+              '''static void fexfn_impl_libvulkan_Vulkan_SetGuestXDisplayString(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {\n  MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &x11_manager.GuestXDisplayString);\n}\n''',
+              '''static void fexfn_impl_libvulkan_Vulkan_SetGuestXDisplayString(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {\n  MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &x11_manager.GuestXDisplayString);\n}\n\nvoid fex_custom_repack_entry(host_layout<VkAllocationCallbacks>& into, const guest_layout<VkAllocationCallbacks>& from) {\n  into.data.pUserData = const_cast<void*>(from.data.pUserData.force_get_host_pointer());\n}\n\nbool fex_custom_repack_exit(guest_layout<VkAllocationCallbacks>&, const host_layout<VkAllocationCallbacks>&) {\n  return true;\n}\n''')
+
+          host = Path('ThunkLibs/libvulkan/Host.cpp')
+          text = host.read_text()
+          replacements = {
+              'return LDR_PTR(vkCreateShaderModule)(a_0, a_1, nullptr, a_3);':
+                  'return LDR_PTR(vkCreateShaderModule)(a_0, a_1, a_2, a_3);',
+              'auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);':
+                  'auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, a_1, &out);',
+              'auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, nullptr, &out);':
+                  'auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, a_2, &out);',
+              'return LDR_PTR(vkAllocateMemory)(a_0, a_1, nullptr, a_3);':
+                  'return LDR_PTR(vkAllocateMemory)(a_0, a_1, a_2, a_3);',
+              'LDR_PTR(vkFreeMemory)(a_0, a_1, nullptr);':
+                  'LDR_PTR(vkFreeMemory)(a_0, a_1, a_2);',
+              'return LDR_PTR(vkCreateDebugReportCallbackEXT)(a_0, &overridden_callback, nullptr, a_3);':
+                  'return LDR_PTR(vkCreateDebugReportCallbackEXT)(a_0, &overridden_callback, a_2, a_3);',
+              'LDR_PTR(vkDestroyDebugReportCallbackEXT)(a_0, a_1, nullptr);':
+                  'LDR_PTR(vkDestroyDebugReportCallbackEXT)(a_0, a_1, a_2);',
+              'return LDR_PTR(vkCreateDebugUtilsMessengerEXT)(a_0, &overridden_callback, nullptr, a_3);':
+                  'return LDR_PTR(vkCreateDebugUtilsMessengerEXT)(a_0, &overridden_callback, a_2, a_3);',
+          }
+          for old, new in replacements.items():
+              count = text.count(old)
+              assert count == 1, (old, count)
+              text = text.replace(old, new, 1)
+          host.write_text(text)
+
+          replace_one(
+              'ThunkLibs/libvulkan/Guest.cpp',
+              '''#include "thunkgen_bridge_accessors_libvulkan.inl"\n#include "thunkgen_guest_libvulkan.inl"''',
+              '''#include "thunkgen_bridge_accessors_libvulkan.inl"\n\n#define AllocateHostTrampolineForGuestFunction FEXAllocateResidentHostTrampolineForGuestFunction\n#include "thunkgen_guest_libvulkan.inl"\n#undef AllocateHostTrampolineForGuestFunction''')
+          PY
+          git diff --check
+          git diff "$BASE" -- ThunkLibs > "$R/product.diff"
+          grep -n 'FEXAllocateResidentHostTrampolineForGuestFunction' ThunkLibs/libvulkan/Guest.cpp | tee "$R/resident-routing.txt"
+          host=ThunkLibs/libvulkan/Host.cpp
+          grep -n -E 'vkCreateShaderModule\)\(a_0, a_1, a_2, a_3\)|vkCreateInstance\)\(vk_struct_base, a_1, &out\)|vkCreateDevice\)\(a_0, a_1, a_2, &out\)|vkAllocateMemory\)\(a_0, a_1, a_2, a_3\)|vkFreeMemory\)\(a_0, a_1, a_2\)|vkCreateDebugReportCallbackEXT\)\(a_0, &overridden_callback, a_2, a_3\)|vkDestroyDebugReportCallbackEXT\)\(a_0, a_1, a_2\)|vkCreateDebugUtilsMessengerEXT\)\(a_0, &overridden_callback, a_2, a_3\)' "$host" | tee "$R/allocator-forwarding-sites.txt"
+          test "$(wc -l < "$R/allocator-forwarding-sites.txt")" -eq 8
+
+      - name: Build integrated FEX and Vulkan pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer vulkan-host-64 cuda-host-64 wayland-client-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1 || { tail -n 420 "$R/build-host.log"; exit 1; }
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target \
+            vulkan-guest vulkan_bridge-guest cuda-guest cuda_bridge-guest wayland-client-guest wayland-client_bridge-guest \
+            -- -j"$(nproc)" -v > "$R/build-guest.log" 2>&1 || { tail -n 480 "$R/build-guest.log"; exit 1; }
+
+      - name: Verify generated allocator and resident ownership
+        shell: bash
+        run: |
+          set -euxo pipefail
+          normal=guest-build/gen/thunkgen_guest_libvulkan.inl
+          bridge=guest-build/gen/thunkgen_bridge_libvulkan.inl
+          accessors=guest-build/gen/thunkgen_bridge_accessors_libvulkan.inl
+          normal_count="$(grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' "$normal")"
+          role_count="$(grep -Ec 'FEX_BRIDGE_ROLE' "$bridge")"
+          printf 'normal_callback_signatures=%s\nbridge_role_signatures=%s\n' "$normal_count" "$role_count" | tee "$R/signature-counts.txt"
+          test "$normal_count" -eq 480
+          test "$role_count" -eq 480
+          grep -F '.pfnAllocation = AllocateHostTrampolineForGuestFunction(' "$normal"
+          grep -F '.pfnReallocation = AllocateHostTrampolineForGuestFunction(' "$normal"
+          grep -F '.pfnFree = AllocateHostTrampolineForGuestFunction(' "$normal"
+          grep -F '.pfnInternalAllocation = AllocateHostTrampolineForGuestFunction(' "$normal"
+          grep -F '.pfnInternalFree = AllocateHostTrampolineForGuestFunction(' "$normal"
+          grep -F 'FinalizeHostTrampolineForGuestFunction(fex_callback_' build/ThunkLibs/libvulkan/thunkgen_host_libvulkan.inl | head
+          grep -E 'make_repack_wrapper<.*const .*VkAllocationCallbacks' build/ThunkLibs/libvulkan/thunkgen_host_libvulkan.inl | head
+          grep -F 'FEXResidentBridgeUnpacker' "$accessors"
+          readelf -d guest-build/libvulkan-guest.so | tee "$R/vulkan.dynamic"
+          readelf -d guest-build/libfex-vulkan-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/vulkan.dynamic"
+          grep -q 'NEEDED.*libfex-vulkan-bridge.so' "$R/vulkan.dynamic"
+          grep -q 'RUNPATH.*\$ORIGIN' "$R/vulkan.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+
+      - name: Prepare amd64 rootfs and probes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp guest-build/libfex-vulkan-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-vulkan-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void*d,int x){(void)d;(void)x;return 0;}
+          void*XGetVisualInfo(void*d,long m,void*t,int*n){(void)d;(void)m;(void)t;if(n)*n=0;return 0;}
+          char*XDisplayString(void*d){(void)d;static char s[]=":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -O0 -g -Wall -Wextra -Werror /tmp/vk_allocator_custom_host_matrix.c -ldl -o "$ROOTFS/opt/fex-ci/allocator-matrix"
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_pfn_unload_probe.c -ldl -o "$ROOTFS/opt/fex-ci/pfn-probe"
+          cp "$R/min.comp.spv" "$ROOTFS/opt/fex-ci/min.comp.spv"
+
+      - name: Execute integrated allocator matrix under FEX
+        shell: bash
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$GITHUB_WORKSPACE/build/HostLibs_64" timeout 30s \
+            "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/allocator-matrix /opt/fex-ci/min.comp.spv > "$R/fex-allocator.stdout" 2> "$R/fex-allocator.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/fex-allocator.exit"
+          cat "$R/fex-allocator.stderr"
+          test "$rc" -eq 0
+          grep -q 'PASS custom-host allocator forwarding matrix' "$R/fex-allocator.stderr"
+          grep -E -q 'DEVICE_CREATE_RETURN result=0 alloc_delta=[1-9]' "$R/fex-allocator.stderr"
+          grep -q 'MEM_ALLOC_RETURN result=0' "$R/fex-allocator.stderr"
+          grep -q 'SHADER_CREATE_RETURN result=0' "$R/fex-allocator.stderr"
+          grep -E -q 'DEVICE_DESTROY_RETURN free_delta=[1-9]' "$R/fex-allocator.stderr"
+
+      - name: Execute resident PFN close and reload under same candidate
+        shell: bash
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          run_case(){ mode="$1"; set +e; VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$GITHUB_WORKSPACE/build/HostLibs_64" timeout 30s "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/pfn-probe "$mode" > "$R/pfn-$mode.out" 2> "$R/pfn-$mode.err"; rc=$?; set -e; echo "$rc" > "$R/pfn-$mode.exit"; cat "$R/pfn-$mode.err"; }
+          run_case close
+          run_case reload
+          test "$(cat "$R/pfn-close.exit")" = 0
+          test "$(cat "$R/pfn-reload.exit")" = 0
+          grep -q 'PROBE return where=after-real-close result=0' "$R/pfn-close.err"
+          grep -q 'PROBE acquired generation=2' "$R/pfn-reload.err"
+          grep -q 'same-pfn=1' "$R/pfn-reload.err"
+          grep -q 'PROBE return where=after-reload-new-pfn result=0' "$R/pfn-reload.err"
+          printf 'native_allocator=%s\nfex_allocator=%s\npfn_close=%s\npfn_reload=%s\nOUTCOME=resident_bridge_plus_generated_vulkan_allocators_passed\n' \
+            "$(cat "$R/native.exit")" "$(cat "$R/fex-allocator.exit")" "$(cat "$R/pfn-close.exit")" "$(cat "$R/pfn-reload.exit")" | tee "$R/final-matrix.txt"
+
+      - name: Materialize source-only integration branch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --binary "$BASE" -- ThunkLibs > /tmp/integrated-vulkan-allocators.patch
+          cp /tmp/integrated-vulkan-allocators.patch "$R/source-only.patch"
+          test -s /tmp/integrated-vulkan-allocators.patch
+          git reset --hard "$BASE"
+          git checkout -B "$OUTPUT_BRANCH" "$BASE"
+          git apply --index /tmp/integrated-vulkan-allocators.patch
+          git diff --cached --check
+          test -z "$(git diff --cached --name-only | grep -v '^ThunkLibs/' || true)"
+          git config user.name Leo
+          git config user.email cheerleaderleo@outlook.com
+          git commit -m 'Research: integrate resident Vulkan allocator callbacks'
+          git rev-parse HEAD | tee "$R/integration-commit.txt"
+          git diff --name-only "$BASE"..HEAD | tee "$R/integration-files.txt"
+          git push origin "HEAD:refs/heads/$OUTPUT_BRANCH"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integrated-resident-vulkan-allocators-${{ github.run_id }}
+          path: integration-vulkan-allocator-receipts
+          retention-days: 30
