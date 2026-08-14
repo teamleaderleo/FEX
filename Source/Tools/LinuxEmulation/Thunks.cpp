@@ -20,8 +20,12 @@ $end_info$
 #include <FEXCore/fextl/set.h>
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/unordered_map.h>
+#include <FEXCore/fextl/vector.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <dlfcn.h>
 
 #include <malloc.h>
@@ -79,6 +83,87 @@ struct TrampolineInstanceInfo {
   uintptr_t GuestTarget;
 };
 
+struct GuestCallbackDescriptor {
+  enum class State : uint32_t { Live, Draining, Revoked };
+
+  explicit GuestCallbackDescriptor(uintptr_t Unpacker, uintptr_t Target)
+    : GuestUnpacker {Unpacker}, GuestTarget {Target} {}
+
+  bool TryAcquire() {
+    std::unique_lock lk(Mutex);
+    CV.wait(lk, [this]() { return Status != State::Draining; });
+    if (Status != State::Live) {
+      return false;
+    }
+    ++Active;
+    return true;
+  }
+
+  void Release() {
+    std::lock_guard lk(Mutex);
+    LOGMAN_THROW_A_FMT(Active != 0, "Callback descriptor active-count underflow");
+    --Active;
+    if (Active == 0) {
+      CV.notify_all();
+    }
+  }
+
+  void BeginDrain() {
+    std::lock_guard lk(Mutex);
+    if (Status == State::Revoked) {
+      return;
+    }
+    ++DrainRequests;
+    Status = State::Draining;
+  }
+
+  void WaitForDrain() {
+    std::unique_lock lk(Mutex);
+    CV.wait(lk, [this]() { return Active == 0; });
+  }
+
+  void CommitRevoke() {
+    std::lock_guard lk(Mutex);
+    Status = State::Revoked;
+    DrainRequests = 0;
+    CV.notify_all();
+  }
+
+  void RollbackDrain() {
+    std::lock_guard lk(Mutex);
+    // Another overlapping successful retirement may already have permanently
+    // revoked this descriptor. In that case this transaction has nothing left
+    // to roll back and must not underflow the request count.
+    if (Status == State::Revoked) {
+      return;
+    }
+    LOGMAN_THROW_A_FMT(DrainRequests != 0, "Callback descriptor drain-request underflow");
+    --DrainRequests;
+    if (DrainRequests == 0 && Status == State::Draining) {
+      Status = State::Live;
+      CV.notify_all();
+    }
+  }
+
+  State GetState() {
+    std::lock_guard lk(Mutex);
+    return Status;
+  }
+
+  size_t GetActive() {
+    std::lock_guard lk(Mutex);
+    return Active;
+  }
+
+  std::mutex Mutex;
+  std::condition_variable CV;
+  State Status {State::Live};
+  size_t Active {};
+  size_t DrainRequests {};
+  const uintptr_t GuestUnpacker;
+  const uintptr_t GuestTarget;
+};
+
 // Opaque type pointing to an instance of HostToGuestTrampolineTemplate and its
 // embedded TrampolineInstanceInfo
 struct HostToGuestTrampolinePtr;
@@ -121,6 +206,16 @@ struct ThunkHandler_impl final : public FEX::HLE::ThunkHandler {
 
   fextl::unordered_map<GuestcallInfo, HostToGuestTrampolinePtr*, GuestcallInfoHash> GuestcallToHostTrampoline;
 
+  struct DrainingGuestRange {
+    uintptr_t Base;
+    uintptr_t Length;
+
+    bool Contains(uintptr_t Address) const {
+      return Address >= Base && (Address - Base) < Length;
+    }
+  };
+  fextl::vector<DrainingGuestRange> DrainingGuestRanges;
+
   uint8_t* HostTrampolineInstanceDataPtr;
   size_t HostTrampolineInstanceDataAvailable = 0;
 
@@ -149,6 +244,44 @@ struct ThunkHandler_impl final : public FEX::HLE::ThunkHandler {
     CTX->HandleCallback(ThreadObject->Thread, (uintptr_t)callback);
   }
 
+  static void CallCallbackDescriptor(void* DescriptorV, void* UnusedTarget, void* ArgsRV) {
+    (void)UnusedTarget;
+    auto* Descriptor = reinterpret_cast<GuestCallbackDescriptor*>(DescriptorV);
+    LOGMAN_THROW_A_FMT(Descriptor != nullptr, "Host callback trampoline has no descriptor");
+
+    if (!Descriptor->TryAcquire()) {
+      std::_Exit(113);
+    }
+
+    struct CallbackExecutionLease final {
+      GuestCallbackDescriptor* Descriptor;
+      ~CallbackExecutionLease() { Descriptor->Release(); }
+    } Lease {Descriptor};
+
+
+    if (!ThreadObject) {
+      ERROR_AND_DIE_FMT("Thunked library attempted to invoke guest callback asynchronously");
+    }
+
+    auto CTX = static_cast<FEXCore::Context::Context*>(ThreadObject->Thread->CTX);
+    auto ThunkHandler = reinterpret_cast<ThunkHandler_impl*>(FEX::HLE::_SyscallHandler->GetThunkHandler());
+    const uintptr_t GuestUnpacker = Descriptor->GuestUnpacker;
+    const uintptr_t GuestTarget = Descriptor->GuestTarget;
+
+    if (ThunkHandler->Is64BitMode()) {
+      ThreadObject->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RDI] = GuestTarget;
+      ThreadObject->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSI] = reinterpret_cast<uintptr_t>(ArgsRV);
+    } else {
+      if ((reinterpret_cast<uintptr_t>(ArgsRV) >> 32) != 0 || (GuestTarget >> 32) != 0) {
+        ERROR_AND_DIE_FMT("Tried to call guest function with arguments packed to a 64-bit address");
+      }
+      ThreadObject->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RCX] = GuestTarget;
+      ThreadObject->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RDX] = reinterpret_cast<uintptr_t>(ArgsRV);
+    }
+
+    CTX->HandleCallback(ThreadObject->Thread, GuestUnpacker);
+  }
+
   FEXCore::ThunkedFunction* LookupThunk(const FEXCore::IR::SHA256Sum& sha256) override {
 
     std::shared_lock lk(ThunksMutex);
@@ -165,6 +298,10 @@ struct ThunkHandler_impl final : public FEX::HLE::ThunkHandler {
   void RegisterTLSState(FEX::HLE::ThreadStateObject* _ThreadObject) override {
     ThreadObject = _ThreadObject;
   }
+
+  void BeginGuestRangeRetirement(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Length) override;
+  void CommitGuestRangeRetirement(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Length) override;
+  void RollbackGuestRangeRetirement(uintptr_t Base, uintptr_t Length) override;
 
   void AppendThunkDefinitions(std::span<const FEXCore::IR::ThunkDefinition> Definitions) override {
     for (auto& Definition : Definitions) {
@@ -286,6 +423,85 @@ void ThunkHandler_impl::LoadLib(std::string_view Name) {
  * is to allocate the trampoline for a given GuestTarget/GuestUnpacker on the guest-side,
  * and provide the HostPacker host-side.
  */
+void ThunkHandler_impl::BeginGuestRangeRetirement(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Length) {
+  if (!Thread || !Length) return;
+
+  fextl::vector<GuestCallbackDescriptor*> CallbackDescriptorsToDrain;
+  {
+    std::lock_guard lk(ThunksMutex);
+    DrainingGuestRanges.emplace_back(DrainingGuestRange {Base, Length});
+
+    for (auto& [Guestcall, Trampoline] : GuestcallToHostTrampoline) {
+      const bool UnpackerInRange = Guestcall.GuestUnpacker >= Base && (Guestcall.GuestUnpacker - Base) < Length;
+      const bool TargetInRange = Guestcall.GuestTarget >= Base && (Guestcall.GuestTarget - Base) < Length;
+      if (!UnpackerInRange && !TargetInRange) continue;
+
+      auto* Descriptor = reinterpret_cast<GuestCallbackDescriptor*>(GetInstanceInfo(Trampoline).GuestUnpacker);
+      LOGMAN_THROW_A_FMT(Descriptor != nullptr, "Beginning callback retirement without descriptor");
+      Descriptor->BeginDrain();
+      CallbackDescriptorsToDrain.emplace_back(Descriptor);
+    }
+  }
+
+  // Never wait while holding ThunksMutex. An already-active guest callback may
+  // itself invoke another thunk before returning.
+  for (auto* Descriptor : CallbackDescriptorsToDrain) {
+    Descriptor->WaitForDrain();
+  }
+}
+
+void ThunkHandler_impl::CommitGuestRangeRetirement(FEXCore::Core::InternalThreadState* Thread, uintptr_t Base, uintptr_t Length) {
+  if (!Thread || !Length) return;
+
+  std::lock_guard lk(ThunksMutex);
+
+  // Commit every descriptor currently depending on the unmapped range,
+  // including descriptors created after Begin while the range was draining.
+  for (auto It = GuestcallToHostTrampoline.begin(); It != GuestcallToHostTrampoline.end();) {
+    const auto Unpacker = It->first.GuestUnpacker;
+    const auto Target = It->first.GuestTarget;
+    const bool UnpackerInRange = Unpacker >= Base && (Unpacker - Base) < Length;
+    const bool TargetInRange = Target >= Base && (Target - Base) < Length;
+    if (!UnpackerInRange && !TargetInRange) {
+      ++It;
+      continue;
+    }
+
+    auto* Trampoline = It->second;
+    auto* Descriptor = reinterpret_cast<GuestCallbackDescriptor*>(GetInstanceInfo(Trampoline).GuestUnpacker);
+    LOGMAN_THROW_A_FMT(Descriptor != nullptr, "Committing callback retirement without descriptor");
+    Descriptor->CommitRevoke();
+    It = GuestcallToHostTrampoline.erase(It);
+  }
+
+  auto Range = std::find_if(DrainingGuestRanges.begin(), DrainingGuestRanges.end(), [&](const DrainingGuestRange& R) {
+    return R.Base == Base && R.Length == Length;
+  });
+  LOGMAN_THROW_A_FMT(Range != DrainingGuestRanges.end(), "Committing unknown guest-range retirement");
+  DrainingGuestRanges.erase(Range);
+}
+
+void ThunkHandler_impl::RollbackGuestRangeRetirement(uintptr_t Base, uintptr_t Length) {
+  if (!Length) return;
+
+  std::lock_guard lk(ThunksMutex);
+  for (auto& [Guestcall, Trampoline] : GuestcallToHostTrampoline) {
+    const bool UnpackerInRange = Guestcall.GuestUnpacker >= Base && (Guestcall.GuestUnpacker - Base) < Length;
+    const bool TargetInRange = Guestcall.GuestTarget >= Base && (Guestcall.GuestTarget - Base) < Length;
+    if (!UnpackerInRange && !TargetInRange) continue;
+
+    auto* Descriptor = reinterpret_cast<GuestCallbackDescriptor*>(GetInstanceInfo(Trampoline).GuestUnpacker);
+    LOGMAN_THROW_A_FMT(Descriptor != nullptr, "Rolling back callback retirement without descriptor");
+    Descriptor->RollbackDrain();
+  }
+
+  auto Range = std::find_if(DrainingGuestRanges.begin(), DrainingGuestRanges.end(), [&](const DrainingGuestRange& R) {
+    return R.Base == Base && R.Length == Length;
+  });
+  LOGMAN_THROW_A_FMT(Range != DrainingGuestRanges.end(), "Rolling back unknown guest-range retirement");
+  DrainingGuestRanges.erase(Range);
+}
+
 FEX_DEFAULT_VISIBILITY HostToGuestTrampolinePtr*
 MakeHostTrampolineForGuestFunction(void* HostPacker, uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
   LOGMAN_THROW_A_FMT(GuestTarget, "Tried to create host-trampoline to null pointer guest function");
@@ -331,8 +547,17 @@ MakeHostTrampolineForGuestFunction(void* HostPacker, uintptr_t GuestTarget, uint
   ThunkHandler->HostTrampolineInstanceDataAvailable -= HostToGuestTrampolineSize;
   ThunkHandler->HostTrampolineInstanceDataPtr += HostToGuestTrampolineSize;
   memcpy(HostTrampoline, (void*)&HostToGuestTrampolineTemplate, HostToGuestTrampolineSize);
+  auto* Descriptor = new GuestCallbackDescriptor {GuestUnpacker, GuestTarget};
+  for (const auto& Range : ThunkHandler->DrainingGuestRanges) {
+    if (Range.Contains(GuestUnpacker) || Range.Contains(GuestTarget)) {
+      Descriptor->BeginDrain();
+    }
+  }
   GetInstanceInfo(HostTrampoline) = TrampolineInstanceInfo {
-    .HostPacker = HostPacker, .CallCallback = (uintptr_t)&ThunkHandler_impl::CallCallback, .GuestUnpacker = GuestUnpacker, .GuestTarget = GuestTarget};
+    .HostPacker = HostPacker,
+    .CallCallback = (uintptr_t)&ThunkHandler_impl::CallCallbackDescriptor,
+    .GuestUnpacker = reinterpret_cast<uintptr_t>(Descriptor),
+    .GuestTarget = 0};
 
   ThunkHandler->GuestcallToHostTrampoline[gci] = HostTrampoline;
   return HostTrampoline;
@@ -345,8 +570,8 @@ FEX_DEFAULT_VISIBILITY void FinalizeHostTrampolineForGuestFunction(HostToGuestTr
 
   auto& Trampoline = GetInstanceInfo(TrampolineAddress);
 
-  LOGMAN_THROW_A_FMT(Trampoline.CallCallback == (uintptr_t)&ThunkHandler_impl::CallCallback, "Invalid trampoline at {} passed to {}",
-                     fmt::ptr(TrampolineAddress), __FUNCTION__);
+  LOGMAN_THROW_A_FMT(Trampoline.CallCallback == (uintptr_t)&ThunkHandler_impl::CallCallbackDescriptor,
+                     "Invalid trampoline at {} passed to {}", fmt::ptr(TrampolineAddress), __FUNCTION__);
 
   if (!Trampoline.HostPacker) {
     LogMan::Msg::DFmt("Thunks: Finalizing trampoline at {} with host packer {}", fmt::ptr(TrampolineAddress), fmt::ptr(HostPacker));
@@ -412,15 +637,15 @@ namespace ThunkFunctions {
    * returned from thunked APIs can safely be called by the guest.
    */
   void LinkAddressToGuestFunction(void* argsv) {
-    struct args_t {
-      uintptr_t original_callee;
-      uintptr_t target_addr; // Guest function to call when branching to original_callee
-    };
+  struct args_t {
+    uintptr_t original_callee;
+    uintptr_t target_addr; // Guest function to call when branching to original_callee
+  };
 
-    auto args = reinterpret_cast<args_t*>(argsv);
-    auto CTX = static_cast<FEXCore::Context::Context*>(ThreadObject->Thread->CTX);
-    CTX->AddThunkTrampolineIRHandler(args->original_callee, args->target_addr);
-  }
+  auto args = reinterpret_cast<args_t*>(argsv);
+  auto CTX = static_cast<FEXCore::Context::Context*>(ThreadObject->Thread->CTX);
+  CTX->AddThunkTrampolineIRHandler(args->original_callee, args->target_addr);
+}
 
   /**
    * Guest-side helper to initiate creation of a host trampoline for
