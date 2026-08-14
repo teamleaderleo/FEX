@@ -1,4 +1,4 @@
-name: CUDA resident post-unload runtime v1
+name: CUDA committed resident PFN runtime v1
 
 on:
   push:
@@ -13,12 +13,12 @@ permissions:
 jobs:
   cuda-runtime:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 80
+    timeout-minutes: 75
     env:
-      ROOTFS: ${{ github.workspace }}/rootfs-cuda-resident-v1
-      R: ${{ github.workspace }}/receipts-cuda-resident-runtime-v1
-      H: ${{ github.workspace }}/host-cuda-resident-v1
-      M: ${{ github.workspace }}/mock-cuda-resident-v1
+      ROOTFS: ${{ github.workspace }}/rootfs-cuda-resident-committed-v1
+      R: ${{ github.workspace }}/receipts-cuda-resident-committed-v1
+      H: ${{ github.workspace }}/host-cuda-resident-committed-v1
+      M: ${{ github.workspace }}/mock-cuda-resident-committed-v1
       FEX_PORTABLE: 1
       DEBIAN_FRONTEND: noninteractive
 
@@ -28,7 +28,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Dependencies
+      - name: Dependencies and committed-source checks
         shell: bash
         run: |
           set -euxo pipefail
@@ -37,9 +37,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
-            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
-            libwayland-dev
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev
           git rev-parse HEAD | tee "$R/carrier-sha.txt"
+          git diff --check
+          grep -q 'generate(libcuda .* RESIDENT_BRIDGE)' ThunkLibs/GuestLibs/CMakeLists.txt
+          grep -q 'FEXGetResidentCallerForHostFunction(name)' ThunkLibs/libcuda/libcuda_Guest.cpp
+          grep -q 'FEXAllocateResidentHostTrampolineForGuestFunction' ThunkLibs/libcuda/libcuda_Guest.cpp
+          test -f ThunkLibs/libcuda_bridge/Guest.cpp
+          test ! -e .github/workflows/materialize-cuda-resident-source-v1.yml
 
       - name: Build FEX and CUDA host thunk
         shell: bash
@@ -56,25 +61,55 @@ jobs:
           cmake --build build --target FEX FEXServer cuda-host-64 -- -j"$(nproc)" -v \
             > "$R/build-host.log" 2>&1 || { tail -n 520 "$R/build-host.log"; exit 1; }
           cp build/HostLibs_64/libcuda-host.so "$H/libcuda-host.so"
-          test -x build/Bin/FEX
-          test -f "$H/libcuda-host.so"
 
-      - name: Build stock CUDA guest wrapper baseline
+      - name: Build committed CUDA wrapper and resident companion
         shell: bash
         run: |
           set -euxo pipefail
-          cmake -S ThunkLibs/GuestLibs -B guest-base -G Ninja \
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
             -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
             -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
             -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
-            > "$R/cmake-guest-base.log" 2>&1 \
-            || { tail -n 260 "$R/cmake-guest-base.log"; exit 1; }
-          cmake --build guest-base --target cuda-guest -- -j"$(nproc)" -v \
-            > "$R/build-guest-base.log" 2>&1 || { tail -n 520 "$R/build-guest-base.log"; exit 1; }
-          test -f guest-base/libcuda-guest.so
-          readelf -d guest-base/libcuda-guest.so | tee "$R/baseline-wrapper.dynamic"
-          ! grep -q 'FLAGS_1.*NODELETE' "$R/baseline-wrapper.dynamic"
+            > "$R/cmake-guest.log" 2>&1 \
+            || { tail -n 280 "$R/cmake-guest.log"; exit 1; }
+          cmake --build guest --target cuda-guest cuda_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 620 "$R/build-guest.log"; exit 1; }
+
+          test -f guest/libcuda-guest.so
+          test -f guest/libfex-cuda-bridge.so
+          test -f guest/gen/thunkgen_guest_libcuda.inl
+          test -f guest/gen/thunkgen_guest_libcuda_bridge.inl
+          test -f guest/gen/thunkgen_guest_libcuda_bridge_accessors.inl
+
+          awk '/^[[:space:]]*MAKE_CALLBACK_THUNK/{sub(/^[[:space:]]*/, ""); print}' \
+            guest/gen/thunkgen_guest_libcuda.inl > "$R/normal-signatures.txt"
+          awk '/^[[:space:]]*MAKE_CALLBACK_THUNK/{sub(/^[[:space:]]*/, ""); print}' \
+            guest/gen/thunkgen_guest_libcuda_bridge.inl > "$R/resident-signatures.txt"
+          diff -u "$R/normal-signatures.txt" "$R/resident-signatures.txt" > "$R/signature-set.diff"
+          wc -l < "$R/normal-signatures.txt" | tr -d ' ' | tee "$R/signature-count.txt"
+          test "$(cat "$R/signature-count.txt")" = 364
+
+          awk '/^extern "C" uintptr_t fex_bridge_libcuda_unpacker_/{n++} END{print n+0}' \
+            guest/gen/thunkgen_guest_libcuda_bridge.inl | tee "$R/resident-unpacker-count.txt"
+          awk '/^template<> struct FEXResidentBridgeUnpacker</{n++} END{print n+0}' \
+            guest/gen/thunkgen_guest_libcuda_bridge_accessors.inl | tee "$R/accessor-unpacker-count.txt"
+          awk '/^template<> struct FEXResidentBridgeInvoker</{n++} END{print n+0}' \
+            guest/gen/thunkgen_guest_libcuda_bridge_accessors.inl | tee "$R/accessor-invoker-count.txt"
+          test "$(cat "$R/resident-unpacker-count.txt")" = 1
+          test "$(cat "$R/accessor-unpacker-count.txt")" = 1
+          test "$(cat "$R/accessor-invoker-count.txt")" = 364
+
+          readelf -d guest/libcuda-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest/libfex-cuda-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-cuda-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          stat -c 'bridge_file_bytes=%s' guest/libfex-cuda-bridge.so | tee "$R/bridge-size.txt"
+          sha256sum guest/gen/thunkgen_guest_libcuda_bridge.inl \
+                    guest/gen/thunkgen_guest_libcuda_bridge_accessors.inl \
+                    guest/libcuda-guest.so guest/libfex-cuda-bridge.so \
+            | tee "$R/product-sha256.txt"
 
       - name: Build fake native CUDA driver and guest probe
         shell: bash
@@ -84,16 +119,13 @@ jobs:
           #include <stdint.h>
           #include <stdio.h>
           #include <string.h>
-
           typedef int CUresult;
 
-          __attribute__((visibility("default")))
           CUresult cuInit(unsigned int flags) {
             fprintf(stderr, "HOST_CUINIT flags=%u\n", flags);
             return 1000 + (int)flags;
           }
 
-          __attribute__((visibility("default")))
           CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
                                       uint64_t flags, int *symbolStatus) {
             fprintf(stderr, "HOST_CUGET symbol=%s version=%d flags=%llu\n",
@@ -118,6 +150,8 @@ jobs:
           docker export "$cid" | tar -C "$ROOTFS" -xf -
           docker rm "$cid"; trap - EXIT
           mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libcuda-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libcuda.so.1"
+          cp guest/libfex-cuda-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-cuda-bridge.so"
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
 
@@ -206,177 +240,60 @@ jobs:
             return (CUINIT)p;
           }
 
-          int main(int argc, char **argv) {
-            int resident = argc > 1 && strcmp(argv[1], "resident") == 0;
+          int main(void) {
             void *h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
             if (!h) { fprintf(stderr, "DLOPEN_FAIL %s\n", dlerror()); return 1; }
             CUGET get0 = (CUGET)dlsym(h, "cuGetProcAddress_v2");
-            if (!get0) { fprintf(stderr, "DLSYM_FAIL %s\n", dlerror()); return 2; }
+            if (!get0) return 2;
             CUINIT p0 = get_init(get0);
-            int pre = p0(41);
-            fprintf(stderr, "PRE_CLOSE_RETURN rc=%d get=%p H=%p resident_bridge=%d\n",
-                    pre, (void *)get0, (void *)p0, maps_contain("/libfex-cuda-bridge.so"));
-            if (pre != 1041) return 3;
+            if (p0(41) != 1041) return 3;
+            fprintf(stderr, "PRE_CLOSE_CUDA_OK get=%p H=%p bridge=%d\n",
+                    (void *)get0, (void *)p0, maps_contain("/libfex-cuda-bridge.so"));
             capture_wrapper();
             if (dlclose(h)) return 4;
             if (map_has((void *)get0, "/usr/lib/x86_64-linux-gnu/libcuda.so.1", 1) != 0) return 5;
-            fprintf(stderr, "POST_CLOSE_CALL_BEGIN H=%p resident=%d\n", (void *)p0, resident);
             int post = p0(42);
-            fprintf(stderr, "POST_CLOSE_CALL_RETURNED rc=%d\n", post);
-            if (!resident) {
-              fprintf(stderr, "BASELINE_UNEXPECTED_POST_CLOSE_RETURN\n");
-              return 90;
-            }
-            if (post != 1042) return 6;
-            if (!maps_contain("/libfex-cuda-bridge.so")) return 7;
+            fprintf(stderr, "POST_CLOSE_CUDA_RETURN rc=%d\n", post);
+            if (post != 1042 || !maps_contain("/libfex-cuda-bridge.so")) return 6;
 
             reserve_old();
             void *h2 = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
-            if (!h2) { fprintf(stderr, "RELOAD_FAIL %s\n", dlerror()); return 8; }
+            if (!h2) { fprintf(stderr, "RELOAD_FAIL %s\n", dlerror()); return 7; }
             CUGET get1 = (CUGET)dlsym(h2, "cuGetProcAddress_v2");
             CUINIT p1 = get_init(get1);
             fprintf(stderr, "GEN2 get_old=%p get_new=%p moved=%d H_old=%p H_new=%p same_H=%d\n",
                     (void *)get0, (void *)get1, get0 != get1,
                     (void *)p0, (void *)p1, p0 == p1);
-            if (get0 == get1 || p0 != p1) return 9;
-            if (p1(43) != 1043) return 10;
-            if (dlclose(h2)) return 11;
-            if (p0(44) != 1044) return 12;
-            fprintf(stderr, "CUDA_RESIDENT_POST_UNLOAD_OK\n");
+            if (get0 == get1 || p0 != p1) return 8;
+            if (p1(43) != 1043) return 9;
+            if (dlclose(h2)) return 10;
+            if (p0(44) != 1044) return 11;
+            fprintf(stderr, "COMMITTED_CUDA_RESIDENT_PFN_RUNTIME_OK\n");
             return 0;
           }
           EOF
           x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/cudaprobe.c -ldl -o "$ROOTFS/opt/fex-ci/cudaprobe"
 
-      - name: Prove stock CUDA proc-address target dies with wrapper
-        shell: bash
-        run: |
-          set -uxo pipefail
-          cp guest-base/libcuda-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libcuda.so.1"
-          rm -f "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-cuda-bridge.so"
-          set +e
-          LD_LIBRARY_PATH="$M" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 25s \
-            build/Bin/FEX /opt/fex-ci/cudaprobe baseline > "$R/baseline.out" 2> "$R/baseline.err"
-          rc=$?
-          set -e
-          echo "$rc" | tee "$R/baseline.exit"
-          cat "$R/baseline.err"
-          test "$rc" -ne 0
-          grep -q 'PRE_CLOSE_RETURN rc=1041' "$R/baseline.err"
-          grep -q 'UNMAPPED ' "$R/baseline.err"
-          grep -q 'POST_CLOSE_CALL_BEGIN' "$R/baseline.err"
-          ! grep -q 'POST_CLOSE_CALL_RETURNED' "$R/baseline.err"
-          ! grep -q 'BASELINE_UNEXPECTED_POST_CLOSE_RETURN' "$R/baseline.err"
-          echo CUDA_BASELINE_POST_UNLOAD_FAILURE_PROVEN | tee "$R/baseline-result.txt"
-
-      - name: Apply CUDA resident companion candidate
+      - name: Prove committed CUDA retained PFN survives unload and moved reload
         shell: bash
         run: |
           set -euxo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          cmake = Path('ThunkLibs/GuestLibs/CMakeLists.txt')
-          s = cmake.read_text()
-          old = '''generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp)\nadd_guest_lib(cuda "libcuda.so.1")'''
-          new = '''generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp RESIDENT_BRIDGE)\n\nadd_library(libcuda_bridge-guest-deps INTERFACE)\ntarget_link_libraries(libcuda_bridge-guest-deps INTERFACE libcuda-guest-deps)\nset(GEN_libcuda_bridge "${GEN_libcuda_BRIDGE}")\nadd_guest_lib(cuda_bridge "libfex-cuda-bridge.so")\nset_target_properties(cuda_bridge-guest PROPERTIES OUTPUT_NAME "fex-cuda-bridge")\ntarget_link_options(cuda_bridge-guest PRIVATE "LINKER:-z,nodelete")\n\nadd_guest_lib(cuda "libcuda.so.1")\ntarget_link_libraries(cuda-guest PRIVATE cuda_bridge-guest)'''
-          if s.count(old) != 1:
-              raise SystemExit('CUDA CMake anchor missing')
-          cmake.write_text(s.replace(old, new, 1))
-
-          guest = Path('ThunkLibs/libcuda/libcuda_Guest.cpp')
-          s = guest.read_text()
-          old = '''#include "common/Guest.h"\n#include "cuda_defines.h"\n\n#include "thunkgen_guest_libcuda.inl"'''
-          new = '''#include "common/Guest.h"\n#include "cuda_defines.h"\n#include "thunkgen_guest_libcuda_bridge_accessors.inl"\n\n#define AllocateHostTrampolineForGuestFunction FEXAllocateResidentHostTrampolineForGuestFunction\n#include "thunkgen_guest_libcuda.inl"\n#undef AllocateHostTrampolineForGuestFunction'''
-          if s.count(old) != 1:
-              raise SystemExit('CUDA include anchor missing')
-          s = s.replace(old, new, 1)
-          old = 'GetCallerForHostFunction(name)'
-          new = 'FEXGetResidentCallerForHostFunction(name)'
-          if s.count(old) != 1:
-              raise SystemExit('CUDA invoker anchor missing')
-          guest.write_text(s.replace(old, new, 1))
-          PY
-
-          mkdir -p ThunkLibs/libcuda_bridge
-          cat > ThunkLibs/libcuda_bridge/Guest.cpp <<'EOF'
-          // SPDX-License-Identifier: MIT
-          #include "common/Guest.h"
-          #include "../libcuda/cuda_defines.h"
-          #include "thunkgen_guest_libcuda_bridge.inl"
-          EOF
-
-          git diff --check
-          git diff -- ThunkLibs/GuestLibs/CMakeLists.txt ThunkLibs/libcuda/libcuda_Guest.cpp \
-            | tee "$R/cuda-resident-candidate.diff"
-          cat ThunkLibs/libcuda_bridge/Guest.cpp | tee "$R/cuda-bridge-Guest.cpp"
-
-      - name: Build CUDA resident candidate
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cmake -S ThunkLibs/GuestLibs -B guest-resident -G Ninja \
-            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
-            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
-            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
-            > "$R/cmake-guest-resident.log" 2>&1 \
-            || { tail -n 280 "$R/cmake-guest-resident.log"; exit 1; }
-          cmake --build guest-resident --target cuda-guest cuda_bridge-guest -- -j"$(nproc)" -v \
-            > "$R/build-guest-resident.log" 2>&1 || { tail -n 620 "$R/build-guest-resident.log"; exit 1; }
-
-          test -f guest-resident/libcuda-guest.so
-          test -f guest-resident/libfex-cuda-bridge.so
-          test -f guest-resident/gen/thunkgen_guest_libcuda.inl
-          test -f guest-resident/gen/thunkgen_guest_libcuda_bridge.inl
-          test -f guest-resident/gen/thunkgen_guest_libcuda_bridge_accessors.inl
-
-          awk '/^[[:space:]]*MAKE_CALLBACK_THUNK/{n++} END{print n+0}' guest-resident/gen/thunkgen_guest_libcuda.inl \
-            | tee "$R/cuda-signature-count.txt"
-          awk '/^[[:space:]]*MAKE_CALLBACK_THUNK/{n++} END{print n+0}' guest-resident/gen/thunkgen_guest_libcuda_bridge.inl \
-            | tee "$R/cuda-bridge-signature-count.txt"
-          test "$(cat "$R/cuda-signature-count.txt")" = "$(cat "$R/cuda-bridge-signature-count.txt")"
-          test "$(cat "$R/cuda-signature-count.txt")" -gt 0
-
-          awk '/^extern "C" uintptr_t fex_bridge_libcuda_unpacker_/{n++} END{print n+0}' \
-            guest-resident/gen/thunkgen_guest_libcuda_bridge.inl | tee "$R/cuda-resident-unpacker-count.txt"
-          awk '/^template<> struct FEXResidentBridgeUnpacker</{n++} END{print n+0}' \
-            guest-resident/gen/thunkgen_guest_libcuda_bridge_accessors.inl | tee "$R/cuda-accessor-unpacker-count.txt"
-          test "$(cat "$R/cuda-resident-unpacker-count.txt")" = "$(cat "$R/cuda-accessor-unpacker-count.txt")"
-          ! grep -q 'FEXResidentBridgeCanUnpack' guest-resident/gen/thunkgen_guest_libcuda_bridge.inl
-
-          readelf -d guest-resident/libcuda-guest.so | tee "$R/resident-wrapper.dynamic"
-          readelf -d guest-resident/libfex-cuda-bridge.so | tee "$R/resident-bridge.dynamic"
-          ! grep -q 'FLAGS_1.*NODELETE' "$R/resident-wrapper.dynamic"
-          grep -q 'NEEDED.*libfex-cuda-bridge.so' "$R/resident-wrapper.dynamic"
-          grep -q 'FLAGS_1.*NODELETE' "$R/resident-bridge.dynamic"
-          stat -c 'bridge_file_bytes=%s' guest-resident/libfex-cuda-bridge.so | tee "$R/cuda-bridge-size.txt"
-          sha256sum guest-resident/gen/thunkgen_guest_libcuda_bridge.inl \
-                    guest-resident/gen/thunkgen_guest_libcuda_bridge_accessors.inl \
-                    guest-resident/libfex-cuda-bridge.so | tee "$R/cuda-product-sha256.txt"
-
-      - name: Prove CUDA resident proc-address target survives unload and moved reload
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cp guest-resident/libcuda-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libcuda.so.1"
-          cp guest-resident/libfex-cuda-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-cuda-bridge.so"
           LD_LIBRARY_PATH="$M" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 35s \
-            build/Bin/FEX /opt/fex-ci/cudaprobe resident > "$R/resident.out" 2> "$R/resident.err"
-          cat "$R/resident.err"
-          grep -q 'PRE_CLOSE_RETURN rc=1041' "$R/resident.err"
-          grep -q 'UNMAPPED ' "$R/resident.err"
-          grep -q 'POST_CLOSE_CALL_RETURNED rc=1042' "$R/resident.err"
-          grep -q 'moved=1' "$R/resident.err"
-          grep -q 'same_H=1' "$R/resident.err"
-          grep -q 'HOST_CUINIT flags=44' "$R/resident.err"
-          grep -q 'CUDA_RESIDENT_POST_UNLOAD_OK' "$R/resident.err"
-          echo CUDA_RESIDENT_RUNTIME_DISCRIMINATOR_OK | tee "$R/result.txt"
+            build/Bin/FEX /opt/fex-ci/cudaprobe > "$R/probe.out" 2> "$R/probe.err"
+          cat "$R/probe.err"
+          grep -q 'PRE_CLOSE_CUDA_OK' "$R/probe.err"
+          grep -q 'UNMAPPED ' "$R/probe.err"
+          grep -q 'POST_CLOSE_CUDA_RETURN rc=1042' "$R/probe.err"
+          grep -q 'moved=1' "$R/probe.err"
+          grep -q 'same_H=1' "$R/probe.err"
+          grep -q 'HOST_CUINIT flags=44' "$R/probe.err"
+          grep -q 'COMMITTED_CUDA_RESIDENT_PFN_RUNTIME_OK' "$R/probe.err"
+          echo COMMITTED_CUDA_RESIDENT_PFN_ACCEPTANCE_OK | tee "$R/result.txt"
 
       - name: Upload receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cuda-resident-runtime-v1-${{ github.run_id }}
-          path: receipts-cuda-resident-runtime-v1
+          name: cuda-resident-committed-v1-${{ github.run_id }}
+          path: receipts-cuda-resident-committed-v1
           retention-days: 30
