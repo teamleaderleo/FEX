@@ -9,13 +9,17 @@ if text.count(marker) != 1:
 test = r'''
 TEST_CASE_METHOD(Fixture, "Custom host symbol registry follows namespace metadata") {
   constexpr std::string_view prelude = R"(
+namespace fexgen {
+struct custom_host_impl {};
+struct generate_guest_symtable {};
+struct indirect_guest_calls {};
+}
 namespace internal {
 void ordinary();
 void custom();
 }
 )";
   constexpr std::string_view code = R"(
-#include <common/GeneratorInterface.h>
 namespace internal {
 template<auto>
 struct fex_gen_config : fexgen::generate_guest_symtable, fexgen::indirect_guest_calls {};
