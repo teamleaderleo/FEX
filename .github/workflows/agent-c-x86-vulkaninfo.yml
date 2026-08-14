@@ -100,7 +100,7 @@ jobs:
           # Foreign debootstrap already unpacked the base set. Re-extracting those payloads
           # can fail on package hardlinks that are normally completed by maintainer scripts.
           # Parse debootstrap's own extraction receipt and add only its deferred packages.
-          sed -n 's/^I: Extracting \([^ ]*\).*/\1/p' "$R/debootstrap.log" \
+          sed -n 's/^I: Extracting \([^ ]*\)\.\.\.$/\1/p' "$R/debootstrap.log" \
             | sort -u | tee "$R/rootfs-already-extracted.txt"
           : > "$R/rootfs-deferred-extracted.txt"
           while IFS= read -r deb; do
