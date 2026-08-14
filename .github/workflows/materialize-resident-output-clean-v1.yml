@@ -1,0 +1,54 @@
+name: Materialize resident output clean v1
+
+on:
+  push:
+    branches:
+      - diagnostic/thunkgen-resident-output-clean-v1
+    paths:
+      - .github/workflows/materialize-resident-output-clean-v1.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: diagnostic/thunkgen-resident-output-clean-v1
+
+      - name: Apply proven generator candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 ThunkLibs/Generator/apply_resident_output_candidate.py
+          python3 ThunkLibs/Generator/apply_resident_output_candidate_fixups.py
+          python3 ThunkLibs/Generator/apply_resident_direction_candidate.py
+          python3 ThunkLibs/Generator/apply_resident_vulkan_first_class_candidate.py
+
+          rm ThunkLibs/Generator/extract_guest_bridge.py
+          rm ThunkLibs/Generator/apply_resident_output_candidate.py
+          rm ThunkLibs/Generator/apply_resident_output_candidate_fixups.py
+          rm ThunkLibs/Generator/apply_resident_direction_candidate.py
+          rm ThunkLibs/Generator/apply_resident_vulkan_first_class_candidate.py
+
+          git diff --check
+          grep -q 'host_to_guest_callback_funcptrs' ThunkLibs/Generator/analysis.cpp
+          grep -q 'target_abi == "-guest-resident"' ThunkLibs/Generator/main.cpp
+          grep -q 'generate(libGL .* RESIDENT_BRIDGE)' ThunkLibs/GuestLibs/CMakeLists.txt
+          grep -q 'generate(libvulkan .* RESIDENT_BRIDGE)' ThunkLibs/GuestLibs/CMakeLists.txt
+          ! grep -q 'FEXResidentBridgeCanUnpack' ThunkLibs/Generator/gen.cpp
+          test ! -e ThunkLibs/Generator/extract_guest_bridge.py
+
+      - name: Commit materialized candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm .github/workflows/materialize-resident-output-clean-v1.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'ThunkGen: materialize resident bridge generation candidate'
+          git push origin HEAD:diagnostic/thunkgen-resident-output-clean-v1
