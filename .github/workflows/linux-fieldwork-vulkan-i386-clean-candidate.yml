@@ -1,0 +1,104 @@
+name: Vulkan i386 clean candidate runtime
+on:
+  workflow_dispatch:
+  push:
+    branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
+    paths:
+      - .github/workflows/linux-fieldwork-vulkan-i386-clean-candidate.yml
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: carrier
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: c011366706eaf65a00380003989b3a10811212b6
+          path: product
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-callback-ci
+          path: fieldwork
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang lld clang-tools libclang-dev llvm-dev pkg-config ccache gcc-x86-64-linux-gnu g++-x86-64-linux-gnu gcc-i686-linux-gnu g++-i686-linux-gnu libcap-dev libglfw3-dev libepoxy-dev python3-dev libsdl2-dev libasound2-dev libdrm-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libgl-dev libegl-dev libvulkan-dev mesa-vulkan-drivers
+      - name: Build exact clean candidate
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD)" = c011366706eaf65a00380003989b3a10811212b6
+          C=$(dirname "$(find /usr/lib/llvm-18 -name ClangConfig.cmake -print -quit)")
+          L=$(dirname "$(find /usr/lib/llvm-18 -name LLVMConfig.cmake -print -quit)")
+          CC=clang CXX=clang++ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX="$PWD/install" -DUSE_LINKER=lld -DENABLE_LTO=False -DENABLE_ASSERTIONS=True -DBUILD_TESTING=False -DBUILD_THUNKS=True -DBUILD_FEXCONFIG=False -DENABLE_CLANG_THUNKS=True -DRANGES_NATIVE=OFF -DClang_DIR="$C" -DLLVM_DIR="$L"
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+          find install -type f | grep -E 'vulkan|ThunksDB' | sort | tee /tmp/install-vulkan-files.txt
+      - name: Compile i386 probes and X11 fixture
+        run: |
+          set -euxo pipefail
+          P=fieldwork/investigations/fex-vulkan-thunk-lifecycle
+          i686-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$P/fex_vulkan_callback_probe.c" -ldl -o /tmp/callback32
+          i686-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror "$P/procaddr_semantics_probe.c" -ldl -o /tmp/procaddr32
+          i686-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror -shared -fPIC -Wl,-soname,libX11.so.6 "$P/x11_symbol_fixture.c" -o /tmp/libX11.so.6
+          file /tmp/callback32 /tmp/procaddr32 /tmp/libX11.so.6
+      - name: Build minimal i386 rootfs
+        run: |
+          set -euxo pipefail
+          sudo systemctl start docker || true
+          sudo docker pull --platform linux/386 i386/ubuntu:24.04
+          cid=$(sudo docker create --platform linux/386 i386/ubuntu:24.04)
+          mkdir rootfs32
+          sudo docker export "$cid" | sudo tar -C rootfs32 -xf -
+          sudo docker rm "$cid"
+          sudo mkdir -p rootfs32/tmp rootfs32/usr/lib/i386-linux-gnu
+          sudo cp /tmp/callback32 /tmp/procaddr32 rootfs32/tmp/
+          sudo cp /tmp/libX11.so.6 rootfs32/usr/lib/i386-linux-gnu/libX11.so.6
+          GUEST32=$(find product/install -type f -path '*GuestThunks_32*' -name 'libvulkan-guest.so' -print -quit)
+          test -n "$GUEST32"
+          sudo cp "$GUEST32" rootfs32/usr/lib/i386-linux-gnu/libvulkan.so.1
+          file rootfs32/usr/lib/i386-linux-gnu/libvulkan.so.1
+      - name: Run i386 callback and procaddr matrix
+        run: |
+          set -euxo pipefail
+          ICD=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' | head -1)
+          HOST32=$(find product/install -type f -path '*HostThunks_32*' -name 'libvulkan-host.so' -print -quit)
+          GUEST32=$(find product/install -type f -path '*GuestThunks_32*' -name 'libvulkan-guest.so' -print -quit)
+          test -n "$HOST32"
+          test -n "$GUEST32"
+          HOST32DIR=$(dirname "$HOST32")
+          GUEST32DIR=$(dirname "$GUEST32")
+          mkdir -p "$HOME/.fex-emu" evidence32
+          printf '{"Config":{"RootFS":"%s/rootfs32","ThunkConfig":"%s/product/install/share/fex-emu/ThunksDB.json"},"ThunksDB":{"Vulkan":1}}\n' "$PWD" "$PWD" > "$HOME/.fex-emu/Config.json"
+          printf 'candidate=%s\nhost32=%s\nguest32=%s\n' c011366706eaf65a00380003989b3a10811212b6 "$HOST32" "$GUEST32" | tee evidence32/identity.txt
+          run_case() {
+            name=$1; shift
+            set +e
+            VK_ICD_FILENAMES="$ICD" FEX_ROOTFS="$PWD/rootfs32" FEX_THUNKCONFIG="$PWD/product/install/share/fex-emu/ThunksDB.json" FEX_THUNKGUESTLIBS="$GUEST32DIR" FEX_THUNKHOSTLIBS="$HOST32DIR" product/install/bin/FEX "$@" >"evidence32/$name.log" 2>&1
+            rc=$?
+            set -e
+            echo "$name=$rc" | tee -a evidence32/matrix.txt
+            cat "evidence32/$name.log"
+            test "$rc" -eq 0
+          }
+          run_case direct-report /tmp/callback32 report direct 0
+          run_case direct-utils /tmp/callback32 utils direct 0
+          run_case dynamic-report /tmp/callback32 report gipa 0
+          run_case dynamic-utils /tmp/callback32 utils gipa 0
+          run_case procaddr /tmp/procaddr32
+      - name: Upload i386 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-i386-clean-${{ github.run_id }}
+          path: |
+            evidence32
+            /tmp/install-vulkan-files.txt
+          retention-days: 14
