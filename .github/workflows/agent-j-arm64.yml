@@ -1,4 +1,4 @@
-name: Agent J ARM64 stable thunk target cell
+name: Agent J ARM64 dynamic thunk target cell
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  stable-cell:
+  dynamic-cell:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     env:
@@ -46,7 +46,7 @@ jobs:
           mkdir /tmp/repro
           tar xf /tmp/repro.tar.gz -C /tmp/repro
 
-      - name: Apply stable target-cell diagnostic
+      - name: Apply dynamic target-cell diagnostic
         shell: bash
         run: |
           set -euxo pipefail
@@ -61,7 +61,6 @@ jobs:
           replacement=r'''namespace {
           struct DiagnosticThunkTargetSlot {
             std::atomic<uintptr_t> Target {};
-            std::atomic<uint64_t> Active {};
           };
           std::mutex DiagnosticThunkTargetSlotsMutex;
           std::unordered_map<uintptr_t, DiagnosticThunkTargetSlot*> DiagnosticThunkTargetSlots;
@@ -89,8 +88,8 @@ jobs:
               } else {
                 Slot = It->second;
                 auto OldTarget = Slot->Target.exchange(GuestThunkEntrypoint, std::memory_order_acq_rel);
-                fprintf(stderr, "DIAG_CELL_REBIND H=%#lx oldT=%#lx newT=%#lx slot=%p active=%lu\\n", Entrypoint, OldTarget,
-                        GuestThunkEntrypoint, Slot, Slot->Active.load(std::memory_order_acquire));
+                fprintf(stderr, "DIAG_CELL_REBIND H=%#lx oldT=%#lx newT=%#lx slot=%p\\n", Entrypoint, OldTarget,
+                        GuestThunkEntrypoint, Slot);
               }
             }
 
@@ -98,20 +97,15 @@ jobs:
               return;
             }
 
-            LogMan::Msg::DFmt("Thunks: Adding stable guest trampoline from address {:#x} through slot {}", Entrypoint, fmt::ptr(Slot));
-
             auto Result = AddCustomIREntrypoint(
               Entrypoint,
               [this, Slot](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
                 auto IRHeader = emit->_IRHeader(emit->Invalid(), Entrypoint, 0, 0, 0, 0);
                 auto Block = emit->CreateCodeNode(true, 0);
-                auto Epilogue = emit->CreateNewCodeBlockAfter(Block);
                 IRHeader.first->Blocks = emit->WrapNode(Block);
                 emit->SetCurrentCodeBlock(Block);
 
                 const auto GPRSize = this->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit;
-                const uint64_t GuestPointerSize = this->Config.Is64BitMode ? 8 : 4;
-
                 if (GPRSize == IR::OpSize::i64Bit) {
                   IR::Ref R = emit->_StoreRegister(emit->Constant(Entrypoint), GPRSize);
                   R->Reg = IR::PhysicalRegister(IR::RegClass::GPRFixed, X86State::REG_R11).Raw;
@@ -120,20 +114,8 @@ jobs:
                                          offsetof(Core::CPUState, mm[0][0]));
                 }
 
-                auto ActiveAddr = emit->Constant(reinterpret_cast<uintptr_t>(&Slot->Active));
-                emit->_AtomicFetchAdd(IR::OpSize::i64Bit, emit->Constant(1), ActiveAddr);
-
                 auto Target = emit->_LoadMemGPR(IR::OpSize::i64Bit, emit->Constant(reinterpret_cast<uintptr_t>(&Slot->Target)));
-                auto GuestRSP = emit->_LoadRegister(X86State::REG_RSP, IR::RegClass::GPR, GPRSize);
-                auto CallerRIP = emit->_LoadMemGPR(GPRSize, GuestRSP);
-                emit->_ExitFunction(IR::OpSize::i64Bit, Target, IR::BranchHint::Call, CallerRIP, Epilogue);
-
-                emit->SetCurrentCodeBlock(Epilogue);
-                emit->_AtomicFetchSub(IR::OpSize::i64Bit, emit->Constant(1), ActiveAddr);
-                auto GuestRSPAfter = emit->_LoadRegister(X86State::REG_RSP, IR::RegClass::GPR, GPRSize);
-                auto ReturnAddressLocation = emit->Sub(GPRSize, GuestRSPAfter, GuestPointerSize);
-                auto ReturnRIP = emit->_LoadMemGPR(GPRSize, ReturnAddressLocation);
-                emit->_ExitFunction(GPRSize, ReturnRIP, IR::BranchHint::None, emit->Invalid(), emit->Invalid());
+                emit->_ExitFunction(IR::OpSize::i64Bit, Target, IR::BranchHint::None, emit->Invalid(), emit->Invalid());
               },
               ThunkHandler, Slot);
 
@@ -175,7 +157,7 @@ jobs:
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
 
-      - name: Execute stable-cell discriminator
+      - name: Execute dynamic-cell discriminator
         shell: bash
         run: |
           set -uxo pipefail
@@ -195,6 +177,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-j-stable-cell-${{ github.run_id }}
+          name: agent-j-dynamic-cell-${{ github.run_id }}
           path: receipts
           retention-days: 30
