@@ -1,0 +1,130 @@
+name: Agent C instance pNext restoration from Fieldwork
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-instance-pnext-restoration-fieldwork.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+  FIELDWORK_SHA: 8aab7fb4412948b040e1886bb9aa252205ded9c7
+  DEBIAN_FRONTEND: noninteractive
+  ROOTFS: ${{ github.workspace }}/rootfs-amd64
+  HOST: ${{ github.workspace }}/host
+  R: ${{ github.workspace }}/receipts
+  FEX_PORTABLE: 1
+
+jobs:
+  restoration:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and exact identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          test "$(git -C fieldwork rev-parse HEAD)" = "$FIELDWORK_SHA"
+          printf 'fex_sha=%s\nfieldwork_sha=%s\n' "$(git -C src rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" | tee "$R/identity.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools \
+            vulkan-validationlayers debootstrap
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" > "$R/lvp-icd.txt"
+          VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
+
+      - name: Apply candidate and build guest probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 fieldwork/investigations/fex-vulkan-thunk-lifecycle/apply_instance_pnext_callback_restoration.py src
+          git -C src diff --check
+          git -C src diff -- ThunkLibs/libvulkan/Host.cpp | tee "$R/candidate.diff"
+          grep -q 'DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT' "$R/candidate.diff"
+          grep -q 'pnext_restore.rbegin' "$R/candidate.diff"
+          x86_64-linux-gnu-gcc -O2 -g -Wall -Wextra -Werror \
+            -Isrc/External/Vulkan-Headers/include \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/instance_pnext_callback_integrity_probe.c \
+            -ldl -o /tmp/pnext-integrity
+          file /tmp/pnext-integrity | tee "$R/probe.file.txt"
+
+      - name: Build focused FEX Vulkan pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON \
+            -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v >"$R/build-host.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
+
+      - name: Build amd64 rootfs and verify restoration
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo debootstrap --arch=amd64 --foreign --variant=minbase --components=main,universe \
+            --include=libvulkan1,libx11-6 noble "$ROOTFS" http://archive.ubuntu.com/ubuntu >"$R/debootstrap.log" 2>&1
+          sudo find "$ROOTFS" -type f -name '*.deb' -print | sort > "$R/rootfs-debs.txt"
+          sed -n 's/^I: Extracting \([^ ]*\)\.\.\.$/\1/p' "$R/debootstrap.log" | sort -u > "$R/rootfs-already-extracted.txt"
+          while IFS= read -r deb; do
+            pkg="$(dpkg-deb -f "$deb" Package)"
+            grep -Fxq "$pkg" "$R/rootfs-already-extracted.txt" && continue
+            sudo dpkg-deb -x "$deb" "$ROOTFS"
+          done < "$R/rootfs-debs.txt"
+          sudo cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
+          sudo mkdir -p "$ROOTFS/usr/local/bin"
+          sudo install -m755 /tmp/pnext-integrity "$ROOTFS/usr/local/bin/pnext-integrity"
+          X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          for sym in XSync XGetVisualInfo XDisplayString; do x86_64-linux-gnu-readelf -Ws "$X11" | grep -E " ${sym}(@|$)" | head -1; done
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          timeout 90s env VK_DRIVER_FILES="$LVP_ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+            "$FEX" /usr/local/bin/pnext-integrity >"$R/fex.out" 2>"$R/fex.err"
+          echo 0 | tee "$R/fex.exit"
+          cat "$R/fex.err"
+          grep -q '^RESTORE_AFTER_CREATE .*ici_same=1 report_same=1 utils_same=1 callbacks=0/0' "$R/fex.err"
+          grep -q '^RESTORE_AFTER_DESTROY ici_same=1 report_same=1 utils_same=1 callbacks=0/0' "$R/fex.err"
+          grep -q '^RESTORE_RETURN unchanged=1 callbacks=0' "$R/fex.err"
+          ! grep -q '^UNEXPECTED_' "$R/fex.err"
+          printf 'fex_exit=0\nguest_chain_unchanged=1\nguest_callbacks=0\nrestoration_candidate=pass\n' | tee "$R/summary.txt"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-c-instance-pnext-restoration-fieldwork-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
