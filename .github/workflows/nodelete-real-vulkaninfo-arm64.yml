@@ -107,20 +107,60 @@ jobs:
           grep -q 'FLAGS_1.*NODELETE' "$R/nodelete.dynamic"
           sha256sum guest-normal/libvulkan-guest.so guest-nodelete/libvulkan-guest.so | tee "$R/guest-sha256.txt"
 
-      - name: Build real amd64 vulkan-tools rootfs
+      - name: Build real amd64 vulkan-tools rootfs without executing amd64
         shell: bash
         run: |
           set -euxo pipefail
           docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
-          docker run --name fex-vulkaninfo-root --platform=linux/amd64 ubuntu:24.04 \
-            /bin/bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null; apt-get install -y --no-install-recommends vulkan-tools libx11-6 >/dev/null; rm -rf /var/lib/apt/lists/*'
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
           mkdir -p "$ROOTFS"
-          docker export fex-vulkaninfo-root | tar -C "$ROOTFS" -xf -
-          docker rm fex-vulkaninfo-root
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+
+          APTROOT="$RUNNER_TEMP/apt-amd64"
+          rm -rf "$APTROOT"
+          mkdir -p \
+            "$APTROOT/etc/apt/sources.list.d" \
+            "$APTROOT/var/lib/apt/lists/partial" \
+            "$APTROOT/var/cache/apt/archives/partial" \
+            "$APTROOT/var/lib/dpkg" \
+            "$APTROOT/var/log/apt"
+          : > "$APTROOT/var/lib/dpkg/status"
+          cat > "$APTROOT/etc/apt/sources.list.d/ubuntu.sources" <<'EOF'
+          Types: deb
+          URIs: http://archive.ubuntu.com/ubuntu/
+          Suites: noble noble-updates
+          Components: main universe
+          Architectures: amd64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: http://security.ubuntu.com/ubuntu/
+          Suites: noble-security
+          Components: main universe
+          Architectures: amd64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          APT_OPTS=(
+            -o "Dir=$APTROOT"
+            -o APT::Architecture=amd64
+            -o APT::Architectures=amd64
+            -o Acquire::Languages=none
+          )
+          sudo apt-get "${APT_OPTS[@]}" update
+          sudo apt-get "${APT_OPTS[@]}" --download-only -y --no-install-recommends \
+            install vulkan-tools libx11-6
+          mapfile -t DEBS < <(find "$APTROOT/var/cache/apt/archives" -maxdepth 1 -type f -name '*.deb' | sort)
+          test "${#DEBS[@]}" -gt 0
+          printf '%s\n' "${DEBS[@]##*/}" | tee "$R/amd64-package-set.txt"
+          for deb in "${DEBS[@]}"; do
+            sudo dpkg-deb -x "$deb" "$ROOTFS"
+          done
           test -x "$ROOTFS/usr/bin/vulkaninfo"
           file "$ROOTFS/usr/bin/vulkaninfo" | tee "$R/x86-vulkaninfo.file"
           mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu"
-          ldd "$ROOTFS/usr/bin/vulkaninfo" > "$R/host-ldd-x86-vulkaninfo.txt" 2>&1 || true
 
       - name: Run normal and NODELETE x86 vulkaninfo teardown
         shell: bash
