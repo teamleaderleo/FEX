@@ -1,0 +1,36 @@
+name: Export retained thunk fixture source
+
+on:
+  push:
+    branches: [ci/thunk-lifetime-race-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: investigation/fex-vulkan-thunk-lifecycle
+          path: fieldwork
+          fetch-depth: 1
+      - name: Decode retained source fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p fixture
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          tar xf /tmp/repro.tar.gz -C fixture
+          find fixture -maxdepth 4 -type f -print | sort | tee fixture/FILELIST.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: retained-thunk-fixture-source-${{ github.run_id }}
+          path: fixture
+          retention-days: 7
