@@ -26,6 +26,7 @@ $end_info$
 
 #include "common/Guest.h"
 
+#include "thunkgen_bridge_accessors_libGL.inl"
 #include "thunkgen_guest_libGL.inl"
 
 typedef void voidFunc();
@@ -33,7 +34,7 @@ typedef void voidFunc();
 // Maps OpenGL API function names to the address of a guest function which is
 // linked to the corresponding host function pointer
 const std::unordered_map<std::string_view, uintptr_t /* guest function address */> HostPtrInvokers = std::invoke([]() {
-#define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(GetCallerForHostFunction(name));
+#define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(FEXGetResidentCallerForHostFunction(name));
   std::unordered_map<std::string_view, uintptr_t> Ret;
   FOREACH_internal_SYMBOL(PAIR);
   return Ret;
@@ -75,15 +76,17 @@ voidFunc* glXGetProcAddressARB(const GLubyte* procname) {
 }
 
 // Wrapper around malloc() without noexcept specifiers
-static void* malloc_wrapper(size_t size) {
-  return malloc(size);
-}
+extern "C" void* FEXGLBridgeMalloc(size_t size);
+extern "C" uintptr_t fex_gl_bridge_malloc_unpacker();
+extern "C" uintptr_t fex_gl_bridge_xsync_unpacker();
+extern "C" uintptr_t fex_gl_bridge_xgetvisualinfo_unpacker();
+extern "C" uintptr_t fex_gl_bridge_xdisplaystring_unpacker();
 
 static void OnInit() {
-  fexfn_pack_GL_SetGuestMalloc((uintptr_t)malloc_wrapper, (uintptr_t)CallbackUnpack<decltype(malloc_wrapper)>::Unpack);
-  fexfn_pack_GL_SetGuestXSync((uintptr_t)XSync, (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
-  fexfn_pack_GL_SetGuestXGetVisualInfo((uintptr_t)XGetVisualInfo, (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
-  fexfn_pack_GL_SetGuestXDisplayString((uintptr_t)XDisplayString, (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+  fexfn_pack_GL_SetGuestMalloc((uintptr_t)&FEXGLBridgeMalloc, fex_gl_bridge_malloc_unpacker());
+  fexfn_pack_GL_SetGuestXSync((uintptr_t)XSync, fex_gl_bridge_xsync_unpacker());
+  fexfn_pack_GL_SetGuestXGetVisualInfo((uintptr_t)XGetVisualInfo, fex_gl_bridge_xgetvisualinfo_unpacker());
+  fexfn_pack_GL_SetGuestXDisplayString((uintptr_t)XDisplayString, fex_gl_bridge_xdisplaystring_unpacker());
 }
 
 // libGL.so must pull in libX11.so as a dependency. Referencing some libX11

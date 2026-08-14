@@ -333,6 +333,12 @@ generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp)
 target_include_directories_from_pkgconfig(libGL-guest-deps gl)
 target_include_directories_from_pkgconfig(libGL-guest-deps "xcb;x11;xrandr;xrender")
 add_guest_lib(GL "libGL.so.1")
+add_guest_bridge(GL_bridge "libfex-GL-bridge.so"
+  OUTPUT_NAME "fex-GL-bridge"
+  WRAPPER_TARGET GL-guest
+  GENERATOR libGL
+  DEP_TARGETS libGL-guest-deps
+  INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../libGL")
 
 generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp)
 target_include_directories_from_pkgconfig(libEGL-guest-deps egl)
