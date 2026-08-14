@@ -1,0 +1,67 @@
+name: Thunkgen baseline full-suite comparison
+
+on:
+  push:
+    branches: [ci/thunkgen-const-pointee-unit-20260814]
+    paths:
+      - .github/workflows/thunkgen-baseline-suite.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      BASELINE: 71afe476751deac24adabd1adb575fd2337b6e0a
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASELINE }}
+          submodules: recursive
+          fetch-depth: 1
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev nasm pkg-config libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libvulkan-dev
+      - name: Configure and build thunkgentest
+        run: |
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=ON \
+            -DBUILD_THUNKS=ON -DENABLE_X86_HOST_DEBUG=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DX86_DEV_ROOTFS=/
+          cmake --build build --target thunkgentest -- -j2
+      - name: Capture full baseline suite
+        shell: bash
+        run: |
+          set +e
+          cmake --build build --target thunkgen_tests -- -j2 2>&1 | tee baseline-suite.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          grep -E '\*\*\*Failed|[0-9]+% tests passed|The following tests FAILED' baseline-suite.log > baseline-failures.txt || true
+          cat baseline-failures.txt
+          echo "$rc" > baseline-suite.exit
+          # This lane is a comparator. The expected hosted x86 configuration currently has
+          # unrelated failures; require the same four named failures seen in the candidate lane.
+          grep -q 'MultipleParameters.ThunkGen.*Failed' baseline-suite.log
+          grep -q 'DataLayoutPointers.ThunkGen.*Failed' baseline-suite.log
+          grep -q 'DataLayout.ThunkGen.*Failed' baseline-suite.log
+          grep -q 'Mapping guest integers to fixed-size.ThunkGen.*Failed' baseline-suite.log
+          grep -q '73% tests passed, 4 tests failed out of 15' baseline-suite.log
+          echo THUNKGEN_BASELINE_FAILURE_SET_CONFIRMED
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: thunkgen-baseline-suite-${{ github.run_id }}
+          path: |
+            baseline-suite.log
+            baseline-failures.txt
+            baseline-suite.exit
+          retention-days: 30
