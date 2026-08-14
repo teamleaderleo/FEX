@@ -99,6 +99,13 @@ jobs:
           docker export "$cid" | tar -C "$ROOTFS" -xf -
           docker rm "$cid"
           trap - EXIT
+          # Docker export leaves /etc/resolv.conf pointing at container-managed
+          # resolver state that does not exist when this directory is executed
+          # directly under FEX. Give the amd64 guest the runner's working DNS.
+          sudo rm -f "$ROOTFS/etc/resolv.conf"
+          sudo cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
+          sudo chmod 0644 "$ROOTFS/etc/resolv.conf"
+          cat "$ROOTFS/etc/resolv.conf" > "$R/guest-resolv.conf"
 
       - name: Install amd64 vulkan-tools and X11 by running apt through FEX
         shell: bash
