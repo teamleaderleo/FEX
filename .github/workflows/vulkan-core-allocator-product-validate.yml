@@ -1,0 +1,166 @@
+name: Validate committed Vulkan core allocator research product
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/vulkan-core-allocator-product-validate-20260814]
+    paths:
+      - .github/workflows/vulkan-core-allocator-product-validate.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    env:
+      PRODUCT_SHA: 1698747b977cfc426896a30fef471e2cfccd044e
+      PARENT_SHA: 715ff36bff2fd9f2353ab31613dc41ae106f3938
+      PROBE_SHA: 8fae18d4691aa8adb8938a7cd735a4685c4bf9e3
+      FEX_PORTABLE: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: carrier
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PROBE_SHA }}
+          path: probe-support
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          fetch-depth: 2
+          submodules: recursive
+
+      - name: Install dependencies and prove committed product boundary
+        run: |
+          set -euxo pipefail
+          test "$(git -C product rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git -C product rev-parse HEAD^)" = "$PARENT_SHA"
+          git -C product diff --name-only HEAD^ HEAD | sort | tee product-files.txt
+          printf '%s\n' \
+            ThunkLibs/libvulkan/Guest.cpp \
+            ThunkLibs/libvulkan/Host.cpp \
+            ThunkLibs/libvulkan/libvulkan_interface.cpp \
+            | sort > expected-product-files.txt
+          diff -u expected-product-files.txt product-files.txt
+          grep -n -E 'vkCreateInstance\)\(vk_struct_base, a_1, &out\)|vkCreateShaderModule\)\(a_0, a_1, a_2, a_3\)|vkCreateDevice\)\(a_0, a_1, a_2, &out\)|vkAllocateMemory\)\(a_0, a_1, a_2, a_3\)|vkFreeMemory\)\(a_0, a_1, a_2\)' product/ThunkLibs/libvulkan/Host.cpp | tee forwarded-sites.txt
+          test "$(wc -l < forwarded-sites.txt)" -eq 5
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build nasm clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers glslang-tools
+
+      - name: Re-run const repack regression from committed product
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=ON \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/
+          cmake --build build --target thunkgentest -- -j"$(nproc)"
+          build/Bin/thunkgentest "StructRepacking" | tee ../thunkgentest.txt
+
+      - name: Build committed plain FEX Vulkan thunk path
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$PWD" -DGENERATOR_EXE="$PWD/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)"
+
+      - name: Prepare both native and FEX allocator matrices
+        run: |
+          set -euxo pipefail
+          mkdir -p receipts host-thunks
+          cat > receipts/min.comp <<'EOF'
+          #version 450
+          layout(local_size_x = 1) in;
+          void main() {}
+          EOF
+          glslangValidator -V -S comp receipts/min.comp -o receipts/min.comp.spv
+          cc -O0 -g -Wall -Wextra -Werror probe-support/LinuxFieldwork/vk_allocator_instance_probe.c -ldl -o receipts/native-instance
+          cc -O0 -g -Wall -Wextra -Werror probe-support/LinuxFieldwork/vk_allocator_custom_host_matrix.c -ldl -o receipts/native-core
+          docker pull --platform=linux/amd64 ubuntu:24.04
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir rootfs-amd64
+          docker export "$cid" | tar -C rootfs-amd64 -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p rootfs-amd64/usr/lib/x86_64-linux-gnu rootfs-amd64/opt/fex-ci
+          cp product/guest-build/libvulkan-guest.so rootfs-amd64/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+          cp product/build/HostLibs_64/libvulkan-host.so host-thunks/libvulkan-host.so
+          cp receipts/min.comp.spv rootfs-amd64/opt/fex-ci/min.comp.spv
+          x86_64-linux-gnu-gcc -O0 -g -Wall -Wextra -Werror probe-support/LinuxFieldwork/vk_allocator_instance_probe.c -ldl -o rootfs-amd64/opt/fex-ci/instance-probe
+          x86_64-linux-gnu-gcc -O0 -g -Wall -Wextra -Werror probe-support/LinuxFieldwork/vk_allocator_custom_host_matrix.c -ldl -o rootfs-amd64/opt/fex-ci/core-matrix
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o rootfs-amd64/usr/lib/x86_64-linux-gnu/libX11.so.6
+
+      - name: Execute both committed-product allocator matrices
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          set +e
+          VK_DRIVER_FILES="$ICD" timeout 30s receipts/native-instance >receipts/native-instance.stdout 2>receipts/native-instance.stderr
+          native_instance_rc=$?
+          VK_DRIVER_FILES="$ICD" timeout 30s receipts/native-core receipts/min.comp.spv >receipts/native-core.stdout 2>receipts/native-core.stderr
+          native_core_rc=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" \
+            timeout 30s product/build/Bin/FEX /opt/fex-ci/instance-probe \
+            >receipts/fex-instance.stdout 2>receipts/fex-instance.stderr
+          fex_instance_rc=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" \
+            timeout 30s product/build/Bin/FEX /opt/fex-ci/core-matrix /opt/fex-ci/min.comp.spv \
+            >receipts/fex-core.stdout 2>receipts/fex-core.stderr
+          fex_core_rc=$?
+          set -e
+          printf 'product=%s\nnative_instance=%s\nnative_core=%s\nfex_instance=%s\nfex_core=%s\n' \
+            "$PRODUCT_SHA" "$native_instance_rc" "$native_core_rc" "$fex_instance_rc" "$fex_core_rc" | tee receipts/final-matrix.txt
+          for rc in "$native_instance_rc" "$native_core_rc" "$fex_instance_rc" "$fex_core_rc"; do test "$rc" -eq 0; done
+          for file in receipts/native-instance.stderr receipts/fex-instance.stderr; do
+            grep -q 'PASS allocator native-valid create/destroy callbacks observed' "$file"
+            grep -E -q 'MARK create-return result=0 .*alloc=[1-9]' "$file"
+            grep -E -q 'MARK destroy-return .*free=[1-9]' "$file"
+          done
+          for file in receipts/native-core.stderr receipts/fex-core.stderr; do
+            grep -q 'PASS custom-host allocator forwarding matrix' "$file"
+            grep -E -q 'DEVICE_CREATE_RETURN result=0 alloc_delta=[1-9]' "$file"
+            grep -E -q 'MEM_ALLOC_RETURN result=0 alloc_delta=[1-9]' "$file"
+            grep -E -q 'MEM_FREE_RETURN free_delta=[1-9]' "$file"
+            grep -E -q 'SHADER_CREATE_RETURN result=0 alloc_delta=[1-9]' "$file"
+            grep -E -q 'SHADER_DESTROY_RETURN free_delta=[1-9]' "$file"
+            grep -E -q 'DEVICE_DESTROY_RETURN free_delta=[1-9]' "$file"
+          done
+          printf '%s\n' 'OUTCOME=committed_core_allocator_product_passed_both_clean_matrices' >> receipts/final-matrix.txt
+
+      - name: Upload committed-product receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-core-allocator-product-validate-${{ github.run_id }}
+          path: |
+            receipts
+            product-files.txt
+            expected-product-files.txt
+            forwarded-sites.txt
+            thunkgentest.txt
+          retention-days: 30
