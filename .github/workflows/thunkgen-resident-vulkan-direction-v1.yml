@@ -68,7 +68,8 @@ jobs:
             -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
             -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1 \
             || { tail -n 240 "$R/cmake-host.log"; exit 1; }
-          cmake --build build --target FEX -- -j"$(nproc)" -v \
+          # GL-host-64 is a known-good thunk target that pulls build/Bin/thunkgen.
+          cmake --build build --target FEX GL-host-64 -- -j"$(nproc)" -v \
             > "$R/build-host.log" 2>&1 || { tail -n 420 "$R/build-host.log"; exit 1; }
           test -x build/Bin/thunkgen
 
