@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #include "common/Guest.h"
