@@ -240,9 +240,18 @@ if (BITNESS EQUAL 64)
   add_guest_lib(drm "libdrm.so.2")
 endif()
 
-generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp)
-add_guest_lib(wayland-client "libwayland-client.so.0.20.0")
+generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp RESIDENT_BRIDGE)
 target_include_directories_from_pkgconfig(libwayland-client-guest-deps wayland-client /usr/include/wayland)
+
+add_library(libwayland-client_bridge-guest-deps INTERFACE)
+target_link_libraries(libwayland-client_bridge-guest-deps INTERFACE libwayland-client-guest-deps)
+set(GEN_libwayland-client_bridge "${GEN_libwayland-client_BRIDGE}")
+add_guest_lib(wayland-client_bridge "libfex-wayland-client-bridge.so")
+set_target_properties(wayland-client_bridge-guest PROPERTIES OUTPUT_NAME "fex-wayland-client-bridge")
+target_link_options(wayland-client_bridge-guest PRIVATE "LINKER:-z,nodelete")
+
+add_guest_lib(wayland-client "libwayland-client.so.0.20.0")
+target_link_libraries(wayland-client-guest PRIVATE wayland-client_bridge-guest)
 
 generate(libVDSO ${CMAKE_CURRENT_SOURCE_DIR}/../libVDSO/libVDSO_interface.cpp)
 add_guest_lib(VDSO "linux-vdso.so.1")
