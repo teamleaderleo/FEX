@@ -1,0 +1,174 @@
+name: Agent B native-first Vulkan routing current main v2
+
+on:
+  push:
+    branches: [ci/agent-b-native-first-current-main-v2-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      FIELDWORK_SHA: 1b268a6742768086aa8355e997c10b4423319ba6
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      HOST_BASE: ${{ github.workspace }}/host-baseline
+      HOST_CAND: ${{ github.workspace }}/host-candidate
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 3
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST_BASE" "$HOST_CAND"
+          git log --oneline -3 | tee "$R/lineage.txt"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/product-source-diff.txt"
+          test ! -s "$R/product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan1 mesa-vulkan-drivers
+
+      - name: Build exact baseline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$HOST_BASE/libvulkan-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest-base -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest-base.log" 2>&1
+          cmake --build guest-base --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-guest-base.log" 2>&1
+
+      - name: Prepare X11-repaired rootfs and probes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-base/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 \
+            /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          PROBE=fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c
+          cc -O2 -Wall -Wextra "$PROBE" -ldl -o "$R/callback-arm64"
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra "$PROBE" -ldl -o "$ROOTFS/opt/fex-ci/callback"
+          cat >/tmp/null_gipa.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          typedef void (*PFN)(void); typedef PFN (*GIPA)(void*,const char*);
+          int main(void){void*h=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);if(!h)return 77;GIPA g=(GIPA)dlsym(h,"vkGetInstanceProcAddr");if(!g)return 78;struct Q{const char*n;int w;}q[]={{"vkGetDeviceProcAddr",0},{"vkCreateInstance",1},{"vkEnumerateInstanceExtensionProperties",1},{"vkCreateDevice",0},{"vkCreateDebugUtilsMessengerEXT",0}};int bad=0;for(unsigned i=0;i<5;i++){PFN p=g(0,q[i].n);fprintf(stderr,"NULL_GIPA name=%s ptr=%p\n",q[i].n,(void*)p);if((p!=0)!=q[i].w)bad|=1<<i;}fprintf(stderr,"NULL_GIPA_RESULT bad=%d\n",bad);return bad?29:0;}
+          EOF
+          cc -O2 -Wall -Wextra -Werror /tmp/null_gipa.c -ldl -o "$R/null-gipa-arm64"
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/null_gipa.c -ldl -o "$ROOTFS/opt/fex-ci/null-gipa"
+
+      - name: Native and pristine matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"; echo "$ICD" > "$R/lvp.txt"
+          set +e
+          VK_DRIVER_FILES="$ICD" "$R/callback-arm64" report gipa positive >"$R/native-report.out" 2>"$R/native-report.err"; echo $? >"$R/native-report.exit"
+          VK_DRIVER_FILES="$ICD" "$R/callback-arm64" utils gipa positive >"$R/native-utils.out" 2>"$R/native-utils.err"; echo $? >"$R/native-utils.exit"
+          "$R/null-gipa-arm64" >"$R/native-null.out" 2>"$R/native-null.err"; echo $? >"$R/native-null.exit"
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          runb(){ n="$1"; shift; VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST_BASE" timeout 30s "$FEX" "$@" >"$R/$n.out" 2>"$R/$n.err"; echo $? >"$R/$n.exit"; }
+          runb base-report-direct /opt/fex-ci/callback report direct 0
+          runb base-report-gipa /opt/fex-ci/callback report gipa positive
+          runb base-utils-direct /opt/fex-ci/callback utils direct 0
+          runb base-utils-gipa /opt/fex-ci/callback utils gipa positive
+          runb base-null /opt/fex-ci/null-gipa
+          set -e
+          printf 'native_report=%s\nnative_utils=%s\nnative_null=%s\nbase_report_direct=%s\nbase_report_gipa=%s\nbase_utils_direct=%s\nbase_utils_gipa=%s\nbase_null=%s\n' \
+            "$(cat "$R/native-report.exit")" "$(cat "$R/native-utils.exit")" "$(cat "$R/native-null.exit")" \
+            "$(cat "$R/base-report-direct.exit")" "$(cat "$R/base-report-gipa.exit")" "$(cat "$R/base-utils-direct.exit")" "$(cat "$R/base-utils-gipa.exit")" "$(cat "$R/base-null.exit")" | tee "$R/baseline-matrix.txt"
+
+      - name: Apply and build candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_native_first_vulkan.py
+          git diff --check
+          git diff -- ThunkLibs/libvulkan/Host.cpp ThunkLibs/libvulkan/Guest.cpp | tee "$R/native-first.diff"
+          cmake --build build --target vulkan-host-64 -- -j"$(nproc)" -v > "$R/rebuild-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$HOST_CAND/libvulkan-host.so"
+          rm -rf guest-cand
+          cmake -S ThunkLibs/GuestLibs -B guest-cand -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-guest-cand.log" 2>&1
+          cmake --build guest-cand --target vulkan-guest -- -j"$(nproc)" -v > "$R/build-guest-cand.log" 2>&1
+          cp guest-cand/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+
+      - name: Candidate matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          ICD="$(cat "$R/lvp.txt")"; FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          set +e
+          runc(){ n="$1"; shift; VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST_CAND" timeout 30s "$FEX" "$@" >"$R/$n.out" 2>"$R/$n.err"; echo $? >"$R/$n.exit"; }
+          runc cand-report /opt/fex-ci/callback report gipa 0
+          runc cand-utils /opt/fex-ci/callback utils gipa 0
+          runc cand-null /opt/fex-ci/null-gipa
+          set -e
+          printf 'native_report=%s\nnative_utils=%s\nnative_null=%s\nbase_report_direct=%s\nbase_report_gipa=%s\nbase_utils_direct=%s\nbase_utils_gipa=%s\nbase_null=%s\ncand_report=%s\ncand_utils=%s\ncand_null=%s\n' \
+            "$(cat "$R/native-report.exit")" "$(cat "$R/native-utils.exit")" "$(cat "$R/native-null.exit")" \
+            "$(cat "$R/base-report-direct.exit")" "$(cat "$R/base-report-gipa.exit")" "$(cat "$R/base-utils-direct.exit")" "$(cat "$R/base-utils-gipa.exit")" "$(cat "$R/base-null.exit")" \
+            "$(cat "$R/cand-report.exit")" "$(cat "$R/cand-utils.exit")" "$(cat "$R/cand-null.exit")" | tee "$R/final-matrix.txt"
+          cat "$R/cand-report.err" "$R/cand-utils.err" "$R/cand-null.err"
+          test "$(cat "$R/native-report.exit")" = 0
+          test "$(cat "$R/native-utils.exit")" = 0
+          test "$(cat "$R/native-null.exit")" = 0
+          test "$(cat "$R/cand-report.exit")" = 0
+          test "$(cat "$R/cand-utils.exit")" = 0
+          test "$(cat "$R/cand-null.exit")" = 0
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-b-native-first-current-main-v2-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
