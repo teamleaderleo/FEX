@@ -1,0 +1,42 @@
+name: Inspect retained thunk lifetime fixture
+
+on:
+  push:
+    branches: [ci/thunk-callback-descriptor-drain-20260814]
+    paths:
+      - .github/workflows/inspect-retained-thunk-fixture.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout retained Fieldwork fixture
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: investigation/fex-vulkan-thunk-lifecycle
+          path: fieldwork
+          fetch-depth: 1
+      - name: Decode and print relevant fixture sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SRC=fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64
+          base64 -d "$SRC" > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          cd /tmp/repro/fex-full-thunk-pair
+          find . -maxdepth 3 -type f -print | sort
+          for f in guest/main.cpp guest/guest_dso.cpp host/host_dso.cpp common.h Makefile; do
+            if test -f "$f"; then
+              echo "===== FILE: $f ====="
+              cat "$f"
+            fi
+          done
