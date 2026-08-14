@@ -134,9 +134,8 @@ int main(int argc, char **argv) {
   fprintf(stderr, "APP dlclose done maps=%d\n", CountVulkanMappings());
 
   if (pin_handle) {
-    fprintf(stderr, "APP pin retained through primary close maps=%d\n", CountVulkanMappings());
-    if (dlclose(pin_handle) != 0) Die("dlclose pin");
-    fprintf(stderr, "APP pin released maps=%d\n", CountVulkanMappings());
+    fprintf(stderr, "APP pin intentionally retained through normal return maps=%d handle=%p\n",
+            CountVulkanMappings(), pin_handle);
   }
 
   fprintf(stderr, "APP normal-return\n");
