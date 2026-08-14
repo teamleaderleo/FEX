@@ -1,0 +1,155 @@
+name: Thunk failed-munmap retirement A/B ARM64
+
+on:
+  push:
+    branches: [ci/thunk-failed-munmap-20260814]
+    paths:
+      - .github/fieldwork/patch_failed_munmap_fixture.py
+      - .github/fieldwork/guard_failed_munmap_retirement.py
+      - .github/workflows/thunk-failed-munmap-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  failed-munmap:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [stock, eager, guarded]
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-${{ matrix.mode }}
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout retirement helpers
+        if: matrix.mode != 'stock'
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Checkout retained fixture
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_REF }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Install dependencies and patch fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir -p /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 .github/fieldwork/patch_failed_munmap_fixture.py /tmp/repro
+
+      - name: Apply retirement policy variant
+        if: matrix.mode != 'stock'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/merge_callback_tombstone.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          if [ '${{ matrix.mode }}' = guarded ]; then
+            python3 .github/fieldwork/guard_failed_munmap_retirement.py src
+          fi
+          git -C src diff --check
+          git -C src diff > "$R/fex-${{ matrix.mode }}.diff"
+
+      - name: Build FEX and fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-fex.log" 2>&1
+          cd /tmp/repro/fex-full-thunk-pair
+          make clean
+          make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/build-fixture.log" 2>&1
+
+      - name: Prepare amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci/full"
+          cp -a /tmp/repro/fex-full-thunk-pair/guest "$ROOTFS/opt/fex-ci/full/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+      - name: Execute failed-munmap discriminator
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          HOST="/tmp/repro/fex-full-thunk-pair/host"
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/full" && \
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+            "$FEX" /opt/fex-ci/full/guest/fex_full_lifetime --failed-munmap) \
+            > "$R/run.stdout" 2> "$R/run.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/run.exit"
+          grep -E 'failed-munmap|DIAG_' "$R/run.stdout" "$R/run.stderr" > "$R/key-lines.txt" || true
+          cat "$R/key-lines.txt"
+          echo "mode=${{ matrix.mode }} rc=$rc"
+          test "$rc" = 0
+
+          grep -q 'failed-munmap syscall.*rc=-1.*errno=22' "$R/run.stdout"
+          grep -q 'failed-munmap invoker remains.*r-xp' "$R/run.stdout"
+          if [ '${{ matrix.mode }}' = eager ]; then
+            grep -Eq 'child Link after failed munmap.*signal=11' "$R/run.stdout"
+          else
+            grep -Eq 'child Link after failed munmap.*exit=0' "$R/run.stdout"
+          fi
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunk-failed-munmap-${{ matrix.mode }}-${{ github.run_id }}
+          path: receipts-${{ matrix.mode }}
+          retention-days: 30
