@@ -41,7 +41,7 @@ jobs:
           mkdir -p "$R"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            cmake ninja-build nasm clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
             gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
           printf 'carrier=%s\nproduct=%s\n' "$(git -C carrier rev-parse HEAD)" "$(git -C product rev-parse HEAD)" > "$R/identity.txt"
 
