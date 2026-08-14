@@ -1,0 +1,203 @@
+name: Real GL split resident bridge v2
+
+on:
+  push:
+    branches: [diagnostic/gl-split-resident-e2e-20260814]
+    paths:
+      - .github/workflows/gl-split-resident-v2-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gl-split-v2:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 70
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs-gl-split-v2
+      R: ${{ github.workspace }}/receipts-gl-split-v2
+      H: ${{ github.workspace }}/host-gl-split-v2
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and stock FEX GL host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer GL-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 300 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libGL-host.so "$H/libGL-host.so"
+          git rev-parse HEAD | tee "$R/fex-sha.txt"
+
+      - name: Build narrow resident GL bridge and unloadable wrapper
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > ThunkLibs/libGL/ResidentBridge.cpp <<'EOF'
+          #define GL_GLEXT_PROTOTYPES 1
+          #define GLX_GLXEXT_PROTOTYPES 1
+          #include <GL/glx.h>
+          #include <GL/glxext.h>
+          #include <GL/gl.h>
+          #include <GL/glext.h>
+          #undef GL_ARB_viewport_array
+          #include "glcorearb.h"
+          #include <X11/Xlib.h>
+          #include <X11/Xutil.h>
+          #include <cstddef>
+          #include "common/Guest.h"
+          #include "thunkgen_guest_libGL.inl"
+
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGLBridgeGetErrorInvoker() {
+            return reinterpret_cast<uintptr_t>(GetCallerForHostFunction(glGetError));
+          }
+          using MallocSignature = void*(size_t);
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGLBridgeMallocUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<MallocSignature>::Unpack);
+          }
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGLBridgeXSyncUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XSync)>::Unpack);
+          }
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGLBridgeXGetVisualInfoUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
+          }
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGLBridgeXDisplayStringUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XDisplayString)>::Unpack);
+          }
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/libGL/libGL_Guest.cpp')
+          s=p.read_text()
+          anchor='#include "thunkgen_guest_libGL.inl"\n\n'
+          repl='''#include "thunkgen_guest_libGL.inl"\n\nextern "C" uintptr_t FEXGLBridgeGetErrorInvoker();\nextern "C" uintptr_t FEXGLBridgeMallocUnpacker();\nextern "C" uintptr_t FEXGLBridgeXSyncUnpacker();\nextern "C" uintptr_t FEXGLBridgeXGetVisualInfoUnpacker();\nextern "C" uintptr_t FEXGLBridgeXDisplayStringUnpacker();\n\n'''
+          if s.count(anchor)!=1: raise SystemExit('include anchor mismatch')
+          s=s.replace(anchor,repl,1)
+          anchor='''  auto TargetFuncIt = HostPtrInvokers.find(reinterpret_cast<const char*>(procname));\n'''
+          repl='''  if (std::string_view {reinterpret_cast<const char*>(procname)} == "glGetError") {\n    const auto ResidentTarget = FEXGLBridgeGetErrorInvoker();\n    fprintf(stderr, "GL_SPLIT_LINK H=%p T=%#zx\\n", Ret, ResidentTarget);\n    LinkAddressToFunction((uintptr_t)Ret, ResidentTarget);\n    return Ret;\n  }\n\n  auto TargetFuncIt = HostPtrInvokers.find(reinterpret_cast<const char*>(procname));\n'''
+          if s.count(anchor)!=1: raise SystemExit('proc anchor mismatch')
+          s=s.replace(anchor,repl,1)
+          old='''static void OnInit() {\n  fexfn_pack_GL_SetGuestMalloc((uintptr_t)malloc_wrapper, (uintptr_t)CallbackUnpack<decltype(malloc_wrapper)>::Unpack);\n  fexfn_pack_GL_SetGuestXSync((uintptr_t)XSync, (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);\n  fexfn_pack_GL_SetGuestXGetVisualInfo((uintptr_t)XGetVisualInfo, (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);\n  fexfn_pack_GL_SetGuestXDisplayString((uintptr_t)XDisplayString, (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);\n}\n'''
+          new='''static void OnInit() {\n  fexfn_pack_GL_SetGuestMalloc((uintptr_t)malloc_wrapper, FEXGLBridgeMallocUnpacker());\n  fexfn_pack_GL_SetGuestXSync((uintptr_t)XSync, FEXGLBridgeXSyncUnpacker());\n  fexfn_pack_GL_SetGuestXGetVisualInfo((uintptr_t)XGetVisualInfo, FEXGLBridgeXGetVisualInfoUnpacker());\n  fexfn_pack_GL_SetGuestXDisplayString((uintptr_t)XDisplayString, FEXGLBridgeXDisplayStringUnpacker());\n}\n'''
+          if s.count(old)!=1: raise SystemExit('OnInit anchor mismatch')
+          p.write_text(s.replace(old,new,1))
+
+          p=Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s=p.read_text()
+          anchor='add_guest_lib(GL "libGL.so.1")\n'
+          block='''add_library(GL-lifetime-bridge ${TARGET_TYPE} ../libGL/ResidentBridge.cpp ${GEN_libGL})\ntarget_include_directories(GL-lifetime-bridge PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen/")\ntarget_compile_definitions(GL-lifetime-bridge PRIVATE GUEST_THUNK_LIBRARY)\ntarget_link_libraries(GL-lifetime-bridge PRIVATE libGL-guest-deps)\ntarget_compile_options(GL-lifetime-bridge PRIVATE -fwrapv)\nif (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)\n  target_compile_options(GL-lifetime-bridge PRIVATE -msse2 -mfpmath=sse)\nendif()\nif (TARGET_TYPE STREQUAL "SHARED")\n  target_link_options(GL-lifetime-bridge PRIVATE "LINKER:-z,nodelete" "LINKER:-soname,libfex-GL-bridge.so")\n  set_target_properties(GL-lifetime-bridge PROPERTIES OUTPUT_NAME "fex-GL-bridge" NO_SONAME ON)\nendif()\nadd_guest_lib(GL "libGL.so.1")\ntarget_link_libraries(GL-guest PRIVATE GL-lifetime-bridge)\nif (TARGET_TYPE STREQUAL "SHARED")\n  target_link_options(GL-guest PRIVATE "LINKER:-rpath,$ORIGIN")\nendif()\n'''
+          if s.count(anchor)!=1: raise SystemExit(f'CMake anchor count={s.count(anchor)}')
+          p.write_text(s.replace(anchor,block,1))
+          PY
+          git diff --check
+          cmake -S ThunkLibs/GuestLibs -B guest-v2 -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-v2 --target GL-guest GL-lifetime-bridge -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 400 "$R/build-guest.log"; exit 1; }
+          test -f guest-v2/libGL-guest.so
+          test -f guest-v2/libfex-GL-bridge.so
+          readelf -d guest-v2/libGL-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest-v2/libfex-GL-bridge.so | tee "$R/bridge.dynamic"
+          readelf -lW guest-v2/libfex-GL-bridge.so | tee "$R/bridge.program-headers"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-GL-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          stat -c 'bridge_file_bytes=%s' guest-v2/libfex-GL-bridge.so | tee "$R/bridge-size.txt"
+
+      - name: Create rootfs and corrected moved-reload probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-v2/libGL-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libGL.so.1"
+          cp guest-v2/libfex-GL-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-GL-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          typedef int (*XErrorHandler)(void *, void *);
+          int XSync(void*d,int x){(void)d;(void)x;return 0;}
+          void *XGetVisualInfo(void*d,long m,void*t,int*c){(void)d;(void)m;(void)t;if(c)*c=0;return 0;}
+          const char *XDisplayString(void*d){(void)d;return ":0";}
+          XErrorHandler XSetErrorHandler(XErrorHandler h){return h;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          cat >/tmp/glprobe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mman.h>
+          typedef void (*VoidFunc)(void); typedef VoidFunc (*GLXGET)(const unsigned char *); typedef unsigned int (*GLGETERROR)(void); typedef uintptr_t (*GETT)(void);
+          struct span{uintptr_t a,b;}; static struct span old[16]; static unsigned oldn;
+          static int map_has(void*p,const char*n,int v){FILE*f=fopen("/proc/self/maps","r");char l[1024];uintptr_t x=(uintptr_t)p;if(!f)return-1;while(fgets(l,sizeof l,f)){unsigned long a,b;if(sscanf(l,"%lx-%lx",&a,&b)==2&&x>=a&&x<b){if(v)fprintf(stderr,"MAP %p %s",p,l);int ok=strstr(l,n)!=0;fclose(f);return ok;}}fclose(f);if(v)fprintf(stderr,"UNMAPPED %p\n",p);return 0;}
+          static void capture(void){FILE*f=fopen("/proc/self/maps","r");char l[1024];oldn=0;if(!f)exit(70);while(fgets(l,sizeof l,f)){unsigned long a,b;if(strstr(l,"/usr/lib/x86_64-linux-gnu/libGL.so.1")&&sscanf(l,"%lx-%lx",&a,&b)==2&&oldn<16){old[oldn++]=(struct span){a,b};fprintf(stderr,"OLD_GL_RANGE %lx-%lx\n",a,b);}}fclose(f);if(!oldn)exit(71);}
+          static void reserve_old(void){for(unsigned i=0;i<oldn;i++){size_t n=old[i].b-old[i].a;void*r=mmap((void*)old[i].a,n,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);if(r==MAP_FAILED){fprintf(stderr,"RESERVE_FAIL %lx-%lx errno=%d %s\n",old[i].a,old[i].b,errno,strerror(errno));exit(72);}}}
+          int main(void){
+            void*h=dlopen("libGL.so.1",RTLD_NOW|RTLD_LOCAL); if(!h){fprintf(stderr,"DLOPEN_FAIL %s\n",dlerror());return 2;}
+            GLXGET g0=(GLXGET)dlsym(h,"glXGetProcAddress"); if(!g0)return 3; GLGETERROR p0=(GLGETERROR)g0((const unsigned char*)"glGetError"); if(!p0)return 4;
+            void*bh=dlopen("libfex-GL-bridge.so",RTLD_NOW|RTLD_NOLOAD); if(!bh)return 5; GETT gett=(GETT)dlsym(bh,"FEXGLBridgeGetErrorInvoker"); if(!gett)return 6; void*T=(void*)gett();
+            unsigned e0=p0(); fprintf(stderr,"GEN1 get=%p H=%p T=%p error=%u\n",(void*)g0,(void*)p0,T,e0); if(e0)return 7; if(map_has(T,"/libfex-GL-bridge.so",1)!=1)return 8; capture(); dlclose(bh); if(dlclose(h))return 9;
+            if(map_has((void*)g0,"/usr/lib/x86_64-linux-gnu/libGL.so.1",1)!=0)return 10;
+            if(map_has(T,"/libfex-GL-bridge.so",1)!=1)return 11;
+            unsigned er=p0(); fprintf(stderr,"RETAINED_AFTER_CLOSE error=%u\n",er); if(er)return 12; reserve_old();
+            void*h2=dlopen("libGL.so.1",RTLD_NOW|RTLD_LOCAL); if(!h2){fprintf(stderr,"RELOAD_FAIL %s\n",dlerror());return 13;} GLXGET g1=(GLXGET)dlsym(h2,"glXGetProcAddress"); GLGETERROR p1=(GLGETERROR)g1((const unsigned char*)"glGetError");
+            fprintf(stderr,"GEN2 get_old=%p get_new=%p moved=%d H_old=%p H_new=%p same_H=%d T=%p\n",(void*)g0,(void*)g1,g0!=g1,(void*)p0,(void*)p1,p0==p1,T); if(g0==g1||p0!=p1)return 14;
+            unsigned e1=p1(); if(e1)return 15; if(dlclose(h2))return 16; unsigned ef=p0(); fprintf(stderr,"FINAL_RETAINED error=%u\n",ef); if(ef)return 17; fprintf(stderr,"REAL_GL_SPLIT_BRIDGE_V2_OK\n"); return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra /tmp/glprobe.c -ldl -o "$ROOTFS/opt/fex-ci/glprobe"
+
+      - name: Run real GL split lifetime
+        shell: bash
+        run: |
+          set -uxo pipefail
+          set +e
+          FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 45s build/Bin/FEX /opt/fex-ci/glprobe > "$R/probe.out" 2> "$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          test "$rc" -eq 0
+          grep -q 'REAL_GL_SPLIT_BRIDGE_V2_OK' "$R/probe.err"
+          grep -q 'moved=1' "$R/probe.err"
+          grep -q 'same_H=1' "$R/probe.err"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-split-resident-v2-${{ github.run_id }}
+          path: receipts-gl-split-v2
+          retention-days: 30
