@@ -1,0 +1,175 @@
+name: Combined Vulkan GL guest bridge build ARM64
+
+on:
+  push:
+    branches: [ci/crosslib-guest-bridge-runtime-20260814]
+    paths:
+      - .github/workflows/crosslib-combined-bridge-build-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  combined-bridge:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      R: ${{ github.workspace }}/receipts-combined-bridge
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev libvulkan-dev
+          git rev-parse HEAD | tee "$R/source-sha.txt"
+
+      - name: Build FEX thunk generator
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" -v \
+            > "$R/build-thunkgen.log" 2>&1 || { tail -n 260 "$R/build-thunkgen.log"; exit 1; }
+
+      - name: Add one combined generated bridge target
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ThunkLibs/CrosslibBridge
+          cat > ThunkLibs/CrosslibBridge/Vulkan.cpp <<'EOF'
+          #define VK_USE_64_BIT_PTR_DEFINES 0
+          #define VK_USE_PLATFORM_XLIB_XRANDR_EXT
+          #define VK_USE_PLATFORM_XLIB_KHR
+          #define VK_USE_PLATFORM_XCB_KHR
+          #define VK_USE_PLATFORM_WAYLAND_KHR
+          #include <vulkan/vulkan.h>
+          #include "common/Guest.h"
+          #include <functional>
+          #include <string_view>
+          #include <unordered_map>
+          #include "thunkgen_guest_libvulkan.inl"
+
+          static const std::unordered_map<std::string_view, uintptr_t> VulkanInvokers = std::invoke([]() {
+          #define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(GetCallerForHostFunction(name));
+            std::unordered_map<std::string_view, uintptr_t> Ret;
+            FOREACH_internal_SYMBOL(PAIR);
+            return Ret;
+          #undef PAIR
+          });
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGuestBridgeVulkanLookup(const char* name) {
+            auto it = VulkanInvokers.find(name);
+            return it == VulkanInvokers.end() ? 0 : it->second;
+          }
+          EOF
+
+          cat > ThunkLibs/CrosslibBridge/GL.cpp <<'EOF'
+          #define GL_GLEXT_PROTOTYPES 1
+          #define GLX_GLXEXT_PROTOTYPES 1
+          #include <GL/glx.h>
+          #include <GL/glxext.h>
+          #include <GL/gl.h>
+          #include <GL/glext.h>
+          #undef GL_ARB_viewport_array
+          #include "glcorearb.h"
+          #include "common/Guest.h"
+          #include <functional>
+          #include <string_view>
+          #include <unordered_map>
+          #include "thunkgen_guest_libGL.inl"
+
+          static const std::unordered_map<std::string_view, uintptr_t> GLInvokers = std::invoke([]() {
+          #define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(GetCallerForHostFunction(name));
+            std::unordered_map<std::string_view, uintptr_t> Ret;
+            FOREACH_internal_SYMBOL(PAIR);
+            return Ret;
+          #undef PAIR
+          });
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGuestBridgeGLLookup(const char* name) {
+            auto it = GLInvokers.find(name);
+            return it == GLInvokers.end() ? 0 : it->second;
+          }
+          EOF
+
+          cat > ThunkLibs/CrosslibBridge/Common.cpp <<'EOF'
+          #include <X11/Xlib.h>
+          #include <X11/Xutil.h>
+          #include "common/Guest.h"
+          #include <cstdint>
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGuestBridgeXSyncUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XSync)>::Unpack);
+          }
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGuestBridgeXGetVisualInfoUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
+          }
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXGuestBridgeXDisplayStringUnpacker() {
+            return reinterpret_cast<uintptr_t>(CallbackUnpack<decltype(XDisplayString)>::Unpack);
+          }
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s = p.read_text()
+          anchor = 'add_guest_lib(GL "libGL.so.1")\n'
+          block = '''add_library(crosslib-lifetime-bridge ${TARGET_TYPE}\n  ../CrosslibBridge/Vulkan.cpp\n  ../CrosslibBridge/GL.cpp\n  ../CrosslibBridge/Common.cpp\n  ${GEN_libvulkan}\n  ${GEN_libGL})\ntarget_include_directories(crosslib-lifetime-bridge PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen/")\ntarget_compile_definitions(crosslib-lifetime-bridge PRIVATE GUEST_THUNK_LIBRARY)\ntarget_link_libraries(crosslib-lifetime-bridge PRIVATE libvulkan-guest-deps libGL-guest-deps)\ntarget_compile_options(crosslib-lifetime-bridge PRIVATE -fwrapv)\nif (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)\n  target_compile_options(crosslib-lifetime-bridge PRIVATE -msse2 -mfpmath=sse)\nendif()\nif (TARGET_TYPE STREQUAL "SHARED")\n  target_link_options(crosslib-lifetime-bridge PRIVATE "LINKER:-z,nodelete" "LINKER:-soname,libfex-guest-bridge.so")\n  set_target_properties(crosslib-lifetime-bridge PROPERTIES OUTPUT_NAME "fex-guest-bridge" NO_SONAME ON)\nendif()\n\nadd_guest_lib(GL "libGL.so.1")\n'''
+          if s.count(anchor) != 1:
+              raise SystemExit(f'GL anchor count={s.count(anchor)}')
+          p.write_text(s.replace(anchor, block, 1))
+          PY
+          git diff --check
+          git diff -- ThunkLibs/CrosslibBridge ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/source.diff"
+
+      - name: Build combined bridge and inspect identity surface
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target crosslib-lifetime-bridge -- -j"$(nproc)" -v \
+            > "$R/build-bridge.log" 2>&1 || { tail -n 400 "$R/build-bridge.log"; exit 1; }
+          test -f guest/libfex-guest-bridge.so
+          file guest/libfex-guest-bridge.so | tee "$R/bridge.file"
+          readelf -d guest/libfex-guest-bridge.so | tee "$R/bridge.dynamic"
+          nm -D guest/libfex-guest-bridge.so | tee "$R/bridge.nm"
+          size guest/libfex-guest-bridge.so | tee "$R/bridge.size"
+          stat -c 'bridge_file_bytes=%s' guest/libfex-guest-bridge.so | tee "$R/bridge-file-size.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          grep -q ' FEXGuestBridgeVulkanLookup$' "$R/bridge.nm"
+          grep -q ' FEXGuestBridgeGLLookup$' "$R/bridge.nm"
+          grep -q ' FEXGuestBridgeXSyncUnpacker$' "$R/bridge.nm"
+          grep -q ' FEXGuestBridgeXGetVisualInfoUnpacker$' "$R/bridge.nm"
+          grep -q ' FEXGuestBridgeXDisplayStringUnpacker$' "$R/bridge.nm"
+          echo CROSSLIB_COMBINED_GENERATED_BRIDGE_BUILD_PASS
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosslib-combined-bridge-${{ github.run_id }}
+          path: receipts-combined-bridge
+          retention-days: 30
