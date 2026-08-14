@@ -4,6 +4,10 @@ tags: thunklibs|Vulkan
 $end_info$
 */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #define VK_USE_64_BIT_PTR_DEFINES 0
 
 #define VK_USE_PLATFORM_XLIB_XRANDR_EXT
@@ -17,6 +21,7 @@ $end_info$
 #include <cstdio>
 #include <dlfcn.h>
 #include <functional>
+#include <link.h>
 #include <string_view>
 #include <unordered_map>
 
@@ -84,7 +89,31 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
 }
 }
 
+static void PromoteBaseNamespaceVulkanThunkToNodelete() {
+  Dl_info Info {};
+  if (!dladdr(reinterpret_cast<void*>(&PromoteBaseNamespaceVulkanThunkToNodelete), &Info) || !Info.dli_fname) {
+    return;
+  }
+
+  void* Self = dlopen(Info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+  if (!Self) {
+    return;
+  }
+
+  Lmid_t Namespace {};
+  if (dlinfo(Self, RTLD_DI_LMID, &Namespace) == 0 && Namespace == LM_ID_BASE) {
+    void* Pin = dlopen(Info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
+    if (Pin) {
+      dlclose(Pin);
+    }
+  }
+
+  dlclose(Self);
+}
+
 void OnInit() {
+  PromoteBaseNamespaceVulkanThunkToNodelete();
+
   // TODO: Load libX11 on-demand instead
   void* libx11 = dlopen("libX11.so.6", RTLD_LAZY);
   fexfn_pack_Vulkan_SetGuestXSync((uintptr_t)dlsym(libx11, "XSync"), (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
