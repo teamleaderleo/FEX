@@ -1,0 +1,41 @@
+name: Split bridge fixture compile smoke
+
+on:
+  push:
+    branches: [ci/thunk-callback-descriptor-20260814]
+    paths:
+      - .github/fieldwork/patch_split_resident_bridge_fixture.py
+      - .github/workflows/thunk-split-bridge-fixture-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: investigation/fex-vulkan-thunk-lifecycle
+          path: fieldwork
+          fetch-depth: 1
+      - name: Patch and compile
+        run: |
+          set -euxo pipefail
+          mkdir /tmp/fixture
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          tar xf /tmp/repro.tar.gz -C /tmp/fixture
+          python3 .github/fieldwork/patch_split_resident_bridge_fixture.py /tmp/fixture
+          cd /tmp/fixture/fex-full-thunk-pair
+          make clean
+          make
+          readelf -d guest/liblifetime-bridge.so | tee /tmp/bridge.dynamic
+          readelf -d guest/liblifetime-guest.so | tee /tmp/wrapper.dynamic
+          grep -q NODELETE /tmp/bridge.dynamic
+          grep -q 'Shared library: \[liblifetime-bridge.so\]' /tmp/wrapper.dynamic
+          nm -D guest/liblifetime-bridge.so | grep lifetime_bridge_callhost_a
+          nm -D guest/liblifetime-bridge.so | grep lifetime_bridge_guest_unpacker
+          nm -D guest/liblifetime-guest.so | grep lifetime_wrapper_generation
