@@ -5,13 +5,44 @@ Validated artifact:
 - Local build command: g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror
 - Local result: range-retirement prototype: 6/6 PASS
 
-Do not apply fex2608-range-retirement.patch as committed on this branch. A local git apply parser check found an invalid hand-written hunk count. Attempts to replace/delete that artifact were rejected by the repository write gateway after the C++ prototype had already been committed.
+Historical artifact only:
+- fex2608-range-retirement.patch has an invalid hand-written hunk count and must not be applied.
+- integration_sketch.txt describes the original v1 idea and is now partly superseded.
 
-The intended first FEX source experiment remains narrow:
-1. Add a Context API that scans CustomIRHandlers for thunk-owned entries whose Data guest target lies in a retiring address range.
-2. Replace each matching entry with a CustomIR tombstone rather than erasing it.
-3. Invalidate translated code at each native PFN key.
-4. Invoke that retirement immediately after a successful GuestMunmap host munmap and before TrackMunmap / ordinary range invalidation.
-5. Treat this only as a causal probe. It does not provide reload revival, host-to-guest callback revocation, or concurrent execution quiescence.
+Critical v1 flaw discovered during source audit:
+- Compiled CustomIR entrypoints are inserted with an empty CodePages vector because GenerateIR takes the CustomIR path before normal frontend decoding/page registration.
+- GuestToHostMap::InvalidateRange() finds shared/L3 blocks only through CodePages.
+- LookupCache::InvalidateCacheRange() finds thread-local L1/L2 entries only through CachedCodePages.
+- Therefore InvalidateGuestCodeRange(H, 1) cannot be trusted to evict an already-compiled synthetic CustomIR entrypoint H. The previous ablation's "invalidate H" axis was not a real exact-H invalidation.
 
-The standalone prototype separately demonstrates the desired later semantics for tombstone revival on same-PFN reload, changed guest load bases, unrelated mappings, and explicit live-binding conflicts.
+Current v2 artifact:
+- apply_exact_customir_retirement_v2.py
+- Commit adding applicator: 7950f66996c5c2b2accada06e0e80c4ef157809d
+- The applicator verifies all expected source anchors before modifying anything and runs git diff --check after application.
+- No CI runner is attached to this diagnostic branch at present, so this artifact is source-audited but not yet compiled in GitHub Actions.
+
+v2 causal experiment:
+1. Add exact shared/L3 eviction for a synthetic entrypoint H via GuestToHostMap::Erase(H), which also delinks inbound direct block links.
+2. Add exact per-thread L1/L2 eviction for H and flush the call/return shadow cache.
+3. Scan CustomIRHandlers for thunk-owned entries whose Data guest target T lies in a successfully unmapped guest range.
+4. Erase those H->T registrations and exact-evict every returned H under the same code-invalidation transaction.
+5. Invoke the retirement after successful GuestMunmap and before ordinary guest-range invalidation.
+
+Interpretation:
+- If unpinned Vulkan teardown stops reaching the old libvulkan-guest.so CallHostFunction address after v2, stale dynamic-PFN CustomIR/compiled-H reachability is strongly implicated.
+- A clean exit is strong positive evidence.
+- A changed failure at H after the mapping is retired is also informative: it proves the old H->T redirect was carrying the dead target even if the application still performs a late call.
+- If the same dead T is reached after logs prove its H->T registration was retired and H was exact-evicted, the leading CustomIR dispatch hypothesis is damaged and another retained reference must be found.
+
+Known limits of v2:
+- GuestMunmap has already performed the kernel unmap before v2 retirement; this is a causal probe, not a race-safe lifetime protocol.
+- Peer threads already executing a translated H block are not quiesced.
+- Host-to-guest callback trampolines are not retired.
+- mmap(MAP_FIXED), mremap, shmdt, and other destructive mapping paths are not covered by this first probe.
+- No load-generation/owner identity is attached to H->T registrations yet.
+
+Next runtime work:
+- Apply v2 to the exact FEX-2608 experimental checkout after the callback-routing diagnostic change.
+- Run unpinned Vulkan with llvmpipe and Venus, recording retirement logs, final exit status, and fault RIP.
+- Run the forced-changed-base libGL fresh-PFN probe to test the same mechanism without Vulkan.
+- If v2 is causally positive, move retirement to a pre-destructive mapping phase and test a peer-thread quiescence barrier before treating any patch as a lifetime repair.
