@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 2
 
       - name: Dependencies and source identity
         shell: bash
@@ -36,7 +36,9 @@ jobs:
             libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxrandr-dev libxrender-dev binutils
           git rev-parse HEAD | tee "$R/carrier-sha.txt"
-          git merge-base HEAD 3288618bdb08cd46b1920d5772e376701e728f70 | tee "$R/prototype-base.txt"
+          parent="$(git rev-parse HEAD^)"
+          printf '%s\n' "$parent" | tee "$R/prototype-base.txt"
+          test "$parent" = 3288618bdb08cd46b1920d5772e376701e728f70
 
       - name: Build thunk generator
         shell: bash
