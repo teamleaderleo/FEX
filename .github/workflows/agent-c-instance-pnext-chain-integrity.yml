@@ -1,0 +1,270 @@
+name: Agent C Vulkan instance pNext chain integrity
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths: [.github/workflows/agent-c-instance-pnext-chain-integrity.yml]
+
+permissions:
+  contents: read
+
+env:
+  FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+  FIELDWORK_SHA: 1f58c1bc21c5dcf2cbc3697d6c3c1dd42e712a31
+  DEBIAN_FRONTEND: noninteractive
+  ROOTFS: ${{ github.workspace }}/rootfs-amd64
+  HOST: ${{ github.workspace }}/host
+  R: ${{ github.workspace }}/receipts
+  FEX_PORTABLE: 1
+
+jobs:
+  integrity:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact FEX base
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Check out exact Fieldwork candidate script
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Identity and dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          test "$(git -C fieldwork rev-parse HEAD)" = "$FIELDWORK_SHA"
+          {
+            echo "fex_sha=$(git -C src rev-parse HEAD)"
+            echo "fieldwork_sha=$(git -C fieldwork rev-parse HEAD)"
+            uname -a
+            uname -m
+          } | tee "$R/identity.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools \
+            vulkan-validationlayers debootstrap
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" > "$R/lvp-icd.txt"
+          VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
+
+      - name: Apply tested callback candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 fieldwork/investigations/fex-vulkan-thunk-lifecycle/apply_instance_pnext_callback_suppression.py src
+          git -C src diff --check
+          git -C src diff -- ThunkLibs/libvulkan/Host.cpp | tee "$R/candidate.diff"
+          grep -q 'DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT' "$R/candidate.diff"
+
+      - name: Build chain-integrity probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat >/tmp/pnext-integrity.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #define VK_NO_PROTOTYPES
+          #include <vulkan/vulkan.h>
+
+          static volatile uint32_t utils_count;
+          static volatile uint32_t report_count;
+
+          VKAPI_ATTR VkBool32 VKAPI_CALL utils_cb(
+              VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+              VkDebugUtilsMessageTypeFlagsEXT types,
+              const VkDebugUtilsMessengerCallbackDataEXT *data,
+              void *user) {
+            (void)severity; (void)types; (void)data; (void)user;
+            ++utils_count;
+            fprintf(stderr,"INTEGRITY_UNEXPECTED_UTILS_CALLBACK count=%u\n",utils_count);
+            fflush(stderr);
+            return VK_FALSE;
+          }
+
+          VKAPI_ATTR VkBool32 VKAPI_CALL report_cb(
+              VkDebugReportFlagsEXT flags, VkDebugReportObjectTypeEXT type,
+              uint64_t object, size_t location, int32_t code,
+              const char *layer, const char *message, void *user) {
+            (void)flags; (void)type; (void)object; (void)location; (void)code;
+            (void)layer; (void)message; (void)user;
+            ++report_count;
+            fprintf(stderr,"INTEGRITY_UNEXPECTED_REPORT_CALLBACK count=%u\n",report_count);
+            fflush(stderr);
+            return VK_FALSE;
+          }
+
+          static int has_layer(PFN_vkEnumerateInstanceLayerProperties fn,const char*w){
+            uint32_t n=0;if(fn(&n,NULL)!=VK_SUCCESS)return 0;
+            VkLayerProperties*p=calloc(n?n:1,sizeof(*p));if(!p)return 0;
+            if(fn(&n,p)!=VK_SUCCESS){free(p);return 0;}int ok=0;
+            for(uint32_t i=0;i<n;++i)if(!strcmp(p[i].layerName,w))ok=1;
+            free(p);return ok;
+          }
+          static int has_ext(PFN_vkEnumerateInstanceExtensionProperties fn,const char*w){
+            uint32_t n=0;if(fn(NULL,&n,NULL)!=VK_SUCCESS)return 0;
+            VkExtensionProperties*p=calloc(n?n:1,sizeof(*p));if(!p)return 0;
+            if(fn(NULL,&n,p)!=VK_SUCCESS){free(p);return 0;}int ok=0;
+            for(uint32_t i=0;i<n;++i)if(!strcmp(p[i].extensionName,w))ok=1;
+            free(p);return ok;
+          }
+
+          int main(void){
+            void*vk=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_LOCAL);
+            if(!vk){fprintf(stderr,"DLOPEN=%s\n",dlerror());return 10;}
+            PFN_vkCreateInstance create=(PFN_vkCreateInstance)dlsym(vk,"vkCreateInstance");
+            PFN_vkDestroyInstance destroy=(PFN_vkDestroyInstance)dlsym(vk,"vkDestroyInstance");
+            PFN_vkEnumerateInstanceLayerProperties enum_layers=(PFN_vkEnumerateInstanceLayerProperties)dlsym(vk,"vkEnumerateInstanceLayerProperties");
+            PFN_vkEnumerateInstanceExtensionProperties enum_exts=(PFN_vkEnumerateInstanceExtensionProperties)dlsym(vk,"vkEnumerateInstanceExtensionProperties");
+            if(!create||!destroy||!enum_layers||!enum_exts)return 11;
+            const char*layer="VK_LAYER_KHRONOS_validation";
+            if(!has_layer(enum_layers,layer)||!has_ext(enum_exts,VK_EXT_DEBUG_UTILS_EXTENSION_NAME)||!has_ext(enum_exts,VK_EXT_DEBUG_REPORT_EXTENSION_NAME))return 12;
+
+            VkDebugUtilsMessengerCreateInfoEXT utils={
+              .sType=VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+              .pNext=NULL,
+              .messageSeverity=VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+              .messageType=VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT|VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+              .pfnUserCallback=utils_cb,
+            };
+            VkDebugReportCallbackCreateInfoEXT report={
+              .sType=VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT,
+              .pNext=&utils,
+              .flags=VK_DEBUG_REPORT_INFORMATION_BIT_EXT|VK_DEBUG_REPORT_WARNING_BIT_EXT|VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT|VK_DEBUG_REPORT_ERROR_BIT_EXT|VK_DEBUG_REPORT_DEBUG_BIT_EXT,
+              .pfnCallback=report_cb,
+            };
+            VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName="fex-pnext-integrity",.apiVersion=VK_API_VERSION_1_0};
+            const char*layers[]={layer};
+            const char*exts[]={VK_EXT_DEBUG_UTILS_EXTENSION_NAME,VK_EXT_DEBUG_REPORT_EXTENSION_NAME};
+            VkInstanceCreateInfo ici={
+              .sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+              .pNext=&report,
+              .flags=(VkInstanceCreateFlags)0x80000000u,
+              .pApplicationInfo=&app,
+              .enabledLayerCount=1,.ppEnabledLayerNames=layers,
+              .enabledExtensionCount=2,.ppEnabledExtensionNames=exts,
+            };
+
+            const void *orig_ici_pnext=ici.pNext;
+            const void *orig_report_pnext=report.pNext;
+            const void *orig_utils_pnext=utils.pNext;
+            fprintf(stderr,"INTEGRITY_BEFORE_CREATE ici=%p report=%p utils=%p callbacks=%u/%u\n",
+                    ici.pNext,report.pNext,utils.pNext,utils_count,report_count);fflush(stderr);
+
+            VkInstance instance=VK_NULL_HANDLE;
+            VkResult r=create(&ici,NULL,&instance);
+            int ici_same=(ici.pNext==orig_ici_pnext);
+            int report_same=(report.pNext==orig_report_pnext);
+            int utils_same=(utils.pNext==orig_utils_pnext);
+            fprintf(stderr,"INTEGRITY_AFTER_CREATE result=%d instance=%p ici_same=%d report_same=%d utils_same=%d ici=%p report=%p utils=%p callbacks=%u/%u\n",
+                    r,(void*)instance,ici_same,report_same,utils_same,ici.pNext,report.pNext,utils.pNext,utils_count,report_count);fflush(stderr);
+            if(r!=VK_SUCCESS||instance==VK_NULL_HANDLE)return 20;
+            if(utils_count||report_count)return 21;
+
+            destroy(instance,NULL);
+            fprintf(stderr,"INTEGRITY_AFTER_DESTROY ici_same=%d report_same=%d utils_same=%d callbacks=%u/%u\n",
+                    ici.pNext==orig_ici_pnext,report.pNext==orig_report_pnext,utils.pNext==orig_utils_pnext,utils_count,report_count);fflush(stderr);
+            if(dlclose(vk)!=0)return 22;
+
+            if(!ici_same||!report_same||!utils_same)return 40;
+            fprintf(stderr,"INTEGRITY_RETURN unchanged=1\n");fflush(stderr);
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -g -Wall -Wextra -Werror \
+            -Isrc/External/Vulkan-Headers/include /tmp/pnext-integrity.c -ldl -o /tmp/pnext-integrity
+          file /tmp/pnext-integrity | tee "$R/probe.file.txt"
+
+      - name: Build focused candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF \
+            -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v >"$R/build-host.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
+
+      - name: Build amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo debootstrap --arch=amd64 --foreign --variant=minbase --components=main,universe \
+            --include=libvulkan1,libx11-6 noble "$ROOTFS" http://archive.ubuntu.com/ubuntu >"$R/debootstrap.log" 2>&1
+          sudo find "$ROOTFS" -type f -name '*.deb' -print | sort > "$R/rootfs-debs.txt"
+          sed -n 's/^I: Extracting \([^ ]*\)\.\.\.$/\1/p' "$R/debootstrap.log" | sort -u > "$R/rootfs-already-extracted.txt"
+          while IFS= read -r deb; do
+            pkg="$(dpkg-deb -f "$deb" Package)"
+            grep -Fxq "$pkg" "$R/rootfs-already-extracted.txt" && continue
+            sudo dpkg-deb -x "$deb" "$ROOTFS"
+          done < "$R/rootfs-debs.txt"
+          sudo cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
+          sudo mkdir -p "$ROOTFS/usr/local/bin"
+          sudo install -m755 /tmp/pnext-integrity "$ROOTFS/usr/local/bin/pnext-integrity"
+          X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          for sym in XSync XGetVisualInfo XDisplayString; do
+            x86_64-linux-gnu-readelf -Ws "$X11" | grep -E " ${sym}(@|$)" | head -1
+          done
+
+      - name: Run guest chain-integrity check
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          set +e
+          timeout 90s env VK_DRIVER_FILES="$LVP_ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+            "$FEX" /usr/local/bin/pnext-integrity >"$R/fex.out" 2>"$R/fex.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/fex.exit"
+          cat "$R/fex.err"
+          if grep -q '^INTEGRITY_AFTER_CREATE ' "$R/fex.err"; then
+            grep '^INTEGRITY_AFTER_CREATE ' "$R/fex.err" | tee "$R/integrity-line.txt"
+          fi
+          {
+            echo "fex_exit=$rc"
+            if grep -q '^INTEGRITY_RETURN unchanged=1' "$R/fex.err"; then echo 'guest_chain_unchanged=1'; else echo 'guest_chain_unchanged=0'; fi
+            if grep -q '^INTEGRITY_UNEXPECTED_' "$R/fex.err"; then echo 'guest_callback_observed=1'; else echo 'guest_callback_observed=0'; fi
+          } | tee "$R/summary.txt"
+          test "$rc" -ne 124
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-instance-pnext-chain-integrity-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
