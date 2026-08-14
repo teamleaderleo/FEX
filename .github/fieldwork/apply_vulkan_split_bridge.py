@@ -61,6 +61,7 @@ print(f"extracted {len(names)} Vulkan internal symbols")
 #include "common/Guest.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <string_view>
 #include <unordered_map>
 
@@ -73,6 +74,13 @@ print(f"extracted {len(names)} Vulkan internal symbols")
 #include "vulkan_bridge_symbols.inl"
 #undef VULKAN_BRIDGE_SYMBOL
 
+[[noreturn]]
+static void ResidentFatalError(void* raw_args) {
+  auto called_function = reinterpret_cast<PackedArguments<void, uintptr_t>*>(raw_args)->a0;
+  fprintf(stderr, "FATAL: Called unknown Vulkan function at address %p\n", reinterpret_cast<void*>(called_function));
+  __builtin_trap();
+}
+
 extern "C" __attribute__((visibility("default")))
 uintptr_t fex_vulkan_bridge_find_host_invoker(const char* name) {
   static const std::unordered_map<std::string_view, uintptr_t> Invokers = [] {
@@ -84,6 +92,12 @@ uintptr_t fex_vulkan_bridge_find_host_invoker(const char* name) {
   }();
   auto It = Invokers.find(name);
   return It == Invokers.end() ? 0 : It->second;
+}
+
+extern "C" __attribute__((visibility("default")))
+uintptr_t fex_vulkan_bridge_fatal_invoker() {
+  const auto StubHostPtrInvoker = CallHostFunction<ResidentFatalError, void>;
+  return reinterpret_cast<uintptr_t>(StubHostPtrInvoker);
 }
 
 extern "C" __attribute__((visibility("default")))
@@ -105,10 +119,15 @@ uintptr_t fex_vulkan_bridge_xdisplaystring_unpacker() {
     old_map = '''// Maps Vulkan API function names to the address of a guest function which is\n// linked to the corresponding host function pointer\nconst std::unordered_map<std::string_view, uintptr_t /* guest function address */> HostPtrInvokers = std::invoke([]() {\n#define PAIR(name, unused) Ret[#name] = reinterpret_cast<uintptr_t>(GetCallerForHostFunction(name));\n  std::unordered_map<std::string_view, uintptr_t> Ret;\n  FOREACH_internal_SYMBOL(PAIR);\n  return Ret;\n#undef PAIR\n});\n\n'''
     if text.count(old_map) != 1:
         raise SystemExit("HostPtrInvokers block anchor missing")
-    text = text.replace(old_map, '''uintptr_t fex_vulkan_bridge_find_host_invoker(const char* name);\nuintptr_t fex_vulkan_bridge_xsync_unpacker();\nuintptr_t fex_vulkan_bridge_xgetvisualinfo_unpacker();\nuintptr_t fex_vulkan_bridge_xdisplaystring_unpacker();\n\n''', 1)
+    text = text.replace(old_map, '''uintptr_t fex_vulkan_bridge_find_host_invoker(const char* name);\nuintptr_t fex_vulkan_bridge_fatal_invoker();\nuintptr_t fex_vulkan_bridge_xsync_unpacker();\nuintptr_t fex_vulkan_bridge_xgetvisualinfo_unpacker();\nuintptr_t fex_vulkan_bridge_xdisplaystring_unpacker();\n\n''', 1)
+
+    fatal_block = '''// Fatally erroring function with a thunk-like interface. This is used as a placeholder for unknown Vulkan functions\n[[noreturn]]\nstatic void FatalError(void* raw_args) {\n  auto called_function = reinterpret_cast<PackedArguments<void, uintptr_t>*>(raw_args)->a0;\n  fprintf(stderr, "FATAL: Called unknown Vulkan function at address %p\\n", reinterpret_cast<void*>(called_function));\n  __builtin_trap();\n}\n\n'''
+    if text.count(fatal_block) != 1:
+        raise SystemExit("FatalError block anchor missing")
+    text = text.replace(fatal_block, '// Unknown-function fatal invoker is owned by the resident bridge DSO.\n\n', 1)
 
     old_callable = '''static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {\n  auto It = HostPtrInvokers.find(name);\n  if (It == HostPtrInvokers.end()) {\n    fprintf(stderr, "%s: Unknown Vulkan function at address %p: %s\\n", origin, func, name);\n    if (stub_unknown_functions) {\n      const auto StubHostPtrInvoker = CallHostFunction<FatalError, void>;\n      LinkAddressToFunction((uintptr_t)func, reinterpret_cast<uintptr_t>(StubHostPtrInvoker));\n      return func;\n    }\n    return nullptr;\n  }\n  fprintf(stderr, "Linking address %p to host invoker %#zx\\n", func, It->second);\n  LinkAddressToFunction((uintptr_t)func, It->second);\n  return func;\n}\n'''
-    new_callable = '''static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {\n  const auto GuestInvoker = fex_vulkan_bridge_find_host_invoker(name);\n  if (!GuestInvoker) {\n    fprintf(stderr, "%s: Unknown Vulkan function at address %p: %s\\n", origin, func, name);\n    if (stub_unknown_functions) {\n      const auto StubHostPtrInvoker = CallHostFunction<FatalError, void>;\n      LinkAddressToFunction((uintptr_t)func, reinterpret_cast<uintptr_t>(StubHostPtrInvoker));\n      return func;\n    }\n    return nullptr;\n  }\n  fprintf(stderr, "Linking address %p to resident host invoker %#zx\\n", func, GuestInvoker);\n  LinkAddressToFunction((uintptr_t)func, GuestInvoker);\n  return func;\n}\n'''
+    new_callable = '''static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFunction func, const char* name) {\n  const auto GuestInvoker = fex_vulkan_bridge_find_host_invoker(name);\n  if (!GuestInvoker) {\n    fprintf(stderr, "%s: Unknown Vulkan function at address %p: %s\\n", origin, func, name);\n    if (stub_unknown_functions) {\n      const auto StubHostPtrInvoker = fex_vulkan_bridge_fatal_invoker();\n      LinkAddressToFunction((uintptr_t)func, StubHostPtrInvoker);\n      return func;\n    }\n    return nullptr;\n  }\n  fprintf(stderr, "Linking address %p to resident host invoker %#zx\\n", func, GuestInvoker);\n  LinkAddressToFunction((uintptr_t)func, GuestInvoker);\n  return func;\n}\n'''
     if text.count(old_callable) != 1:
         raise SystemExit("MakeGuestCallable anchor missing")
     text = text.replace(old_callable, new_callable, 1)
