@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 90
     env:
       FEX_BASE: e869aa644a16e4332cdc15c1ea0b4d13d482385d
-      FIELDWORK_REF: probe/fex-vulkan-combined-repair
+      FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
       ROOTFS: ${{ github.workspace }}/rootfs-amd64
       R: ${{ github.workspace }}/receipts-combined-lifetime
       H: ${{ github.workspace }}/host-vulkan
