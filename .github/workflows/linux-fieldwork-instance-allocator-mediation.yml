@@ -1,0 +1,108 @@
+name: Vulkan instance allocator mediation experiment
+on:
+  workflow_dispatch:
+  push:
+    branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
+    paths:
+      - LINUX_FIELDWORK_ALLOCATOR_TRAMPOLINE.py
+      - LINUX_FIELDWORK_INSTANCE_ALLOCATOR_MEDIATION.py
+      - LINUX_FIELDWORK_INSTANCE_ALLOCATOR_DYNAMIC_PROBE.c
+      - .github/workflows/linux-fieldwork-instance-allocator-mediation.yml
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      PRODUCT_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      FIELDWORK_REF: investigation/fex-vulkan-thunk-lifecycle
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: carrier
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_REF }}
+          path: fieldwork
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers
+      - name: Apply allocator mediation and instance pass-through
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          python3 ../carrier/LINUX_FIELDWORK_ALLOCATOR_TRAMPOLINE.py
+          python3 ../carrier/LINUX_FIELDWORK_INSTANCE_ALLOCATOR_MEDIATION.py
+          git diff --check
+          git diff -- ThunkLibs/libvulkan/libvulkan_interface.cpp ThunkLibs/libvulkan/Host.cpp ThunkLibs/libvulkan/Guest.cpp | tee /tmp/instance-mediation.diff
+      - name: Build FEX and Vulkan thunks
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_x86_64.cmake" -DFEX_PROJECT_SOURCE_DIR="$PWD" -DGENERATOR_EXE="$PWD/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)"
+      - name: Prepare rootfs and probes
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir rootfs-amd64
+          docker export "$cid" | tar -C rootfs-amd64 -xf -
+          docker rm "$cid"
+          mkdir -p rootfs-amd64/usr/lib/x86_64-linux-gnu rootfs-amd64/opt/fex-ci host-thunks receipts
+          cp product/guest-build/libvulkan-guest.so rootfs-amd64/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+          cp product/build/HostLibs_64/libvulkan-host.so host-thunks/libvulkan-host.so
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o rootfs-amd64/usr/lib/x86_64-linux-gnu/libX11.so.6
+          PROBE=fieldwork/investigations/fex-vulkan-thunk-lifecycle/agent-b/vk_allocator_instance_probe.c
+          cc -O2 -Wall -Wextra -Werror "$PROBE" -ldl -o receipts/native-direct
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror "$PROBE" -ldl -o rootfs-amd64/opt/fex-ci/allocator-instance-direct
+          cc -std=c11 -O2 -Wall -Wextra -Werror -Ifieldwork carrier/LINUX_FIELDWORK_INSTANCE_ALLOCATOR_DYNAMIC_PROBE.c -ldl -o receipts/native-dynamic
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror -Ifieldwork carrier/LINUX_FIELDWORK_INSTANCE_ALLOCATOR_DYNAMIC_PROBE.c -ldl -o rootfs-amd64/opt/fex-ci/allocator-instance-dynamic
+      - name: Execute direct and GIPA allocator matrix
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$ICD" timeout 30s receipts/native-direct >receipts/native-direct.stdout 2>receipts/native-direct.stderr
+          native_direct=$?
+          VK_DRIVER_FILES="$ICD" timeout 30s receipts/native-dynamic >receipts/native-dynamic.stdout 2>receipts/native-dynamic.stderr
+          native_dynamic=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" timeout 30s product/build/Bin/FEX /opt/fex-ci/allocator-instance-direct >receipts/fex-direct.stdout 2>receipts/fex-direct.stderr
+          fex_direct=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" timeout 30s product/build/Bin/FEX /opt/fex-ci/allocator-instance-dynamic >receipts/fex-dynamic.stdout 2>receipts/fex-dynamic.stderr
+          fex_dynamic=$?
+          set -e
+          printf 'native_direct=%s\nnative_dynamic=%s\nfex_direct=%s\nfex_dynamic=%s\n' "$native_direct" "$native_dynamic" "$fex_direct" "$fex_dynamic" | tee receipts/final-matrix.txt
+          for f in native-direct native-dynamic fex-direct fex-dynamic; do printf '%s\n' "--- $f ---"; cat "receipts/$f.stderr"; done
+          test "$native_direct" -eq 0
+          test "$native_dynamic" -eq 0
+          test "$fex_direct" -eq 0
+          test "$fex_dynamic" -eq 0
+          grep -q 'PASS allocator native-valid create/destroy callbacks observed' receipts/fex-direct.stderr
+          grep -q 'PASS allocator callbacks observed' receipts/fex-dynamic.stderr
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instance-allocator-mediation-${{ github.run_id }}
+          path: |
+            receipts
+            /tmp/instance-mediation.diff
+          retention-days: 30
