@@ -1,0 +1,495 @@
+name: Wayland resident callback lifetime v1
+
+on:
+  push:
+    branches: [diagnostic/wayland-resident-callback-v1]
+    paths:
+      - .github/workflows/wayland-resident-callback-runtime-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wayland-callback-runtime:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 80
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs-wayland-resident-v1
+      R: ${{ github.workspace }}/receipts-wayland-resident-v1
+      H: ${{ github.workspace }}/host-wayland-resident-v1
+      M: ${{ github.workspace }}/mock-wayland-resident-v1
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and escape checks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H" "$M"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libwayland-dev
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+          git diff --check
+          grep -q 'AllocateHostTrampolineForGuestFunction' ThunkLibs/libwayland-client/Guest.cpp
+          grep -q 'custom_host_impl, fexgen::custom_guest_entrypoint' ThunkLibs/libwayland-client/libwayland-client_interface.cpp
+          ! grep -q 'generate(libwayland-client .* RESIDENT_BRIDGE)' ThunkLibs/GuestLibs/CMakeLists.txt
+
+      - name: Build FEX and Wayland host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1 \
+            || { tail -n 260 "$R/cmake-host.log"; exit 1; }
+          cmake --build build --target FEX FEXServer wayland-client-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 560 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libwayland-client-host.so "$H/libwayland-client-host.so"
+          test -x build/Bin/FEX
+
+      - name: Build stock Wayland guest baseline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest-base -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest-base.log" 2>&1 \
+            || { tail -n 280 "$R/cmake-guest-base.log"; exit 1; }
+          cmake --build guest-base --target wayland-client-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest-base.log" 2>&1 || { tail -n 560 "$R/build-guest-base.log"; exit 1; }
+          test -f guest-base/libwayland-client-guest.so
+          readelf -d guest-base/libwayland-client-guest.so | tee "$R/baseline-wrapper.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/baseline-wrapper.dynamic"
+
+      - name: Build fake native Wayland library and guest probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/mockwayland.c <<'EOF'
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <wayland-client.h>
+
+          struct mock_proxy {
+            const struct wl_interface *interface;
+            void (**listener)(void);
+            void *data;
+          };
+
+          static const struct wl_message mock_display_events[] = {
+            {"tick", "", NULL},
+          };
+
+          const struct wl_interface wl_display_interface = {
+            "wl_display", 1, 0, NULL, 1, mock_display_events,
+          };
+
+          #define SIMPLE_INTERFACE(sym, text) \
+            const struct wl_interface sym = {text, 1, 0, NULL, 0, NULL}
+          SIMPLE_INTERFACE(wl_output_interface, "wl_output");
+          SIMPLE_INTERFACE(wl_shm_pool_interface, "wl_shm_pool");
+          SIMPLE_INTERFACE(wl_pointer_interface, "wl_pointer");
+          SIMPLE_INTERFACE(wl_compositor_interface, "wl_compositor");
+          SIMPLE_INTERFACE(wl_shm_interface, "wl_shm");
+          SIMPLE_INTERFACE(wl_registry_interface, "wl_registry");
+          SIMPLE_INTERFACE(wl_buffer_interface, "wl_buffer");
+          SIMPLE_INTERFACE(wl_seat_interface, "wl_seat");
+          SIMPLE_INTERFACE(wl_surface_interface, "wl_surface");
+          SIMPLE_INTERFACE(wl_keyboard_interface, "wl_keyboard");
+          SIMPLE_INTERFACE(wl_callback_interface, "wl_callback");
+          SIMPLE_INTERFACE(wl_data_offer_interface, "wl_data_offer");
+          SIMPLE_INTERFACE(wl_data_source_interface, "wl_data_source");
+          SIMPLE_INTERFACE(wl_data_device_interface, "wl_data_device");
+          SIMPLE_INTERFACE(wl_data_device_manager_interface, "wl_data_device_manager");
+          SIMPLE_INTERFACE(wl_shell_interface, "wl_shell");
+          SIMPLE_INTERFACE(wl_shell_surface_interface, "wl_shell_surface");
+          SIMPLE_INTERFACE(wl_touch_interface, "wl_touch");
+          SIMPLE_INTERFACE(wl_region_interface, "wl_region");
+          SIMPLE_INTERFACE(wl_subcompositor_interface, "wl_subcompositor");
+          SIMPLE_INTERFACE(wl_subsurface_interface, "wl_subsurface");
+          #undef SIMPLE_INTERFACE
+
+          static struct mock_proxy display_proxy = {&wl_display_interface, NULL, NULL};
+
+          struct wl_display *wl_display_connect(const char *name) {
+            fprintf(stderr, "HOST_WL_CONNECT name=%s proxy=%p\n", name ? name : "(null)", (void *)&display_proxy);
+            return (struct wl_display *)&display_proxy;
+          }
+
+          void (**wl_proxy_get_listener(struct wl_proxy *proxy))(void) {
+            struct mock_proxy *p = (struct mock_proxy *)proxy;
+            return p->listener;
+          }
+
+          int wl_proxy_add_listener(struct wl_proxy *proxy, void (**implementation)(void), void *data) {
+            struct mock_proxy *p = (struct mock_proxy *)proxy;
+            p->listener = implementation;
+            p->data = data;
+            fprintf(stderr, "HOST_WL_ADD listener=%p callback0=%p data=%p\n",
+                    (void *)implementation,
+                    implementation ? (void *)implementation[0] : NULL,
+                    data);
+            return 0;
+          }
+
+          int wl_display_dispatch(struct wl_display *display) {
+            struct mock_proxy *p = (struct mock_proxy *)display;
+            fprintf(stderr, "HOST_WL_DISPATCH listener=%p callback0=%p data=%p\n",
+                    (void *)p->listener,
+                    p->listener ? (void *)p->listener[0] : NULL,
+                    p->data);
+            if (p->listener && p->listener[0]) {
+              typedef void (*cb_t)(void *, struct wl_proxy *);
+              ((cb_t)p->listener[0])(p->data, (struct wl_proxy *)p);
+            }
+            return 0;
+          }
+          EOF
+          clang-18 -shared -fPIC -O2 -Wall -Wextra -Werror /tmp/mockwayland.c \
+            -Wl,-soname,libwayland-client.so.0 -o "$M/libwayland-client.so.0"
+
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat > /tmp/waylandprobe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mman.h>
+
+          typedef void *(*WLCONNECT)(const char *);
+          typedef int (*WLADDLISTENER)(void *, void (**)(void), void *);
+          typedef int (*WLDISPATCH)(void *);
+          struct span { uintptr_t a, b; };
+          static struct span old_ranges[24];
+          static unsigned old_count;
+          static int callback_count;
+
+          static void guest_listener(void *data, void *proxy) {
+            ++callback_count;
+            fprintf(stderr, "GUEST_WL_LISTENER data=%ld proxy=%p count=%d\n",
+                    (long)(intptr_t)data, proxy, callback_count);
+          }
+
+          static int map_has(void *p, const char *needle, int verbose) {
+            FILE *f = fopen("/proc/self/maps", "r");
+            char line[1024];
+            uintptr_t x = (uintptr_t)p;
+            if (!f) return -1;
+            while (fgets(line, sizeof(line), f)) {
+              unsigned long a, b;
+              if (sscanf(line, "%lx-%lx", &a, &b) == 2 && x >= a && x < b) {
+                if (verbose) fprintf(stderr, "MAP %p %s", p, line);
+                int ok = strstr(line, needle) != NULL;
+                fclose(f);
+                return ok;
+              }
+            }
+            fclose(f);
+            if (verbose) fprintf(stderr, "UNMAPPED %p\n", p);
+            return 0;
+          }
+
+          static int maps_contain(const char *needle) {
+            FILE *f = fopen("/proc/self/maps", "r");
+            char line[1024];
+            if (!f) return 0;
+            while (fgets(line, sizeof(line), f)) {
+              if (strstr(line, needle)) { fclose(f); return 1; }
+            }
+            fclose(f);
+            return 0;
+          }
+
+          static void capture_wrapper(void) {
+            FILE *f = fopen("/proc/self/maps", "r");
+            char line[1024];
+            old_count = 0;
+            if (!f) exit(70);
+            while (fgets(line, sizeof(line), f)) {
+              unsigned long a, b;
+              if (strstr(line, "/usr/lib/x86_64-linux-gnu/libwayland-client.so.0.20.0") &&
+                  sscanf(line, "%lx-%lx", &a, &b) == 2 && old_count < 24) {
+                old_ranges[old_count++] = (struct span){a, b};
+                fprintf(stderr, "OLD_WL_RANGE %lx-%lx\n", a, b);
+              }
+            }
+            fclose(f);
+            if (!old_count) exit(71);
+          }
+
+          static void reserve_old(void) {
+            for (unsigned i = 0; i < old_count; ++i) {
+              size_t n = old_ranges[i].b - old_ranges[i].a;
+              void *r = mmap((void *)old_ranges[i].a, n, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+              if (r == MAP_FAILED) {
+                fprintf(stderr, "RESERVE_FAIL %lx-%lx errno=%d %s\n",
+                        old_ranges[i].a, old_ranges[i].b, errno, strerror(errno));
+                exit(72);
+              }
+            }
+          }
+
+          int main(int argc, char **argv) {
+            int resident = argc > 1 && strcmp(argv[1], "resident") == 0;
+            void *h = dlopen("libwayland-client.so.0.20.0", RTLD_NOW | RTLD_LOCAL);
+            if (!h) { fprintf(stderr, "DLOPEN_FAIL %s\n", dlerror()); return 1; }
+            WLCONNECT connect0 = (WLCONNECT)dlsym(h, "wl_display_connect");
+            WLADDLISTENER add0 = (WLADDLISTENER)dlsym(h, "wl_proxy_add_listener");
+            WLDISPATCH dispatch0 = (WLDISPATCH)dlsym(h, "wl_display_dispatch");
+            if (!connect0 || !add0 || !dispatch0) return 2;
+            void *proxy = connect0("mock");
+            if (!proxy) return 3;
+            void (*callbacks[1])(void) = {(void (*)(void))guest_listener};
+            if (add0(proxy, callbacks, (void *)(intptr_t)77) != 0) return 4;
+            if (dispatch0(proxy) != 0 || callback_count != 1) return 5;
+            fprintf(stderr, "PRE_CLOSE_WL_OK connect=%p add=%p dispatch=%p proxy=%p bridge=%d\n",
+                    (void *)connect0, (void *)add0, (void *)dispatch0, proxy,
+                    maps_contain("/libfex-wayland-client-bridge.so"));
+            capture_wrapper();
+            if (dlclose(h)) return 6;
+            if (map_has((void *)dispatch0, "/usr/lib/x86_64-linux-gnu/libwayland-client.so.0.20.0", 1) != 0) return 7;
+            reserve_old();
+
+            void *h2 = dlopen("libwayland-client.so.0.20.0", RTLD_NOW | RTLD_LOCAL);
+            if (!h2) { fprintf(stderr, "RELOAD_FAIL %s\n", dlerror()); return 8; }
+            WLDISPATCH dispatch1 = (WLDISPATCH)dlsym(h2, "wl_display_dispatch");
+            if (!dispatch1) return 9;
+            fprintf(stderr, "POST_CLOSE_WL_TRIGGER_BEGIN old=%p new=%p moved=%d resident=%d\n",
+                    (void *)dispatch0, (void *)dispatch1, dispatch0 != dispatch1, resident);
+            int rc = dispatch1(proxy);
+            fprintf(stderr, "POST_CLOSE_WL_TRIGGER_RETURN rc=%d count=%d\n", rc, callback_count);
+            if (!resident) {
+              fprintf(stderr, "BASELINE_UNEXPECTED_WL_CALLBACK_RETURN\n");
+              return 90;
+            }
+            if (rc != 0 || callback_count != 2 || dispatch0 == dispatch1) return 10;
+            if (!maps_contain("/libfex-wayland-client-bridge.so")) return 11;
+            if (dlclose(h2)) return 12;
+            fprintf(stderr, "WAYLAND_RESIDENT_CALLBACK_AFTER_UNLOAD_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/waylandprobe.c -ldl -o "$ROOTFS/opt/fex-ci/waylandprobe"
+
+      - name: Prove stock Wayland custom callback unpacker dies after wrapper unload
+        shell: bash
+        run: |
+          set -uxo pipefail
+          cp guest-base/libwayland-client-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libwayland-client.so.0.20.0"
+          rm -f "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-wayland-client-bridge.so"
+          set +e
+          LD_LIBRARY_PATH="$M" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 30s \
+            build/Bin/FEX /opt/fex-ci/waylandprobe baseline > "$R/baseline.out" 2> "$R/baseline.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/baseline.exit"
+          cat "$R/baseline.err"
+          test "$rc" -ne 0
+          grep -q 'GUEST_WL_LISTENER data=77 .* count=1' "$R/baseline.err"
+          grep -q 'PRE_CLOSE_WL_OK' "$R/baseline.err"
+          grep -q 'UNMAPPED ' "$R/baseline.err"
+          grep -q 'POST_CLOSE_WL_TRIGGER_BEGIN' "$R/baseline.err"
+          grep -q 'HOST_WL_DISPATCH listener=' "$R/baseline.err"
+          ! grep -q 'count=2' "$R/baseline.err"
+          ! grep -q 'POST_CLOSE_WL_TRIGGER_RETURN' "$R/baseline.err"
+          ! grep -q 'BASELINE_UNEXPECTED_WL_CALLBACK_RETURN' "$R/baseline.err"
+          echo WAYLAND_BASELINE_CUSTOM_UNPACKER_FAILURE_PROVEN | tee "$R/baseline-result.txt"
+
+      - name: Apply explicit resident Wayland listener dispatcher candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cmake = Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s = cmake.read_text()
+          old = '''generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp)\nadd_guest_lib(wayland-client "libwayland-client.so.0.20.0")\ntarget_include_directories_from_pkgconfig(libwayland-client-guest-deps wayland-client /usr/include/wayland)'''
+          new = '''generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp RESIDENT_BRIDGE)\ntarget_include_directories_from_pkgconfig(libwayland-client-guest-deps wayland-client /usr/include/wayland)\n\nadd_library(libwayland-client_bridge-guest-deps INTERFACE)\ntarget_link_libraries(libwayland-client_bridge-guest-deps INTERFACE libwayland-client-guest-deps)\nset(GEN_libwayland-client_bridge "${GEN_libwayland-client_BRIDGE}")\nadd_guest_lib(wayland-client_bridge "libfex-wayland-client-bridge.so")\nset_target_properties(wayland-client_bridge-guest PROPERTIES OUTPUT_NAME "fex-wayland-client-bridge")\ntarget_link_options(wayland-client_bridge-guest PRIVATE "LINKER:-z,nodelete")\n\nadd_guest_lib(wayland-client "libwayland-client.so.0.20.0")\ntarget_link_libraries(wayland-client-guest PRIVATE wayland-client_bridge-guest)'''
+          if s.count(old) != 1:
+              raise SystemExit('Wayland CMake anchor missing')
+          cmake.write_text(s.replace(old, new, 1))
+
+          guest = Path('ThunkLibs/libwayland-client/Guest.cpp')
+          s = guest.read_text()
+          template_start = s.index('// See wayland-util.h for documentation on protocol message signatures')
+          template_end = s.index('#define WL_CLOSURE_MAX_ARGS 20', template_start)
+          declaration = '''extern "C" uint64_t FEXWaylandResidentAllocateHostTrampoline(const char* signature, void (*callback)());\n\n'''
+          s = s[:template_start] + declaration + s[template_end:]
+          function_start = s.index('extern "C" int wl_proxy_add_listener')
+          switch_start = s.index('    if (signature == "") {', function_start)
+          final_marker = '      std::abort();\n    }\n'
+          switch_end = s.index(final_marker, switch_start) + len(final_marker)
+          replacement = '    host_callbacks[i] = FEXWaylandResidentAllocateHostTrampoline(signature.c_str(), callback[i]);\n'
+          s = s[:switch_start] + replacement + s[switch_end:]
+          guest.write_text(s)
+          PY
+
+          mkdir -p ThunkLibs/libwayland-client_bridge
+          cat > ThunkLibs/libwayland-client_bridge/Guest.cpp <<'EOF'
+          // SPDX-License-Identifier: MIT
+          #include <wayland-client.h>
+          #include <wayland-util.h>
+
+          #include <cstdio>
+          #include <cstdlib>
+          #include <string_view>
+
+          #include "common/Guest.h"
+          #include "thunkgen_guest_libwayland-client_bridge.inl"
+
+          template<char>
+          struct ArgType;
+          template<> struct ArgType<'s'> { using type = const char*; };
+          template<> struct ArgType<'u'> { using type = uint32_t; };
+          template<> struct ArgType<'i'> { using type = int32_t; };
+          template<> struct ArgType<'o'> { using type = wl_proxy*; };
+          template<> struct ArgType<'n'> { using type = wl_proxy*; };
+          template<> struct ArgType<'a'> { using type = wl_array*; };
+          template<> struct ArgType<'f'> { using type = wl_fixed_t; };
+          template<> struct ArgType<'h'> { using type = int32_t; };
+
+          template<char... Signature>
+          static uint64_t Allocate(void (*callback)()) {
+            using cb = void(void*, wl_proxy*, typename ArgType<Signature>::type...);
+            return (uint64_t)(uintptr_t)(void*)AllocateHostTrampolineForGuestFunction((cb*)callback);
+          }
+
+          extern "C" uint64_t FEXWaylandResidentAllocateHostTrampoline(const char* raw, void (*callback)()) {
+            const std::string_view signature {raw};
+            if (signature == "") return Allocate<>(callback);
+            if (signature == "a") return Allocate<'a'>(callback);
+            if (signature == "f") return Allocate<'f'>(callback);
+            if (signature == "hu") return Allocate<'h', 'u'>(callback);
+            if (signature == "i") return Allocate<'i'>(callback);
+            if (signature == "if") return Allocate<'i', 'f'>(callback);
+            if (signature == "iff") return Allocate<'i', 'f', 'f'>(callback);
+            if (signature == "ii") return Allocate<'i', 'i'>(callback);
+            if (signature == "iu") return Allocate<'i', 'u'>(callback);
+            if (signature == "iia") return Allocate<'i', 'i', 'a'>(callback);
+            if (signature == "iiii") return Allocate<'i', 'i', 'i', 'i'>(callback);
+            if (signature == "iiiiissi") return Allocate<'i', 'i', 'i', 'i', 'i', 's', 's', 'i'>(callback);
+            if (signature == "n") return Allocate<'n'>(callback);
+            if (signature == "o") return Allocate<'o'>(callback);
+            if (signature == "u") return Allocate<'u'>(callback);
+            if (signature == "uff") return Allocate<'u', 'f', 'f'>(callback);
+            if (signature == "uffff") return Allocate<'u', 'f', 'f', 'f', 'f'>(callback);
+            if (signature == "uhu") return Allocate<'u', 'h', 'u'>(callback);
+            if (signature == "ui") return Allocate<'u', 'i'>(callback);
+            if (signature == "uiff") return Allocate<'u', 'i', 'f', 'f'>(callback);
+            if (signature == "uiii") return Allocate<'u', 'i', 'i', 'i'>(callback);
+            if (signature == "uiiii") return Allocate<'u', 'i', 'i', 'i', 'i'>(callback);
+            if (signature == "uo") return Allocate<'u', 'o'>(callback);
+            if (signature == "uoa") return Allocate<'u', 'o', 'a'>(callback);
+            if (signature == "uoff") return Allocate<'u', 'o', 'f', 'f'>(callback);
+            if (signature == "uoffo") return Allocate<'u', 'o', 'f', 'f', 'o'>(callback);
+            if (signature == "uoo") return Allocate<'u', 'o', 'o'>(callback);
+            if (signature == "us") return Allocate<'u', 's'>(callback);
+            if (signature == "uss") return Allocate<'u', 's', 's'>(callback);
+            if (signature == "usu") return Allocate<'u', 's', 'u'>(callback);
+            if (signature == "uu") return Allocate<'u', 'u'>(callback);
+            if (signature == "uuf") return Allocate<'u', 'u', 'f'>(callback);
+            if (signature == "uui") return Allocate<'u', 'u', 'i'>(callback);
+            if (signature == "uuoiff") return Allocate<'u', 'u', 'o', 'i', 'f', 'f'>(callback);
+            if (signature == "uuou") return Allocate<'u', 'u', 'o', 'u'>(callback);
+            if (signature == "uuu") return Allocate<'u', 'u', 'u'>(callback);
+            if (signature == "uuuu") return Allocate<'u', 'u', 'u', 'u'>(callback);
+            if (signature == "uuuuu") return Allocate<'u', 'u', 'u', 'u', 'u'>(callback);
+            if (signature == "s") return Allocate<'s'>(callback);
+            if (signature == "ss") return Allocate<'s', 's'>(callback);
+            if (signature == "sii") return Allocate<'s', 'i', 'i'>(callback);
+            fprintf(stderr, "TODO: Unknown wayland event signature descriptor %s\n", raw);
+            std::abort();
+          }
+          EOF
+
+          git diff --check
+          git diff -- ThunkLibs/GuestLibs/CMakeLists.txt ThunkLibs/libwayland-client/Guest.cpp \
+            | tee "$R/wayland-resident-candidate.diff"
+          cat ThunkLibs/libwayland-client_bridge/Guest.cpp | tee "$R/wayland-bridge-Guest.cpp"
+
+      - name: Build explicit resident Wayland candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest-resident -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest-resident.log" 2>&1 \
+            || { tail -n 320 "$R/cmake-guest-resident.log"; exit 1; }
+          cmake --build guest-resident --target wayland-client-guest wayland-client_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest-resident.log" 2>&1 || { tail -n 720 "$R/build-guest-resident.log"; exit 1; }
+
+          test -f guest-resident/libwayland-client-guest.so
+          test -f guest-resident/libfex-wayland-client-bridge.so
+          test -f guest-resident/gen/thunkgen_guest_libwayland-client_bridge.inl
+          test -f guest-resident/gen/thunkgen_guest_libwayland-client_bridge_accessors.inl
+          test "$(grep -Ec '^[[:space:]]*MAKE_CALLBACK_THUNK' guest-resident/gen/thunkgen_guest_libwayland-client_bridge.inl)" = 0
+          test "$(awk '/^extern "C" uintptr_t fex_bridge_.*_unpacker_/{n++} END{print n+0}' guest-resident/gen/thunkgen_guest_libwayland-client_bridge.inl)" = 0
+          ! grep -q 'WaylandAllocateHostTrampolineForGuestListener' ThunkLibs/libwayland-client/Guest.cpp
+          grep -q 'FEXWaylandResidentAllocateHostTrampoline' ThunkLibs/libwayland-client/Guest.cpp
+          grep -q 'NEEDED.*libfex-wayland-client-bridge.so' <(readelf -d guest-resident/libwayland-client-guest.so)
+          grep -q 'FLAGS_1.*NODELETE' <(readelf -d guest-resident/libfex-wayland-client-bridge.so)
+          stat -c 'bridge_file_bytes=%s' guest-resident/libfex-wayland-client-bridge.so | tee "$R/bridge-size.txt"
+          sha256sum guest-resident/libwayland-client-guest.so guest-resident/libfex-wayland-client-bridge.so \
+            | tee "$R/product-sha256.txt"
+
+      - name: Prove explicit resident Wayland listener survives wrapper unload
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp guest-resident/libwayland-client-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libwayland-client.so.0.20.0"
+          cp guest-resident/libfex-wayland-client-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-wayland-client-bridge.so"
+          LD_LIBRARY_PATH="$M" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 35s \
+            build/Bin/FEX /opt/fex-ci/waylandprobe resident > "$R/resident.out" 2> "$R/resident.err"
+          cat "$R/resident.err"
+          grep -q 'GUEST_WL_LISTENER data=77 .* count=1' "$R/resident.err"
+          grep -q 'PRE_CLOSE_WL_OK' "$R/resident.err"
+          grep -q 'UNMAPPED ' "$R/resident.err"
+          grep -q 'POST_CLOSE_WL_TRIGGER_BEGIN' "$R/resident.err"
+          grep -q 'moved=1' "$R/resident.err"
+          grep -q 'GUEST_WL_LISTENER data=77 .* count=2' "$R/resident.err"
+          grep -q 'POST_CLOSE_WL_TRIGGER_RETURN rc=0 count=2' "$R/resident.err"
+          grep -q 'WAYLAND_RESIDENT_CALLBACK_AFTER_UNLOAD_OK' "$R/resident.err"
+          echo WAYLAND_RESIDENT_CUSTOM_CALLBACK_RUNTIME_OK | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayland-resident-callback-v1-${{ github.run_id }}
+          path: receipts-wayland-resident-v1
+          retention-days: 30
