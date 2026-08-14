@@ -1,0 +1,76 @@
+name: Minimal GL split bridge build smoke
+
+on:
+  push:
+    branches: [diagnostic/gl-split-resident-e2e-20260814]
+    paths:
+      - .github/fieldwork/apply_gl_split_bridge.py
+      - .github/workflows/gl-split-resident-v3-build-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guest-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      R: ${{ github.workspace }}/receipts-gl-v3-build
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - name: Dependencies and transform
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev
+          python3 .github/fieldwork/apply_gl_split_bridge.py .
+          git diff --check
+          git diff -- ThunkLibs/libGL/libGL_Guest.cpp ThunkLibs/libGL/ResidentBridge.cpp ThunkLibs/GuestLibs/CMakeLists.txt \
+            > "$R/source.diff"
+      - name: Build thunkgen
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build-smoke -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_X86_HOST_DEBUG=ON \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build build-smoke --target thunkgen -- -j"$(nproc)" -v > "$R/build-thunkgen.log" 2>&1 \
+            || { tail -n 220 "$R/build-thunkgen.log"; exit 1; }
+      - name: Build minimal split GL guest pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest-v3 -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build-smoke/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-v3 --target GL-guest GL-lifetime-bridge -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 300 "$R/build-guest.log"; exit 1; }
+          readelf -d guest-v3/libfex-GL-bridge.so | tee "$R/bridge.dynamic.txt"
+          readelf -d guest-v3/libGL-guest.so | tee "$R/wrapper.dynamic.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic.txt"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic.txt"
+          grep -q 'NEEDED.*libfex-GL-bridge.so' "$R/wrapper.dynamic.txt"
+          nm -D guest-v3/libfex-GL-bridge.so | grep -E 'FEXGLBridgeLookup|FEXGLBridgeMallocTarget|FEXGLBridgeMallocUnpacker' \
+            | tee "$R/bridge.exports.txt"
+          stat -c 'bridge_file_bytes=%s' guest-v3/libfex-GL-bridge.so | tee "$R/bridge-size.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gl-split-v3-build-${{ github.run_id }}
+          path: receipts-gl-v3-build
+          retention-days: 14
