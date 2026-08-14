@@ -1,0 +1,113 @@
+name: Split Vulkan bridge one-signature compile
+
+on:
+  push:
+    branches: [ci/split-vulkan-bridge-runtime-20260814]
+    paths:
+      - .github/workflows/split-vulkan-bridge-compile-v2-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-compile:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      R: ${{ github.workspace }}/receipts-bridge-v2
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" bridge
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev binutils
+      - name: Build thunk generator and generate Vulkan guest source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ >"$R/cmake.log" 2>&1
+          cmake --build src/build --target thunkgen -- -j"$(nproc)" >"$R/thunkgen-build.log" 2>&1
+          cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ >"$R/guest-cmake.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" >"$R/guest-build.log" 2>&1
+          GEN="$(find guest -name thunkgen_guest_libvulkan.inl -type f | head -n1)"
+          cp "$GEN" "$R/thunkgen_guest_libvulkan.inl"
+          grep -F 'MAKE_CALLBACK_THUNK' "$GEN" | grep -F 'enum VkResult (unsigned int *)' | head -n1 | tee "$R/enumerate-version-callback.inc"
+          test "$(wc -l < "$R/enumerate-version-callback.inc")" -eq 1
+      - name: Compile one-signature resident bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp "$R/enumerate-version-callback.inc" /tmp/enumerate-version-callback.inc
+          cat >/tmp/fex-vulkan-bridge.cpp <<'EOF'
+          #define VK_USE_64_BIT_PTR_DEFINES 0
+          #define VK_USE_PLATFORM_XLIB_XRANDR_EXT
+          #define VK_USE_PLATFORM_XLIB_KHR
+          #define VK_USE_PLATFORM_XCB_KHR
+          #define VK_USE_PLATFORM_WAYLAND_KHR
+          #include <vulkan/vulkan.h>
+          #include "common/Guest.h"
+          #include <cstdint>
+          #include "/tmp/enumerate-version-callback.inc"
+          extern "C" __attribute__((visibility("default"))) uintptr_t FEXVulkanBridgeEnumerateVersionInvoker() {
+            auto caller = GetCallerForHostFunction((PFN_vkEnumerateInstanceVersion)nullptr);
+            return reinterpret_cast<uintptr_t>(caller);
+          }
+          EOF
+          cp /tmp/fex-vulkan-bridge.cpp "$R/fex-vulkan-bridge.cpp"
+          set +e
+          x86_64-linux-gnu-g++ -std=c++20 -E -H -dD \
+            -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" \
+            -I"$GITHUB_WORKSPACE/src/External/Vulkan-Headers/include" \
+            /tmp/fex-vulkan-bridge.cpp >"$R/bridge.preprocessed.cpp" 2>"$R/bridge.include-trace.err"
+          pre_rc=$?
+          x86_64-linux-gnu-g++ -std=c++20 -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" \
+            -I"$GITHUB_WORKSPACE/src/External/Vulkan-Headers/include" \
+            -Wl,-z,nodelete -Wl,-soname,libfex-vulkan-bridge.so.1 \
+            /tmp/fex-vulkan-bridge.cpp -o bridge/libfex-vulkan-bridge.so.1 \
+            >"$R/bridge.compile.out" 2>"$R/bridge.compile.err"
+          cc_rc=$?
+          set -e
+          echo "$pre_rc" | tee "$R/preprocess.exit"
+          echo "$cc_rc" | tee "$R/compile.exit"
+          head -n 120 "$R/bridge.include-trace.err" || true
+          cat "$R/bridge.compile.err" || true
+          test "$pre_rc" -eq 0
+          test "$cc_rc" -eq 0
+          file bridge/libfex-vulkan-bridge.so.1 | tee "$R/bridge.file"
+          readelf -d bridge/libfex-vulkan-bridge.so.1 | tee "$R/bridge.dynamic"
+          nm -D bridge/libfex-vulkan-bridge.so.1 | tee "$R/bridge.nm"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          grep -q FEXVulkanBridgeEnumerateVersionInvoker "$R/bridge.nm"
+          echo SPLIT_BRIDGE_ONE_SIGNATURE_COMPILE_OK
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: split-vulkan-bridge-compile-v2-${{ github.run_id }}
+          path: receipts-bridge-v2
+          retention-days: 30
