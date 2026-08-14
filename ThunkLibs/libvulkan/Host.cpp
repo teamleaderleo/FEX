@@ -75,6 +75,14 @@ static void fexfn_impl_libvulkan_Vulkan_SetGuestXDisplayString(uintptr_t GuestTa
   MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &x11_manager.GuestXDisplayString);
 }
 
+void fex_custom_repack_entry(host_layout<VkAllocationCallbacks>& into, const guest_layout<VkAllocationCallbacks>& from) {
+  into.data.pUserData = const_cast<void*>(from.data.pUserData.force_get_host_pointer());
+}
+
+bool fex_custom_repack_exit(guest_layout<VkAllocationCallbacks>&, const host_layout<VkAllocationCallbacks>&) {
+  return true;
+}
+
 void fex_custom_repack_entry(host_layout<VkXcbSurfaceCreateInfoKHR>& to, const guest_layout<VkXcbSurfaceCreateInfoKHR>& from) {
   // TODO: xcb_aux_sync?
   to.data.connection = x11_manager.GuestToHostConnection(const_cast<xcb_connection_t*>(from.data.connection.force_get_host_pointer()));
@@ -127,7 +135,7 @@ static VkBool32 fexfn_impl_libvulkan_vkGetPhysicalDeviceXlibPresentationSupportK
 static VkResult
 FEXFN_IMPL(vkCreateShaderModule)(VkDevice a_0, const VkShaderModuleCreateInfo* a_1, const VkAllocationCallbacks* a_2, VkShaderModule* a_3) {
   (void*&)LDR_PTR(vkCreateShaderModule) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkCreateShaderModule");
-  return LDR_PTR(vkCreateShaderModule)(a_0, a_1, nullptr, a_3);
+  return LDR_PTR(vkCreateShaderModule)(a_0, a_1, a_2, a_3);
 }
 
 static VkBool32
@@ -152,7 +160,7 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
   }
 
   VkInstance out;
-  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
+  auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, a_1, &out);
   *a_2.get_pointer() = to_guest(to_host_layout(out));
   return ret;
 }
@@ -160,7 +168,7 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
 static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                            guest_layout<VkDevice*> a_3) {
   VkDevice out;
-  auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, nullptr, &out);
+  auto ret = LDR_PTR(vkCreateDevice)(a_0, a_1, a_2, &out);
   *a_3.get_pointer() = to_guest(to_host_layout(out));
 
   // Reload device-specific function pointers used in custom implementations.
@@ -182,12 +190,12 @@ static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceC
 
 static VkResult FEXFN_IMPL(vkAllocateMemory)(VkDevice a_0, const VkMemoryAllocateInfo* a_1, const VkAllocationCallbacks* a_2, VkDeviceMemory* a_3) {
   (void*&)LDR_PTR(vkAllocateMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkAllocateMemory");
-  return LDR_PTR(vkAllocateMemory)(a_0, a_1, nullptr, a_3);
+  return LDR_PTR(vkAllocateMemory)(a_0, a_1, a_2, a_3);
 }
 
 static void FEXFN_IMPL(vkFreeMemory)(VkDevice a_0, VkDeviceMemory a_1, const VkAllocationCallbacks* a_2) {
   (void*&)LDR_PTR(vkFreeMemory) = (void*)LDR_PTR(vkGetDeviceProcAddr)(a_0, "vkFreeMemory");
-  LDR_PTR(vkFreeMemory)(a_0, a_1, nullptr);
+  LDR_PTR(vkFreeMemory)(a_0, a_1, a_2);
 }
 
 static VkResult FEXFN_IMPL(vkCreateDebugReportCallbackEXT)(VkInstance a_0, guest_layout<const VkDebugReportCallbackCreateInfoEXT*> a_1,
@@ -195,12 +203,12 @@ static VkResult FEXFN_IMPL(vkCreateDebugReportCallbackEXT)(VkInstance a_0, guest
   auto overridden_callback = host_layout<VkDebugReportCallbackCreateInfoEXT> {*a_1.get_pointer()}.data;
   overridden_callback.pfnCallback = DummyVkDebugReportCallback;
   (void*&)LDR_PTR(vkCreateDebugReportCallbackEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateDebugReportCallbackEXT");
-  return LDR_PTR(vkCreateDebugReportCallbackEXT)(a_0, &overridden_callback, nullptr, a_3);
+  return LDR_PTR(vkCreateDebugReportCallbackEXT)(a_0, &overridden_callback, a_2, a_3);
 }
 
 static void FEXFN_IMPL(vkDestroyDebugReportCallbackEXT)(VkInstance a_0, VkDebugReportCallbackEXT a_1, const VkAllocationCallbacks* a_2) {
   (void*&)LDR_PTR(vkDestroyDebugReportCallbackEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkDestroyDebugReportCallbackEXT");
-  LDR_PTR(vkDestroyDebugReportCallbackEXT)(a_0, a_1, nullptr);
+  LDR_PTR(vkDestroyDebugReportCallbackEXT)(a_0, a_1, a_2);
 }
 
 extern "C" VkBool32 DummyVkDebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
@@ -213,7 +221,7 @@ static VkResult FEXFN_IMPL(vkCreateDebugUtilsMessengerEXT)(VkInstance_T* a_0, gu
   auto overridden_callback = host_layout<VkDebugUtilsMessengerCreateInfoEXT> {*a_1.get_pointer()}.data;
   overridden_callback.pfnUserCallback = DummyVkDebugUtilsMessengerCallback;
   (void*&)LDR_PTR(vkCreateDebugUtilsMessengerEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkCreateDebugUtilsMessengerEXT");
-  return LDR_PTR(vkCreateDebugUtilsMessengerEXT)(a_0, &overridden_callback, nullptr, a_3);
+  return LDR_PTR(vkCreateDebugUtilsMessengerEXT)(a_0, &overridden_callback, a_2, a_3);
 }
 
 #ifdef IS_32BIT_THUNK

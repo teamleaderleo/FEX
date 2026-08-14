@@ -2307,9 +2307,16 @@ struct fex_gen_type<VkBaseOutStructure> : fexgen::assume_compatible_data_layout 
 #endif
 
 
-// TODO: Should not be opaque, but it's usually NULL anyway. Supporting the contained function pointers will need more work.
-template<>
-struct fex_gen_type<VkAllocationCallbacks> : fexgen::opaque_type {};
+// Generate ABI conversion for Vulkan allocation callback members.
+template<> struct fex_gen_type<VkSystemAllocationScope> {};
+template<> struct fex_gen_type<VkInternalAllocationType> {};
+template<> struct fex_gen_type<VkAllocationCallbacks> {};
+template<> struct fex_gen_config<&VkAllocationCallbacks::pUserData> : fexgen::custom_repack {};
+template<> struct fex_gen_config<&VkAllocationCallbacks::pfnAllocation> : fexgen::callback_member {};
+template<> struct fex_gen_config<&VkAllocationCallbacks::pfnReallocation> : fexgen::callback_member {};
+template<> struct fex_gen_config<&VkAllocationCallbacks::pfnFree> : fexgen::callback_member {};
+template<> struct fex_gen_config<&VkAllocationCallbacks::pfnInternalAllocation> : fexgen::callback_member {};
+template<> struct fex_gen_config<&VkAllocationCallbacks::pfnInternalFree> : fexgen::callback_member {};
 
 // X11 interop
 template<>

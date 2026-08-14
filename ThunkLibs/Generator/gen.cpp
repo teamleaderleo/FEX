@@ -798,16 +798,6 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
         function_to_call = "fexfn_impl_" + libname + "_" + function_name;
       }
 
-      auto get_type_name_with_nonconst_pointee = [&](clang::QualType type) {
-        type = type.getLocalUnqualifiedType();
-        if (type->isPointerType()) {
-          // Strip away "const" from pointee type
-          type = context.getPointerType(type->getPointeeType().getLocalUnqualifiedType());
-        }
-        return get_type_name(context, type.getTypePtr());
-      };
-
-
       file << "static void fexfn_unpack_" << libname << "_" << function_name << "(" << struct_name << "* args) {\n";
 
       for (unsigned param_idx = 0; param_idx != thunk.param_types.size(); ++param_idx) {
@@ -846,7 +836,7 @@ void GenerateThunkLibsAction::OnAnalysisComplete(clang::ASTContext& context) {
         } else if (pointee_compat == TypeCompatibility::Repackable) {
           // TODO: Require opt-in for this to be emitted since it's single-element only; otherwise, pointers-to-arrays arguments will cause stack trampling
           fmt::print(file, "  auto a_{} = make_repack_wrapper<{}>(args->a_{});\n", param_idx,
-                     get_type_name_with_nonconst_pointee(param_type), param_idx);
+                     get_type_name(context, param_type.getTypePtr()), param_idx);
 
           if (auto callback_struct = get_callback_struct_info(param_type)) {
             auto pointee = param_type->getPointeeType();

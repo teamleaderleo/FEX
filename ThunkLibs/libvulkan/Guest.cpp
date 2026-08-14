@@ -21,7 +21,10 @@ $end_info$
 #include <unordered_map>
 
 #include "thunkgen_bridge_accessors_libvulkan.inl"
+
+#define AllocateHostTrampolineForGuestFunction FEXAllocateResidentHostTrampolineForGuestFunction
 #include "thunkgen_guest_libvulkan.inl"
+#undef AllocateHostTrampolineForGuestFunction
 
 extern "C" {
 
