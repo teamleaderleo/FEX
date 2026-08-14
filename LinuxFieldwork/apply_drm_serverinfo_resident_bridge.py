@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 # Start with the already-proven two-stage persistent callback conversion.
 base = Path('LinuxFieldwork/apply_drm_serverinfo_callback_bridge.py').read_text()
@@ -8,7 +9,9 @@ exec(compile(base, 'apply_drm_serverinfo_callback_bridge.py', 'exec'))
 # unpacker for drmServerInfo::load_module: int(const char *).
 bridge_dir = Path('ThunkLibs/libdrm_bridge')
 bridge_dir.mkdir(exist_ok=True)
-(bridge_dir / 'libdrm_bridge_interface.cpp').write_text(r'''#include <common/GeneratorInterface.h>
+bridge_iface = bridge_dir / 'libdrm_bridge_interface.cpp'
+bridge_guest = bridge_dir / 'Guest.cpp'
+bridge_iface.write_text(r'''#include <common/GeneratorInterface.h>
 
 using LoadModuleSignature = int(const char*);
 
@@ -19,7 +22,7 @@ template<>
 struct fex_gen_type<LoadModuleSignature> {};
 ''')
 
-(bridge_dir / 'Guest.cpp').write_text(r'''#include "common/Guest.h"
+bridge_guest.write_text(r'''#include "common/Guest.h"
 #include "thunkgen_guest_libdrm_bridge.inl"
 
 extern "C" uintptr_t FEXDRMBridgeLoadModuleUnpacker() {
@@ -27,6 +30,10 @@ extern "C" uintptr_t FEXDRMBridgeLoadModuleUnpacker() {
   return reinterpret_cast<uintptr_t>(CallbackUnpack<LoadModuleSignature>::Unpack);
 }
 ''')
+
+# Make runtime-created source files visible to git diff/provenance checks without
+# actually committing them in the workflow checkout.
+subprocess.run(['git', 'add', '-N', str(bridge_iface), str(bridge_guest)], check=True)
 
 # Build the sidecar as NODELETE, link it into the ordinary DRM wrapper, but
 # leave the wrapper itself unloadable.
