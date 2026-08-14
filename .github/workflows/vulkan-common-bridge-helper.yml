@@ -1,0 +1,135 @@
+name: Vulkan common guest bridge helper runtime
+
+on:
+  push:
+    branches: [diagnostic/per-library-bridge-helper-f3ab-20260814]
+    paths:
+      - .github/fieldwork/apply_thunkgen_guest_bridge_output.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles_compat.py
+      - LinuxFieldwork/apply_per_library_guest_bridge_helper.py
+      - LinuxFieldwork/apply_vulkan_helper_direct_bridge.py
+      - .github/workflows/vulkan-common-bridge-helper.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  vulkan:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      PRODUCT_SHA: f3ab82a73fb48271ee12a882c98bc5d823a2b4d1
+      R: ${{ github.workspace }}/vulkan-helper-receipts
+      ROOTFS: ${{ github.workspace }}/vulkan-helper-rootfs
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: probe/fex-vulkan-customir-retirement
+          path: fieldwork
+          fetch-depth: 1
+      - name: Dependencies and exact-product provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
+          git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
+          test ! -s "$R/pre-patch-product-source-diff.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers binutils
+      - name: Apply helper-backed direct Vulkan bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 LinuxFieldwork/apply_per_library_guest_bridge_helper.py
+          python3 .github/fieldwork/apply_thunkgen_guest_bridge_output.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles_compat.py .
+          python3 LinuxFieldwork/apply_vulkan_helper_direct_bridge.py
+          git diff --check
+          git diff -- ThunkLibs FEXCore Source > "$R/product.diff"
+          grep -q 'add_guest_bridge(vulkan_bridge "libfex-vulkan-bridge.so"' ThunkLibs/GuestLibs/CMakeLists.txt
+      - name: Build FEX host and helper-backed Vulkan pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 320 "$R/build-host.log"; exit 1; }
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest vulkan_bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 360 "$R/build-guest.log"; exit 1; }
+          test -f guest/gen/thunkgen_bridge_libvulkan.inl
+          test -f guest/gen/thunkgen_bridge_accessors_libvulkan.inl
+          readelf -d guest/libvulkan-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest/libfex-vulkan-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'NEEDED.*libfex-vulkan-bridge.so' "$R/wrapper.dynamic"
+          grep -q 'RUNPATH.*\$ORIGIN' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+      - name: Prepare amd64 rootfs and retained PFN probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp guest/libfex-vulkan-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void*d,int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void*d,long mask,void*t,int*n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void*d){(void)d;static char s[]=":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_pfn_unload_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/vulkan-pfn-probe"
+      - name: Execute real Vulkan helper matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          HOST="$GITHUB_WORKSPACE/build/HostLibs_64"
+          run_case(){ mode="$1"; set +e; FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s "$FEX" /opt/fex-ci/vulkan-pfn-probe "$mode" > "$R/$mode.out" 2> "$R/$mode.err"; rc=$?; set -e; echo "$rc" > "$R/$mode.exit"; echo "===== $mode rc=$rc ====="; grep -E 'PROBE |Linking address|signal|SIG' "$R/$mode.err" || true; }
+          run_case close
+          run_case reload
+          test "$(cat "$R/close.exit")" = 0
+          test "$(cat "$R/reload.exit")" = 0
+          grep -q 'PROBE return where=after-real-close result=0' "$R/close.err"
+          grep -q 'PROBE acquired generation=2' "$R/reload.err"
+          grep -q 'same-pfn=1' "$R/reload.err"
+          grep -q 'PROBE return where=after-reload-new-pfn result=0' "$R/reload.err"
+          echo VULKAN_COMMON_HELPER_OK
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-common-helper-${{ github.run_id }}
+          path: vulkan-helper-receipts
+          retention-days: 30
