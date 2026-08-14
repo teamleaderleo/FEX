@@ -22,8 +22,17 @@ struct fex_gen_type<drmStatsT> : fexgen::assume_compatible_data_layout {};
 // TODO: Convert vtable
 template<>
 struct fex_gen_type<drmServerInfo> : fexgen::assume_compatible_data_layout {};
+// drmHandleEvent callbacks can escape the guest wrapper through native
+// host trampolines, so thunkgen must type them as callbacks and generate
+// resident unpacker accessors.
 template<>
-struct fex_gen_type<drmEventContext> : fexgen::assume_compatible_data_layout {};
+struct fex_gen_config<&drmEventContext::vblank_handler> : fexgen::callback_member {};
+template<>
+struct fex_gen_config<&drmEventContext::page_flip_handler> : fexgen::callback_member {};
+template<>
+struct fex_gen_config<&drmEventContext::page_flip_handler2> : fexgen::callback_member {};
+template<>
+struct fex_gen_config<&drmEventContext::sequence_handler> : fexgen::callback_member {};
 #endif
 
 size_t FEX_usable_size(void*);

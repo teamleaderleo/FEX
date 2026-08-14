@@ -286,6 +286,11 @@ if (BITNESS EQUAL 64)
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories_from_pkgconfig(libdrm-guest-deps libdrm /usr/include/drm /usr/include/libdrm)
   add_guest_lib(drm "libdrm.so.2")
+  add_guest_bridge(drm_bridge "libfex-drm-bridge.so"
+    OUTPUT_NAME "fex-drm-bridge"
+    WRAPPER_TARGET drm-guest
+    GENERATOR libdrm
+    DEP_TARGETS libdrm-guest-deps)
 endif()
 
 generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp)

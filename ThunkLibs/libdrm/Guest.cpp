@@ -14,7 +14,11 @@ $end_info$
 #include "common/Guest.h"
 #include <stdarg.h>
 
+#include "thunkgen_bridge_accessors_libdrm.inl"
+
+#define AllocateHostTrampolineForGuestFunction FEXAllocateResidentHostTrampolineForGuestFunction
 #include "thunkgen_guest_libdrm.inl"
+#undef AllocateHostTrampolineForGuestFunction
 
 extern "C" {
 void FEX_malloc_free_on_host(void* Ptr) {
