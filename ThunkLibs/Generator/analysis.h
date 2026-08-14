@@ -154,6 +154,11 @@ protected:
   // The map value is a pair of the function pointer's clang::Type and the mapping of parameter annotations
   std::unordered_map<std::string, std::pair<const clang::Type*, std::unordered_map<unsigned, ParameterAnnotations>>> thunked_funcptrs;
 
+  // Subset of thunked_funcptrs that are used as real Host->Guest callbacks.
+  // These require a resident CallbackUnpack entrypoint; pure Guest->Host
+  // runtime function pointers only require the resident invoker.
+  std::unordered_set<std::string> host_to_guest_callback_funcptrs;
+
   std::unordered_map<const clang::Type*, RepackedType> types;
   std::optional<unsigned> lib_version;
   std::vector<NamespaceInfo> namespaces;

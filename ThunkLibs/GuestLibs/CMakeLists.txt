@@ -83,6 +83,14 @@ function(generate NAME SOURCE_FILE)
   # Run thunk generator for each of the given output files
   set(OUTFOLDER "${CMAKE_CURRENT_BINARY_DIR}/gen")
   set(OUTFILE "${OUTFOLDER}/thunkgen_guest_${NAME}.inl")
+  set(GENERATOR_TARGET "-guest")
+  set(GENERATOR_OUTPUTS "${OUTFILE}")
+  if ("RESIDENT_BRIDGE" IN_LIST ARGN)
+    set(GENERATOR_TARGET "-guest-resident")
+    string(REGEX REPLACE "\.inl$" "_bridge.inl" BRIDGE_OUTFILE "${OUTFILE}")
+    string(REGEX REPLACE "\.inl$" "_bridge_accessors.inl" BRIDGE_ACCESSORS_OUTFILE "${OUTFILE}")
+    list(APPEND GENERATOR_OUTPUTS "${BRIDGE_OUTFILE}" "${BRIDGE_ACCESSORS_OUTFILE}")
+  endif()
 
   file(MAKE_DIRECTORY "${OUTFOLDER}")
 
@@ -96,10 +104,10 @@ function(generate NAME SOURCE_FILE)
   list(APPEND BITNESS_FLAGS2 "--sysroot" "${X86_DEV_ROOTFS}")
 
   add_custom_command(
-    OUTPUT "${OUTFILE}"
+    OUTPUT ${GENERATOR_OUTPUTS}
     DEPENDS "${GENERATOR_EXE}"
     DEPENDS "${SOURCE_FILE}"
-    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
+    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "${GENERATOR_TARGET}" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
       # Expand include directories to space-separated list of -isystem parameters
@@ -109,6 +117,10 @@ function(generate NAME SOURCE_FILE)
 
   list(APPEND OUTPUTS "${OUTFILE}")
   set(GEN_${NAME} ${OUTPUTS} PARENT_SCOPE)
+  if ("RESIDENT_BRIDGE" IN_LIST ARGN)
+    set(GEN_${NAME}_BRIDGE "${BRIDGE_OUTFILE}" PARENT_SCOPE)
+    set(GEN_${NAME}_BRIDGE_ACCESSORS "${BRIDGE_ACCESSORS_OUTFILE}" PARENT_SCOPE)
+  endif()
 endfunction()
 
 function(add_guest_lib NAME SONAME)
@@ -205,37 +217,23 @@ if (BITNESS EQUAL 64)
   # target_link_libraries(SDL2-guest PRIVATE GL)
   # target_link_libraries(SDL2-guest PRIVATE dl)
 
-  generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp)
+  generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp RESIDENT_BRIDGE)
   target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
   target_include_directories_from_pkgconfig(libvulkan-guest-deps "xcb;x11;xrandr;xrender")
 
-  # Derive the resident bridge signature set from the normal generated Vulkan
-  # guest thunk output, keeping the ordinary interface as the single source of truth.
-  set(VULKAN_GUEST_INL "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libvulkan.inl")
-  set(VULKAN_BRIDGE_INL "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libvulkan_bridge.inl")
-  set(VULKAN_BRIDGE_ACCESSORS "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libvulkan_bridge_accessors.inl")
-  add_custom_command(
-    OUTPUT "${VULKAN_BRIDGE_INL}" "${VULKAN_BRIDGE_ACCESSORS}"
-    DEPENDS "${VULKAN_GUEST_INL}" "${FEX_PROJECT_SOURCE_DIR}/ThunkLibs/Generator/extract_guest_bridge.py"
-    COMMAND "${Python3_EXECUTABLE}"
-      "${FEX_PROJECT_SOURCE_DIR}/ThunkLibs/Generator/extract_guest_bridge.py"
-      "${VULKAN_GUEST_INL}" "${VULKAN_BRIDGE_INL}" "${VULKAN_BRIDGE_ACCESSORS}"
-    VERBATIM)
-  add_custom_target(vulkan-bridge-generated DEPENDS "${VULKAN_BRIDGE_INL}" "${VULKAN_BRIDGE_ACCESSORS}")
-
+  # The normal wrapper, resident invokers, and resident callback accessors now
+  # come from one thunkgen analysis/invocation.
   add_library(libvulkan_bridge-guest-deps INTERFACE)
   target_include_directories(libvulkan_bridge-guest-deps INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/../include")
   target_include_directories(libvulkan_bridge-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
   target_include_directories_from_pkgconfig(libvulkan_bridge-guest-deps "xcb;x11;xrandr;xrender")
-  set(GEN_libvulkan_bridge "${VULKAN_BRIDGE_INL}" "${VULKAN_BRIDGE_ACCESSORS}")
+  set(GEN_libvulkan_bridge "${GEN_libvulkan_BRIDGE}")
   add_guest_lib(vulkan_bridge "libfex-vulkan-bridge.so")
   set_target_properties(vulkan_bridge-guest PROPERTIES OUTPUT_NAME "fex-vulkan-bridge")
   target_link_options(vulkan_bridge-guest PRIVATE "LINKER:-z,nodelete")
-  add_dependencies(vulkan_bridge-guest vulkan-bridge-generated)
 
   add_guest_lib(vulkan "libvulkan.so.1")
   target_link_libraries(vulkan-guest PRIVATE vulkan_bridge-guest)
-  add_dependencies(vulkan-guest vulkan-bridge-generated)
 
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories_from_pkgconfig(libdrm-guest-deps libdrm /usr/include/drm /usr/include/libdrm)
@@ -279,10 +277,19 @@ if (BUILD_FEX_LINUX_TESTS)
   add_guest_lib(fex_thunk_test "libfex_thunk_test.so")
 endif()
 
-generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp)
+generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp RESIDENT_BRIDGE)
 target_include_directories_from_pkgconfig(libGL-guest-deps gl)
 target_include_directories_from_pkgconfig(libGL-guest-deps "xcb;x11;xrandr;xrender")
+
+add_library(libGL_bridge-guest-deps INTERFACE)
+target_link_libraries(libGL_bridge-guest-deps INTERFACE libGL-guest-deps)
+set(GEN_libGL_bridge "${GEN_libGL_BRIDGE}")
+add_guest_lib(GL_bridge "libfex-GL-bridge.so")
+set_target_properties(GL_bridge-guest PROPERTIES OUTPUT_NAME "fex-GL-bridge")
+target_link_options(GL_bridge-guest PRIVATE "LINKER:-z,nodelete")
+
 add_guest_lib(GL "libGL.so.1")
+target_link_libraries(GL-guest PRIVATE GL_bridge-guest)
 
 generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp)
 target_include_directories_from_pkgconfig(libEGL-guest-deps egl)
