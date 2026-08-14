@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Diagnostic PR carrier: force a fresh Actions checkout after the GL lifetime fixes.
 from pathlib import Path
 import re
 
