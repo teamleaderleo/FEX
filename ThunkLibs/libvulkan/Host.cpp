@@ -404,12 +404,16 @@ static PFN_vkVoidFunction FEXFN_IMPL(vkGetDeviceProcAddr)(VkDevice a_0, const ch
   // Just return the host facing function pointer
   // The guest will handle mapping if this exists
 
-  // Check for functions with custom implementations first
+  auto Native = LDR_PTR(vkGetDeviceProcAddr)(a_0, a_1);
+  if (!Native) {
+    return nullptr;
+  }
+
   if (auto ptr = LookupCustomVulkanFunction(a_1)) {
     return ptr;
   }
 
-  return LDR_PTR(vkGetDeviceProcAddr)(a_0, a_1);
+  return Native;
 }
 
 static PFN_vkVoidFunction FEXFN_IMPL(vkGetInstanceProcAddr)(VkInstance a_0, const char* a_1) {
@@ -420,31 +424,35 @@ static PFN_vkVoidFunction FEXFN_IMPL(vkGetInstanceProcAddr)(VkInstance a_0, cons
     DoSetupWithInstance(a_0);
   }
 
-  // Check for functions with custom implementations first
+  auto Native = LDR_PTR(vkGetInstanceProcAddr)(a_0, a_1);
+  if (!Native) {
+    return nullptr;
+  }
+
   if (auto ptr = LookupCustomVulkanFunction(a_1)) {
-    // If this function belongs to an instance extension, requery its address.
-    // This ensures fexldr_ptr_* is valid if the application creates a minimal
-    // VkInstance with no extensions before creating its actual instance.
+    // If this function belongs to an instance extension, populate its loader
+    // slot from the successful native lookup. This keeps fexldr_ptr_* valid if
+    // the application creates a minimal VkInstance before its actual instance.
     using namespace std::string_view_literals;
     if (a_1 == "vkGetRandROutputDisplayEXT"sv && !LDR_PTR(vkGetRandROutputDisplayEXT)) {
-      (void*&)LDR_PTR(vkGetRandROutputDisplayEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkGetRandROutputDisplayEXT");
+      (void*&)LDR_PTR(vkGetRandROutputDisplayEXT) = (void*)Native;
     }
     if (a_1 == "vkAcquireXlibDisplayEXT"sv && !LDR_PTR(vkAcquireXlibDisplayEXT)) {
-      (void*&)LDR_PTR(vkAcquireXlibDisplayEXT) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, "vkAcquireXlibDisplayEXT");
+      (void*&)LDR_PTR(vkAcquireXlibDisplayEXT) = (void*)Native;
     }
     const char* XcbPresent = "vkGetPhysicalDeviceXcbPresentationSupportKHR";
     if (a_1 == std::string_view {XcbPresent} && !LDR_PTR(vkGetPhysicalDeviceXcbPresentationSupportKHR)) {
-      (void*&)LDR_PTR(vkGetPhysicalDeviceXcbPresentationSupportKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, XcbPresent);
+      (void*&)LDR_PTR(vkGetPhysicalDeviceXcbPresentationSupportKHR) = (void*)Native;
     }
     const char* XlibPresent = "vkGetPhysicalDeviceXlibPresentationSupportKHR";
     if (a_1 == std::string_view {XlibPresent} && !LDR_PTR(vkGetPhysicalDeviceXlibPresentationSupportKHR)) {
-      (void*&)LDR_PTR(vkGetPhysicalDeviceXlibPresentationSupportKHR) = (void*)LDR_PTR(vkGetInstanceProcAddr)(a_0, XlibPresent);
+      (void*&)LDR_PTR(vkGetPhysicalDeviceXlibPresentationSupportKHR) = (void*)Native;
     }
 
     return ptr;
   }
 
-  return LDR_PTR(vkGetInstanceProcAddr)(a_0, a_1);
+  return Native;
 }
 
 #ifdef IS_32BIT_THUNK

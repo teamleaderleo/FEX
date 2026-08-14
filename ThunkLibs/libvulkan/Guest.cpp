@@ -72,15 +72,19 @@ PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice a_0, const char* a_1) {
 }
 
 PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
+  auto Ret = fexfn_pack_vkGetInstanceProcAddr(a_0, a_1);
+  if (!Ret) {
+    return nullptr;
+  }
+
+  if (a_1 == std::string_view {"vkGetInstanceProcAddr"}) {
+    return (PFN_vkVoidFunction)vkGetInstanceProcAddr;
+  }
   if (a_1 == std::string_view {"vkGetDeviceProcAddr"}) {
     return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
-  } else {
-    auto Ret = fexfn_pack_vkGetInstanceProcAddr(a_0, a_1);
-    if (!Ret) {
-      return nullptr;
-    }
-    return MakeGuestCallable(__FUNCTION__, Ret, a_1);
   }
+
+  return MakeGuestCallable(__FUNCTION__, Ret, a_1);
 }
 }
 
