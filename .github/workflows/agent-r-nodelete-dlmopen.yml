@@ -1,0 +1,60 @@
+name: Agent R NODELETE dlmopen namespaces
+
+on:
+  push:
+    branches: [ci/agent-r-nodelete-dlmopen-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dlmopen:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare normal and NODELETE namespace recycling
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/ns.c <<'EOF'
+          __attribute__((visibility("default"))) int ns_probe(void) { return 42; }
+          EOF
+          cc -shared -fPIC -O2 -Wl,-soname,libns-normal.so /tmp/ns.c -o /tmp/libns-normal.so
+          cc -shared -fPIC -O2 -Wl,-z,nodelete -Wl,-soname,libns-nodelete.so /tmp/ns.c -o /tmp/libns-nodelete.so
+          cat > /tmp/loop.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <link.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          typedef int (*fn_t)(void);
+          static int run(const char *path, int count) {
+            int ok = 0;
+            for (int i = 0; i < count; ++i) {
+              void *h = dlmopen(LM_ID_NEWLM, path, RTLD_NOW | RTLD_LOCAL);
+              if (!h) {
+                fprintf(stderr, "FAIL path=%s iteration=%d error=%s\n", path, i, dlerror());
+                return ok;
+              }
+              fn_t fn = (fn_t)dlsym(h, "ns_probe");
+              if (!fn || fn() != 42) return -1;
+              ++ok;
+              if (dlclose(h) != 0) return -2;
+            }
+            fprintf(stderr, "COMPLETE path=%s count=%d\n", path, ok);
+            return ok;
+          }
+          int main(void) {
+            int normal = run("/tmp/libns-normal.so", 40);
+            int nodelete = run("/tmp/libns-nodelete.so", 40);
+            fprintf(stderr, "RESULT normal=%d nodelete=%d\n", normal, nodelete);
+            if (normal != 40) return 2;
+            if (nodelete < 1) return 3;
+            return 0;
+          }
+          EOF
+          cc -O2 -Wall -Wextra -Werror /tmp/loop.c -ldl -o /tmp/loop
+          /tmp/loop 2>&1 | tee /tmp/dlmopen.log
+          grep -q 'RESULT normal=40' /tmp/dlmopen.log
