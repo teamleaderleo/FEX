@@ -65,9 +65,10 @@ int main(int argc, char** argv) {
   setvbuf(stderr, nullptr, _IONBF, 0);
   const bool MapFixed = argc == 2 && std::strcmp(argv[1], "map-fixed") == 0;
   const bool MapFixedReregister = argc == 2 && std::strcmp(argv[1], "map-fixed-reregister") == 0;
+  const bool MapFixedFail = argc == 2 && std::strcmp(argv[1], "map-fixed-fail") == 0;
   const bool Mprotect = argc == 2 && std::strcmp(argv[1], "mprotect") == 0;
-  if (!MapFixed && !MapFixedReregister && !Mprotect) {
-    std::fprintf(stderr, "usage: %s map-fixed|map-fixed-reregister|mprotect\n", argv[0]);
+  if (!MapFixed && !MapFixedReregister && !MapFixedFail && !Mprotect) {
+    std::fprintf(stderr, "usage: %s map-fixed|map-fixed-reregister|map-fixed-fail|mprotect\n", argv[0]);
     return 64;
   }
 
@@ -94,6 +95,31 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "VMA first H=%p T=%p value=%d\n", reinterpret_cast<void*>(SyntheticH), Target, First);
   if (First != 111) {
     return 5;
+  }
+
+  if (MapFixedFail) {
+    // Deliberately invalid file-backed MAP_FIXED request: fd=-1 without
+    // MAP_ANONYMOUS. The kernel must reject the mmap and leave the old mapping
+    // at T intact. A pre-retirement transaction therefore has to roll back.
+    errno = 0;
+    void* Replacement = ::mmap(Target, PageSize, PROT_READ, MAP_PRIVATE | MAP_FIXED, -1, 0);
+    const int SavedErrno = errno;
+    if (Replacement != MAP_FAILED) {
+      std::fprintf(stderr, "VMA expected MAP_FIXED failure but got result=%p\n", Replacement);
+      return 13;
+    }
+
+    const int Direct = reinterpret_cast<Fn>(Target)();
+    std::fprintf(stderr,
+                 "VMA failed-map-fixed result=MAP_FAILED errno=%d (%s) T=%p direct-value=%d\n",
+                 SavedErrno, std::strerror(SavedErrno), Target, Direct);
+    if (Direct != 111) {
+      return 14;
+    }
+
+    const int AfterFailure = Linked();
+    std::fprintf(stderr, "VMA after-failed-map-fixed H-value=%d\n", AfterFailure);
+    return AfterFailure == 111 ? 0 : 15;
   }
 
   if (MapFixed || MapFixedReregister) {
