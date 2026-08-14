@@ -1,0 +1,211 @@
+name: Minimal GL split resident bridge runtime
+
+on:
+  push:
+    branches: [diagnostic/gl-split-resident-e2e-20260814]
+    paths:
+      - .github/fieldwork/apply_gl_split_bridge.py
+      - .github/workflows/gl-split-resident-v3-runtime-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gl-split-v3:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 80
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs-gl-v3
+      R: ${{ github.workspace }}/receipts-gl-v3
+      H: ${{ github.workspace }}/host-gl-v3
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and minimal split transform
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
+            libcap-dev libgl-dev libgl1-mesa-dri libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev xvfb x11-utils
+          python3 .github/fieldwork/apply_gl_split_bridge.py .
+          git diff --check
+          git diff -- ThunkLibs/libGL/libGL_Guest.cpp ThunkLibs/libGL/ResidentBridge.cpp ThunkLibs/GuestLibs/CMakeLists.txt \
+            > "$R/source.diff"
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+
+      - name: Build FEX runtime, GL host thunk, and minimal split guest pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build-v3 -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build-v3 --target FEX FEXServer GL-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 320 "$R/build-host.log"; exit 1; }
+          cp build-v3/HostLibs_64/libGL-host.so "$H/libGL-host.so"
+
+          cmake -S ThunkLibs/GuestLibs -B guest-v3 -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build-v3/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-v3 --target GL-guest GL-lifetime-bridge -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 320 "$R/build-guest.log"; exit 1; }
+          readelf -d guest-v3/libGL-guest.so | tee "$R/wrapper.dynamic"
+          readelf -d guest-v3/libfex-GL-bridge.so | tee "$R/bridge.dynamic"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/bridge.dynamic"
+          grep -q 'NEEDED.*libfex-GL-bridge.so' "$R/wrapper.dynamic"
+          stat -c 'bridge_file_bytes=%s' guest-v3/libfex-GL-bridge.so | tee "$R/bridge-size.txt"
+          nm -D guest-v3/libfex-GL-bridge.so | grep -E 'FEXGLBridgeLookup|FEXGLBridgeMallocTarget|FEXGLBridgeMallocUnpacker' \
+            | tee "$R/bridge.exports"
+
+      - name: Build amd64 X11 stub and GL lifetime probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"; trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp guest-v3/libGL-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libGL.so.1"
+          cp guest-v3/libfex-GL-bridge.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex-GL-bridge.so"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat >/tmp/x11stub.c <<'EOF'
+          #include <stdio.h>
+          typedef int (*XErrorHandler)(void *, void *);
+          int XSync(void *d, int discard) { fprintf(stderr,"GUEST_XSYNC display=%p discard=%d\n",d,discard); return 0; }
+          void *XGetVisualInfo(void *d, long mask, void *t, int *count) { fprintf(stderr,"GUEST_XGETVISUALINFO display=%p mask=%ld\n",d,mask); (void)t; if(count)*count=0; return 0; }
+          char *XDisplayString(void *d) { fprintf(stderr,"GUEST_XDISPLAYSTRING display=%p\n",d); static char s[] = ":99"; return s; }
+          XErrorHandler XSetErrorHandler(XErrorHandler h) { return h; }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat >/tmp/glv3.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mman.h>
+          typedef void (*VoidFunc)(void);
+          typedef VoidFunc (*GLXGET)(const unsigned char *);
+          typedef unsigned int (*GLGETERROR)(void);
+          typedef void *(*GLXGETFBCONFIGS)(void *, int, int *);
+          typedef uintptr_t (*BRLOOK)(const char *);
+          struct range { uintptr_t a,b; } old[16]; static int oldn;
+          static int map_has(void *p, const char *needle) {
+            FILE *f=fopen("/proc/self/maps","r"); char l[1024]; uintptr_t x=(uintptr_t)p;
+            if(!f)return -1;
+            while(fgets(l,sizeof l,f)){unsigned long a,b;if(sscanf(l,"%lx-%lx",&a,&b)==2&&x>=a&&x<b){int ok=strstr(l,needle)!=0;fprintf(stderr,"MAP %p %s",p,l);fclose(f);return ok;}}
+            fclose(f);fprintf(stderr,"UNMAPPED %p\n",p);return 0;
+          }
+          static void capture_wrapper(void) {
+            FILE*f=fopen("/proc/self/maps","r");char l[1024];oldn=0;
+            while(f&&fgets(l,sizeof l,f)&&oldn<16){unsigned long a,b;if(strstr(l,"/usr/lib/x86_64-linux-gnu/libGL.so.1")&&sscanf(l,"%lx-%lx",&a,&b)==2){old[oldn++]=(struct range){a,b};fprintf(stderr,"OLD_GL_RANGE %lx-%lx\n",a,b);}}
+            if(f)fclose(f);
+          }
+          static int reserve_old(void) {
+            for(int i=0;i<oldn;i++){size_t n=old[i].b-old[i].a;void*p=mmap((void*)old[i].a,n,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);if(p==MAP_FAILED){fprintf(stderr,"RESERVE_FAIL %d %lx-%lx errno=%d\n",i,old[i].a,old[i].b,errno);return -1;}fprintf(stderr,"RESERVED %lx-%lx\n",old[i].a,old[i].b);}return 0;
+          }
+          static int call_configs(GLXGETFBCONFIGS fn, uintptr_t token, const char *tag) {
+            int n=0; void *p=fn((void*)token,0,&n); fprintf(stderr,"%s configs=%p count=%d\n",tag,p,n); return p&&n>0 ? 0 : -1;
+          }
+          int main(void) {
+            // Keep X11 independently resident so this test isolates libGL wrapper ownership.
+            void *x11=dlopen("libX11.so.6",RTLD_NOW|RTLD_LOCAL); if(!x11){fprintf(stderr,"X11_FAIL %s\n",dlerror());return 2;}
+            void *h=dlopen("libGL.so.1",RTLD_NOW|RTLD_LOCAL); if(!h){fprintf(stderr,"GL_FAIL %s\n",dlerror());return 3;}
+            GLXGET get0=(GLXGET)dlsym(h,"glXGetProcAddress"); if(!get0)return 4;
+            GLGETERROR err0=(GLGETERROR)get0((const unsigned char*)"glGetError");
+            GLXGETFBCONFIGS cfg0=(GLXGETFBCONFIGS)get0((const unsigned char*)"glXGetFBConfigs");
+            if(!err0||!cfg0)return 5;
+            void *bh=dlopen("libfex-GL-bridge.so",RTLD_NOW|RTLD_NOLOAD); if(!bh)return 6;
+            BRLOOK lookup=(BRLOOK)dlsym(bh,"FEXGLBridgeLookup"); if(!lookup)return 7;
+            void *terr=(void*)lookup("glGetError"), *tcfg=(void*)lookup("glXGetFBConfigs");
+            fprintf(stderr,"GEN1 get=%p Herr=%p Terr=%p Hcfg=%p Tcfg=%p\n",(void*)get0,(void*)err0,terr,(void*)cfg0,tcfg);
+            if(err0()!=0)return 8;
+            if(call_configs(cfg0,0x12345000,"BEFORE_CLOSE_CONFIGS"))return 9;
+            if(map_has(terr,"/libfex-GL-bridge.so")!=1||map_has(tcfg,"/libfex-GL-bridge.so")!=1)return 10;
+            capture_wrapper();
+            dlclose(bh);
+            if(dlclose(h))return 11;
+            if(map_has((void*)get0,"/usr/lib/x86_64-linux-gnu/libGL.so.1")!=0)return 12;
+            if(map_has(terr,"/libfex-GL-bridge.so")!=1)return 13;
+            fprintf(stderr,"AFTER_CLOSE_BEGIN\n");
+            if(err0()!=0)return 14;
+            if(call_configs(cfg0,0x12346000,"AFTER_CLOSE_CONFIGS"))return 15;
+            if(reserve_old())return 16;
+            void *h2=dlopen("libGL.so.1",RTLD_NOW|RTLD_LOCAL); if(!h2){fprintf(stderr,"RELOAD_FAIL %s\n",dlerror());return 17;}
+            GLXGET get1=(GLXGET)dlsym(h2,"glXGetProcAddress");
+            GLGETERROR err1=(GLGETERROR)get1((const unsigned char*)"glGetError");
+            GLXGETFBCONFIGS cfg1=(GLXGETFBCONFIGS)get1((const unsigned char*)"glXGetFBConfigs");
+            fprintf(stderr,"GEN2 get_old=%p get_new=%p moved=%d Herr_old=%p Herr_new=%p same_H=%d Hcfg_old=%p Hcfg_new=%p same_cfg_H=%d\n",(void*)get0,(void*)get1,get0!=get1,(void*)err0,(void*)err1,err0==err1,(void*)cfg0,(void*)cfg1,cfg0==cfg1);
+            if(get0==get1||err0!=err1||cfg0!=cfg1)return 18;
+            if(err1()!=0)return 19;
+            if(call_configs(cfg1,0x12347000,"RELOAD_CONFIGS"))return 20;
+            if(dlclose(h2))return 21;
+            if(err0()!=0)return 22;
+            if(call_configs(cfg0,0x12348000,"FINAL_RETAINED_CONFIGS"))return 23;
+            fprintf(stderr,"REAL_GL_SPLIT_V3_OK\n");
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/glv3.c -ldl -o "$ROOTFS/opt/fex-ci/glv3"
+
+      - name: Execute minimal split GL PFN and malloc-callback lifetime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          Xvfb :99 -screen 0 640x480x24 +extension GLX > "$R/xvfb.log" 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 60); do DISPLAY=:99 xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+          DISPLAY=:99 xdpyinfo >/dev/null
+          set +e
+          DISPLAY=:99 FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" timeout 45s build-v3/Bin/FEX /opt/fex-ci/glv3 \
+            > "$R/probe.out" 2> "$R/probe.err"
+          rc=$?
+          set -e
+          echo "$rc" | tee "$R/probe.exit"
+          cat "$R/probe.err"
+          test "$rc" -eq 0
+          grep -q 'AFTER_CLOSE_BEGIN' "$R/probe.err"
+          after_line="$(grep -n 'AFTER_CLOSE_BEGIN' "$R/probe.err" | head -1 | cut -d: -f1)"
+          tail -n "+$after_line" "$R/probe.err" > "$R/after-close.txt"
+          grep -q 'GL_BRIDGE_MALLOC' "$R/after-close.txt"
+          grep -q 'GUEST_XSYNC display=0x12346000' "$R/after-close.txt"
+          grep -q 'GUEST_XDISPLAYSTRING display=0x12346000' "$R/after-close.txt"
+          grep -q 'REAL_GL_SPLIT_V3_OK' "$R/after-close.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-split-v3-runtime-${{ github.run_id }}
+          path: receipts-gl-v3
+          retention-days: 30
