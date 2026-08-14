@@ -1,0 +1,116 @@
+name: Exact CustomIR retirement A/B
+
+on:
+  push:
+    branches: [diagnostic/thunk-range-retirement-2608]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  retirement-ab:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-retirement
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/linux-fieldwork
+          ref: ${{ env.FIELDWORK_SHA }}
+          path: fieldwork
+          fetch-depth: 1
+
+      - name: Dependencies and identity
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang lld libclang-dev llvm-dev pkg-config libcap-dev gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'fex=%s\nfieldwork=%s\ncarrier=%s\n' "$(git rev-parse HEAD)" "$(git -C fieldwork rev-parse HEAD)" "$GITHUB_SHA" > "$R/identity.txt"
+
+      - name: Reassemble retained LinkAddress fixture
+        run: |
+          set -euxo pipefail
+          base64 -d fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 > /tmp/repro.tar.gz
+          echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
+          mkdir /tmp/repro
+          tar xf /tmp/repro.tar.gz -C /tmp/repro
+
+      - name: Build baseline FEX and server
+        run: |
+          set -euxo pipefail
+          CC=clang CXX=clang++ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
+          cmake --build build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-baseline.log" 2>&1
+          test -x build/Bin/FEX
+          test -x build/Bin/FEXServer
+
+      - name: Prepare amd64 guest
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci/link"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cd /tmp/repro/fex-linkaddress-guest
+          make clean all CXX=x86_64-linux-gnu-g++
+          cp fex_link_lifetime libguest_link_lifetime.so "$ROOTFS/opt/fex-ci/link/"
+
+      - name: Baseline changed-base reload
+        run: |
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/link" && FEX_ROOTFS="$ROOTFS" timeout 45s "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/link/fex_link_lifetime --force-different) > "$R/baseline.stdout" 2> "$R/baseline.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/baseline.exit"
+          grep -E 'stable native|proof:|reload invoker|reserved old|linked entry|fresh direct' "$R/baseline.stdout" > "$R/baseline.key-lines" || true
+          grep -E 'already linked elsewhere|Retiring guest trampoline' "$R/baseline.stderr" >> "$R/baseline.key-lines" || true
+          cat "$R/baseline.key-lines"
+          printf 'baseline_rc=%s\n' "$rc" | tee "$R/summary.txt"
+
+      - name: Apply exact retirement v2 and rebuild
+        run: |
+          set -euxo pipefail
+          python3 diagnostics/thunk-range-retirement-2608/apply_exact_customir_retirement_v2.py
+          git diff --check
+          git diff -- FEXCore Source > "$R/v2.diff"
+          cmake --build build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build-v2.log" 2>&1
+
+      - name: Patched changed-base reload
+        run: |
+          set +e
+          (cd "$ROOTFS/opt/fex-ci/link" && FEX_ROOTFS="$ROOTFS" timeout 45s "$GITHUB_WORKSPACE/build/Bin/FEX" /opt/fex-ci/link/fex_link_lifetime --force-different) > "$R/v2.stdout" 2> "$R/v2.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/v2.exit"
+          grep -E 'stable native|proof:|reload invoker|reserved old|linked entry|fresh direct' "$R/v2.stdout" > "$R/v2.key-lines" || true
+          grep -E 'already linked elsewhere|Retiring guest trampoline' "$R/v2.stderr" >> "$R/v2.key-lines" || true
+          cat "$R/v2.key-lines"
+          printf 'v2_rc=%s\n' "$rc" | tee -a "$R/summary.txt"
+          echo '--- retirement logs ---' | tee -a "$R/summary.txt"
+          grep -E 'Retiring guest trampoline' "$R/v2.stderr" | tee -a "$R/summary.txt" || true
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-customir-retirement-ab-${{ github.run_id }}
+          path: receipts-retirement
+          if-no-files-found: warn
