@@ -1,0 +1,153 @@
+name: Vulkan allocator repack identity ARM64
+
+on:
+  push:
+    branches: [ci/vulkan-allocator-repack-identity-20260814]
+    paths:
+      - .github/workflows/vulkan-allocator-repack-identity-arm64.yml
+      - LINUX_FIELDWORK_ALLOCATOR_REPACK_IDENTITY.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repack:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    env:
+      PRODUCT_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      HOST: ${{ github.workspace }}/host-thunks
+      R: ${{ github.workspace }}/receipts-repack
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+        with:
+          path: carrier
+
+      - name: Checkout exact product
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          submodules: recursive
+
+      - name: Dependencies and identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers
+          printf 'carrier=%s\nproduct=%s\n' "$(git -C carrier rev-parse HEAD)" "$(git -C product rev-parse HEAD)" > "$R/identity.txt"
+
+      - name: Apply allocator callback mediation and repack trace
+        working-directory: product
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 ../carrier/LINUX_FIELDWORK_ALLOCATOR_TRAMPOLINE.py
+          python3 ../carrier/LINUX_FIELDWORK_ALLOCATOR_REPACK_IDENTITY.py
+          git diff --check
+          git diff -- ThunkLibs/libvulkan | tee "$R/product.diff"
+
+      - name: Build FEX and Vulkan thunks
+        working-directory: product
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 240 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$PWD" -DGENERATOR_EXE="$PWD/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 240 "$R/build-guest.log"; exit 1; }
+
+      - name: Prepare rootfs and cross-call probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp product/guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 \
+            /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          x86_64-linux-gnu-gcc -std=c11 -O0 -g -Wall -Wextra -Werror \
+            carrier/LINUX_FIELDWORK_ALLOCATOR_CROSSCALL_TRACE.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/allocator-crosscall-trace"
+
+      - name: Execute and compare repacks
+        shell: bash
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+            timeout 30s product/build/Bin/FEX /opt/fex-ci/allocator-crosscall-trace \
+            > "$R/fex.stdout" 2> "$R/fex.stderr"
+          rc=$?
+          set -e
+          echo "$rc" > "$R/fex.exit"
+          grep -E 'ALLOC_REPACK_|API_CREATE_|API_DESTROY_|CB_' "$R/fex.stderr" | tee "$R/key-lines.txt" || true
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('receipts-repack/fex.stderr').read_text()
+          rows = re.findall(r'ALLOC_REPACK_END seq=(\d+) host_user=(\S+) host_alloc=(\S+) host_realloc=(\S+) host_free=(\S+) host_internal_alloc=(\S+) host_internal_free=(\S+)', text)
+          Path('receipts-repack/repack-count.txt').write_text(f'{len(rows)}\n')
+          if len(rows) < 2:
+              Path('receipts-repack/repack-summary.txt').write_text(f'REPACK_ROWS={rows!r}\n')
+              print('REPACK_ROWS', rows)
+              raise SystemExit(0)
+          first, last = rows[0], rows[-1]
+          same = first[1:] == last[1:]
+          out = [
+              f'first={first!r}',
+              f'last={last!r}',
+              f'same_host_allocator={int(same)}',
+          ]
+          Path('receipts-repack/repack-summary.txt').write_text('\n'.join(out) + '\n')
+          print('\n'.join(out))
+          PY
+          cat "$R/repack-summary.txt" || true
+          printf 'fex=%s\n' "$rc" | tee "$R/final-matrix.txt"
+          exit 0
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-allocator-repack-${{ github.run_id }}
+          path: receipts-repack
+          retention-days: 30
