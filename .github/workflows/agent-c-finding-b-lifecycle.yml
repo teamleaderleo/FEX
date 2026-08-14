@@ -1,0 +1,285 @@
+name: Agent C Finding B lifecycle matrix
+
+on:
+  push:
+    branches: [ci/agent-c-vulkan-load-sigill-20260814]
+    paths:
+      - .github/workflows/agent-c-finding-b-lifecycle.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      FEX_SHA: c011366706eaf65a00380003989b3a10811212b6
+      DEBIAN_FRONTEND: noninteractive
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts
+      HOST: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Identity and dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          test "$(git -C src rev-parse HEAD)" = "$FEX_SHA"
+          {
+            echo "fex_sha=$(git -C src rev-parse HEAD)"
+            uname -a
+            uname -m
+          } | tee "$R/identity.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers vulkan-tools debootstrap
+
+      - name: Native Lavapipe control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" > "$R/lvp-icd.txt"
+          VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
+
+      - name: Build exact candidate and focused Vulkan thunk pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DENABLE_LTO=OFF \
+            -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-host.log" 2>&1
+          cmake --build src/build --target FEXServer vulkan-host-64 -- -j"$(nproc)" -v >"$R/build-host.log" 2>&1
+          cp src/build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S src/ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            >"$R/cmake-guest.log" 2>&1
+          cmake --build guest --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
+
+      - name: Build amd64 lifecycle probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > /tmp/vulkan-lifecycle.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #define VK_NO_PROTOTYPES
+          #include <vulkan/vulkan.h>
+
+          static void marker(const char *s) {
+            ssize_t n = write(2, s, strlen(s));
+            (void)n;
+          }
+
+          static int one_cycle(int flags, int use_vulkan, int close_handle) {
+            marker("PHASE_BEFORE_DLOPEN\n");
+            void *h = dlopen("libvulkan.so.1", flags);
+            if (!h) {
+              fprintf(stderr, "DLOPEN_ERROR=%s\n", dlerror());
+              return 10;
+            }
+            marker("PHASE_AFTER_DLOPEN\n");
+
+            if (use_vulkan) {
+              PFN_vkCreateInstance create_instance = (PFN_vkCreateInstance)dlsym(h, "vkCreateInstance");
+              PFN_vkEnumeratePhysicalDevices enumerate = (PFN_vkEnumeratePhysicalDevices)dlsym(h, "vkEnumeratePhysicalDevices");
+              PFN_vkDestroyInstance destroy_instance = (PFN_vkDestroyInstance)dlsym(h, "vkDestroyInstance");
+              if (!create_instance || !enumerate || !destroy_instance) {
+                fprintf(stderr, "DLSYM_FAIL create=%p enumerate=%p destroy=%p\n",
+                        (void*)create_instance, (void*)enumerate, (void*)destroy_instance);
+                return 11;
+              }
+
+              VkApplicationInfo app = {
+                .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                .pApplicationName = "fex-finding-b-lifecycle",
+                .applicationVersion = 1,
+                .pEngineName = "none",
+                .engineVersion = 1,
+                .apiVersion = VK_API_VERSION_1_0,
+              };
+              VkInstanceCreateInfo ci = {
+                .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                .pApplicationInfo = &app,
+              };
+              VkInstance instance = VK_NULL_HANDLE;
+              VkResult r = create_instance(&ci, NULL, &instance);
+              fprintf(stderr, "CREATE_RESULT=%d INSTANCE=%p\n", r, (void*)instance);
+              if (r != VK_SUCCESS || instance == VK_NULL_HANDLE) return 12;
+              marker("PHASE_AFTER_CREATE\n");
+
+              uint32_t count = 0;
+              r = enumerate(instance, &count, NULL);
+              fprintf(stderr, "ENUM_RESULT=%d COUNT=%u\n", r, count);
+              if (r != VK_SUCCESS || count == 0) return 13;
+              marker("PHASE_AFTER_ENUMERATE\n");
+
+              destroy_instance(instance, NULL);
+              marker("PHASE_AFTER_DESTROY\n");
+            }
+
+            if (close_handle) {
+              marker("PHASE_BEFORE_DLCLOSE\n");
+              int rc = dlclose(h);
+              fprintf(stderr, "DLCLOSE_RESULT=%d\n", rc);
+              if (rc != 0) return 14;
+              marker("PHASE_AFTER_DLCLOSE\n");
+            } else {
+              marker("PHASE_SKIP_DLCLOSE\n");
+            }
+            return 0;
+          }
+
+          int main(int argc, char **argv) {
+            if (argc != 2) return 2;
+            const char *mode = argv[1];
+            int rc = 0;
+
+            if (!strcmp(mode, "load-close")) {
+              rc = one_cycle(RTLD_NOW | RTLD_LOCAL, 0, 1);
+            } else if (!strcmp(mode, "normal-close")) {
+              rc = one_cycle(RTLD_NOW | RTLD_LOCAL, 1, 1);
+            } else if (!strcmp(mode, "no-close")) {
+              rc = one_cycle(RTLD_NOW | RTLD_LOCAL, 1, 0);
+            } else if (!strcmp(mode, "nodelete")) {
+              rc = one_cycle(RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE, 1, 1);
+            } else if (!strcmp(mode, "extra-ref")) {
+              marker("PHASE_EXTRA_REF_FIRST\n");
+              void *a = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+              void *b = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+              fprintf(stderr, "EXTRA_REF a=%p b=%p\n", a, b);
+              if (!a || !b) return 20;
+              if (dlclose(a) != 0) return 21;
+              marker("PHASE_EXTRA_REF_AFTER_FIRST_CLOSE\n");
+              if (dlclose(b) != 0) return 22;
+              marker("PHASE_EXTRA_REF_AFTER_SECOND_CLOSE\n");
+            } else if (!strcmp(mode, "repeat")) {
+              for (int i = 0; i < 20; ++i) {
+                fprintf(stderr, "ITERATION=%d\n", i);
+                rc = one_cycle(RTLD_NOW | RTLD_LOCAL, 1, 1);
+                if (rc) break;
+              }
+            } else if (!strcmp(mode, "close-_exit")) {
+              rc = one_cycle(RTLD_NOW | RTLD_LOCAL, 1, 1);
+              if (rc == 0) {
+                marker("PHASE_BEFORE__EXIT\n");
+                _exit(0);
+              }
+            } else {
+              return 3;
+            }
+
+            fprintf(stderr, "MODE_RESULT=%d\n", rc);
+            marker("PHASE_BEFORE_RETURN\n");
+            return rc;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -g -Wall -Wextra -Werror \
+            -I"$GITHUB_WORKSPACE/src/External/Vulkan-Headers/include" \
+            /tmp/vulkan-lifecycle.c -ldl -o /tmp/vulkan-lifecycle
+          file /tmp/vulkan-lifecycle | tee "$R/lifecycle-probe.file.txt"
+
+      - name: Build package-resolved amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo debootstrap \
+            --arch=amd64 --foreign --variant=minbase --components=main,universe \
+            --include=libvulkan1,libx11-6 \
+            noble "$ROOTFS" http://archive.ubuntu.com/ubuntu \
+            >"$R/debootstrap.log" 2>&1
+          sudo find "$ROOTFS" -type f -name '*.deb' -print | sort | tee "$R/rootfs-debs.txt"
+          sed -n 's/^I: Extracting \([^ ]*\)\.\.\.$/\1/p' "$R/debootstrap.log" \
+            | sort -u | tee "$R/rootfs-already-extracted.txt"
+          : > "$R/rootfs-deferred-extracted.txt"
+          while IFS= read -r deb; do
+            pkg="$(dpkg-deb -f "$deb" Package)"
+            if grep -Fxq "$pkg" "$R/rootfs-already-extracted.txt"; then
+              continue
+            fi
+            echo "$pkg" | tee -a "$R/rootfs-deferred-extracted.txt"
+            sudo dpkg-deb -x "$deb" "$ROOTFS"
+          done < "$R/rootfs-debs.txt"
+
+          sudo cp guest/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
+          sudo install -m755 /tmp/vulkan-lifecycle "$ROOTFS/usr/local/bin/vulkan-lifecycle"
+
+          X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+          test -e "$X11"
+          for sym in XSync XGetVisualInfo XDisplayString; do
+            x86_64-linux-gnu-readelf -Ws "$X11" | grep -E " ${sym}(@|$)" | head -1
+          done
+
+      - name: FEX smoke and Finding B matrix
+        shell: bash
+        run: |
+          set -uxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          export VK_DRIVER_FILES="$LVP_ICD"
+          export FEX_ROOTFS="$ROOTFS"
+          export FEX_THUNKHOSTLIBS="$HOST"
+
+          set +e
+          "$FEX" /bin/true >"$R/fex-true.out" 2>"$R/fex-true.err"
+          true_rc=$?
+          set -e
+          echo "$true_rc" > "$R/fex-true.exit"
+          test "$true_rc" -eq 0
+
+          : > "$R/matrix.txt"
+          for mode in load-close normal-close no-close nodelete extra-ref repeat close-_exit; do
+            set +e
+            timeout 60s "$FEX" /usr/local/bin/vulkan-lifecycle "$mode" \
+              >"$R/${mode}.out" 2>"$R/${mode}.err"
+            rc=$?
+            set -e
+            echo "$mode=$rc" | tee -a "$R/matrix.txt"
+            sed -n '1,220p' "$R/${mode}.err"
+          done
+
+          cat "$R/matrix.txt"
+
+          # This is an investigation matrix, not an assumption that Finding B must reproduce.
+          # Require only that every case reached a classified process exit rather than timeout.
+          if grep -q '=124$' "$R/matrix.txt"; then
+            echo 'unexpected timeout in lifecycle matrix' >&2
+            exit 1
+          fi
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-c-finding-b-lifecycle-${{ github.run_id }}
+          path: receipts
+          if-no-files-found: warn
+          retention-days: 30
