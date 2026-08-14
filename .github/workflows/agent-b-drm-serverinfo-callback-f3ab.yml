@@ -23,14 +23,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 9
+          fetch-depth: 12
 
       - name: Dependencies and provenance
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$R" "$HOST"
-          git log --oneline -9 | tee "$R/lineage.txt"
+          git log --oneline -12 | tee "$R/lineage.txt"
+          git cat-file -e "$PRODUCT_SHA^{commit}"
           git diff --name-only "$PRODUCT_SHA" -- ThunkLibs FEXCore Source | tee "$R/pre-patch-product-source-diff.txt"
           test ! -s "$R/pre-patch-product-source-diff.txt"
           sudo apt-get update
