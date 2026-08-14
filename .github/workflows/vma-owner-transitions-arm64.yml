@@ -88,7 +88,10 @@ jobs:
           mkdir -p "$ROOTFS/opt/fex-ci" "$ROOTFS/usr/lib/x86_64-linux-gnu"
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/"
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          # Keep warnings strict for this fixture while exempting one warning
+          # originating in FEX's shared Guest.h helper rather than this probe.
           x86_64-linux-gnu-g++ -std=c++20 -O2 -g -Wall -Wextra -Wpedantic -Werror \
+            -Wno-error=missing-field-initializers \
             -I"$GITHUB_WORKSPACE/src/ThunkLibs/include" \
             diagnostics/vma-owner-transitions/vma_linkaddress_probe.cpp \
             -o "$ROOTFS/opt/fex-ci/vma-linkaddress-probe"
