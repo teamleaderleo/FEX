@@ -1,0 +1,139 @@
+name: Positive callback-direction resident output v1
+
+on:
+  push:
+    branches: [diagnostic/thunkgen-resident-output-v1]
+    paths:
+      - .github/workflows/thunkgen-resident-direction-positive-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  callback-positive:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      R: ${{ github.workspace }}/receipts-resident-direction-positive-v1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev
+          git rev-parse HEAD | tee "$R/carrier-sha.txt"
+
+      - name: Apply generator candidate and one-callback fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 ThunkLibs/Generator/apply_resident_output_candidate.py
+          python3 ThunkLibs/Generator/apply_resident_output_candidate_fixups.py
+          python3 ThunkLibs/Generator/apply_resident_direction_candidate.py
+          rm ThunkLibs/Generator/extract_guest_bridge.py
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          api = Path('ThunkLibs/libfex_thunk_test/api.h')
+          s = api.read_text()
+          anchor = 'uint32_t GetDoubledValue(uint32_t);\n'
+          replacement = '''uint32_t GetDoubledValue(uint32_t);\n\nusing ResidentDirectionCallback = uint32_t (*)(uint32_t);\nuint32_t InvokeResidentDirectionCallback(ResidentDirectionCallback callback, uint32_t value);\n'''
+          if s.count(anchor) != 1:
+              raise SystemExit(f'api anchor count={s.count(anchor)}')
+          api.write_text(s.replace(anchor, replacement, 1))
+
+          interface = Path('ThunkLibs/libfex_thunk_test/libfex_thunk_test_interface.cpp')
+          s = interface.read_text()
+          anchor = 'template<>\nstruct fex_gen_config<GetDoubledValue> {};\n'
+          replacement = '''template<>\nstruct fex_gen_config<GetDoubledValue> {};\n\ntemplate<>\nstruct fex_gen_config<InvokeResidentDirectionCallback> {};\n'''
+          if s.count(anchor) != 1:
+              raise SystemExit(f'interface anchor count={s.count(anchor)}')
+          interface.write_text(s.replace(anchor, replacement, 1))
+
+          cmake = Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s = cmake.read_text()
+          anchor = 'generate(libfex_thunk_test ${CMAKE_CURRENT_SOURCE_DIR}/../libfex_thunk_test/libfex_thunk_test_interface.cpp)'
+          replacement = 'generate(libfex_thunk_test ${CMAKE_CURRENT_SOURCE_DIR}/../libfex_thunk_test/libfex_thunk_test_interface.cpp RESIDENT_BRIDGE)'
+          if s.count(anchor) != 1:
+              raise SystemExit(f'CMake anchor count={s.count(anchor)}')
+          cmake.write_text(s.replace(anchor, replacement, 1))
+          PY
+
+          git diff --check
+          git diff -- ThunkLibs/Generator/analysis.h ThunkLibs/Generator/analysis.cpp ThunkLibs/Generator/gen.cpp \
+            ThunkLibs/Generator/interface.h ThunkLibs/Generator/main.cpp ThunkLibs/GuestLibs/CMakeLists.txt \
+            ThunkLibs/libfex_thunk_test/api.h ThunkLibs/libfex_thunk_test/libfex_thunk_test_interface.cpp \
+            | tee "$R/positive-control.diff"
+          ! grep -q 'FEXResidentBridgeCanUnpack' ThunkLibs/Generator/gen.cpp
+          grep -q 'InvokeResidentDirectionCallback' ThunkLibs/libfex_thunk_test/libfex_thunk_test_interface.cpp
+
+      - name: Build thunkgen
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1 \
+            || { tail -n 240 "$R/cmake-host.log"; exit 1; }
+          cmake --build build --target FEX GL-host-64 -- -j"$(nproc)" -v \
+            > "$R/build-host.log" 2>&1 || { tail -n 420 "$R/build-host.log"; exit 1; }
+          test -x build/Bin/thunkgen
+
+      - name: Generate one positive resident callback unpacker
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DBUILD_FEX_LINUX_TESTS=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1 \
+            || { tail -n 240 "$R/cmake-guest.log"; exit 1; }
+          cmake --build guest --target fex_thunk_test-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 420 "$R/build-guest.log"; exit 1; }
+
+          test -f guest/gen/thunkgen_guest_libfex_thunk_test.inl
+          test -f guest/gen/thunkgen_guest_libfex_thunk_test_bridge.inl
+          test -f guest/gen/thunkgen_guest_libfex_thunk_test_bridge_accessors.inl
+
+          awk '/^extern "C" uintptr_t fex_bridge_libfex_thunk_test_unpacker_/{n++} END{print n+0}' \
+            guest/gen/thunkgen_guest_libfex_thunk_test_bridge.inl | tee "$R/resident-unpacker-count.txt"
+          awk '/^template<> struct FEXResidentBridgeUnpacker</{n++} END{print n+0}' \
+            guest/gen/thunkgen_guest_libfex_thunk_test_bridge_accessors.inl | tee "$R/accessor-unpacker-count.txt"
+          test "$(cat "$R/resident-unpacker-count.txt")" = 1
+          test "$(cat "$R/accessor-unpacker-count.txt")" = 1
+          ! grep -q 'FEXResidentBridgeCanUnpack' guest/gen/thunkgen_guest_libfex_thunk_test_bridge.inl
+          ! grep -q 'sizeof...(Args) <= 19' guest/gen/thunkgen_guest_libfex_thunk_test_bridge.inl
+
+          grep -n 'ResidentDirectionCallback\|fex_bridge_libfex_thunk_test_unpacker_' \
+            guest/gen/thunkgen_guest_libfex_thunk_test_bridge.inl \
+            guest/gen/thunkgen_guest_libfex_thunk_test_bridge_accessors.inl \
+            | tee "$R/callback-evidence.txt"
+          echo POSITIVE_DIRECTION_RESIDENT_UNPACKER_OK | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resident-direction-positive-v1-${{ github.run_id }}
+          path: receipts-resident-direction-positive-v1
+          retention-days: 30
