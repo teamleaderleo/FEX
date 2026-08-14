@@ -85,24 +85,24 @@ jobs:
           grep -q 'ELF 64-bit.*x86-64' "$R/file64.txt"
           stat -c '%n %s' guest64/libvulkan-guest.so guest64/libfex-vulkan-bridge.so | tee "$R/sizes64.txt"
 
-      - name: Build and verify 32-bit split
+      - name: Verify FEX-2608 has no 32-bit Vulkan guest thunk
         shell: bash
         run: |
           set -euxo pipefail
+          # In FEX-2608 the Vulkan generator/guest target lives inside the
+          # `if (BITNESS EQUAL 64)` block. The split therefore has no 32-bit
+          # Vulkan counterpart to build on this historical baseline.
           cmake -S ThunkLibs/GuestLibs -B guest32 -G Ninja \
             -DBITNESS=32 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_32.cmake" \
             -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
             > "$R/cmake32.log" 2>&1
-          cmake --build guest32 --target vulkan-guest vulkan-bridge-guest -- -j"$(nproc)" > "$R/build32.log" 2>&1
-          file guest32/libvulkan-guest.so guest32/libfex-vulkan-bridge.so | tee "$R/file32.txt"
-          readelf -d guest32/libvulkan-guest.so > "$R/wrapper32.dynamic"
-          readelf -d guest32/libfex-vulkan-bridge.so > "$R/bridge32.dynamic"
-          ! grep -q 'FLAGS_1.*NODELETE' "$R/wrapper32.dynamic"
-          grep -q 'FLAGS_1.*NODELETE' "$R/bridge32.dynamic"
-          grep -q 'ELF 32-bit.*Intel 80386' "$R/file32.txt"
-          stat -c '%n %s' guest32/libvulkan-guest.so guest32/libfex-vulkan-bridge.so | tee "$R/sizes32.txt"
-          echo SPLIT_BITNESS_PASS | tee "$R/result.txt"
+          ninja -C guest32 -t targets all > "$R/targets32.txt"
+          ! grep -q '^vulkan-guest:' "$R/targets32.txt"
+          ! grep -q '^vulkan-bridge-guest:' "$R/targets32.txt"
+          grep -n -A30 'if (BITNESS EQUAL 64)' ThunkLibs/GuestLibs/CMakeLists.txt | tee "$R/vulkan64-scope.txt"
+          grep -q 'add_guest_lib(vulkan "libvulkan.so.1")' "$R/vulkan64-scope.txt"
+          echo 'SPLIT_64_OK_32BIT_VULKAN_NOT_SUPPORTED_IN_FEX2608' | tee "$R/result.txt"
 
       - name: Upload receipts
         if: always()
