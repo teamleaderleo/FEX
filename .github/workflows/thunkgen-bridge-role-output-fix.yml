@@ -1,0 +1,102 @@
+name: Thunkgen bridge roles source-location unblock
+
+on:
+  push:
+    branches: [diagnostic/thunkgen-bridge-role-output-fix-20260814]
+    paths:
+      - .github/workflows/thunkgen-bridge-role-output-fix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  role-output-unblock:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      R: ${{ github.workspace }}/role-unblock-receipts
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Apply role transforms and repair diagnostic location
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            libcap-dev
+          python3 .github/fieldwork/apply_thunkgen_guest_bridge_output.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles_compat.py .
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/Generator/analysis.cpp')
+          s = p.read_text()
+          old = '*decl->getSourceRange().getBegin().getPtrEncoding()'
+          new = 'decl->getLocation()'
+          assert s.count(old) == 1, s.count(old)
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git diff --check
+          git diff -- ThunkLibs/Generator > "$R/source.diff"
+
+      - name: Build thunkgen and exercise role fixture
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" -v \
+            > "$R/build.log" 2>&1 || { tail -n 240 "$R/build.log"; exit 1; }
+
+          build/Bin/thunkgen \
+            "$GITHUB_WORKSPACE/.github/fieldwork/thunkgen_bridge_role_fixture.cpp" role_fixture \
+            -guest-bridge "$R/fixture-bridge.inl" / -- \
+            -std=c++20 --target=x86_64-linux-gnu --sysroot / \
+            -isystem"$GITHUB_WORKSPACE/ThunkLibs/include"
+          build/Bin/thunkgen \
+            "$GITHUB_WORKSPACE/.github/fieldwork/thunkgen_bridge_role_fixture.cpp" role_fixture \
+            -guest-bridge-accessors "$R/fixture-accessors.inl" / -- \
+            -std=c++20 --target=x86_64-linux-gnu --sysroot / \
+            -isystem"$GITHUB_WORKSPACE/ThunkLibs/include"
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('role-unblock-receipts/fixture-bridge.inl').read_text()
+          roles = [(int(c), int(u), h, sig) for c, u, h, sig in re.findall(
+              r'FEX_BRIDGE_ROLE index=\d+ caller=(\d) unpacker=(\d) hash=([0-9a-f]+) (.*)', text)]
+          assert roles, 'no role records'
+          unpacker_only = [r for r in roles if r[0] == 0 and r[1] == 1]
+          both = [r for r in roles if r[0] == 1 and r[1] == 1]
+          assert len(unpacker_only) == 1, roles
+          assert len(both) == 1, roles
+          accessors = Path('role-unblock-receipts/fixture-accessors.inl').read_text()
+          for caller, unpacker, h, sig in roles:
+              assert (f'fex_bridge_invoker_{h}();' in accessors) == bool(caller), (caller, unpacker, h, sig)
+              assert (f'fex_bridge_unpacker_{h}();' in accessors) == bool(unpacker), (caller, unpacker, h, sig)
+          Path('role-unblock-receipts/summary.txt').write_text(
+              f'fixture_total={len(roles)}\nunpacker_only={len(unpacker_only)}\nboth={len(both)}\n')
+          print(Path('role-unblock-receipts/summary.txt').read_text(), end='')
+          PY
+          echo BRIDGE_ROLE_SOURCE_LOCATION_UNBLOCK_OK
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunkgen-bridge-role-unblock-${{ github.run_id }}
+          path: role-unblock-receipts
+          retention-days: 30
