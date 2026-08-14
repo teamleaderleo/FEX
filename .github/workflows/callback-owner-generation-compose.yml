@@ -5,6 +5,7 @@ on:
     branches: [ci/callback-owner-generation-lease-20260814]
     paths:
       - .github/workflows/callback-owner-generation-compose.yml
+      - .github/fieldwork/relax_owner_generation_registry_anchor.py
   workflow_dispatch:
 
 permissions:
@@ -58,6 +59,8 @@ jobs:
         run: python3 owner-helper/.github/fieldwork/add_owner_claim_identity.py src
       - name: Upgrade callback tombstone to descriptor
         run: python3 .github/fieldwork/add_callback_descriptor_after_tombstone.py src
+      - name: Relax owner-generation registry patch anchor
+        run: python3 .github/fieldwork/relax_owner_generation_registry_anchor.py
       - name: Attempt callback owner-generation lease
         continue-on-error: true
         run: python3 .github/fieldwork/add_callback_owner_generation_lease.py src
