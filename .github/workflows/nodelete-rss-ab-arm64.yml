@@ -1,0 +1,303 @@
+name: NODELETE retained-memory A/B
+
+on:
+  push:
+    branches: [diagnostic/nodelete-rss-ab-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rss-ab:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
+            libcap-dev libasound2-dev libdrm-dev libwayland-dev \
+            libgl-dev libegl1-mesa-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev mesa-vulkan-drivers
+          git rev-parse HEAD | tee "$R/fex-sha.txt"
+          git diff --check
+
+      - name: Build FEX and six host thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer \
+            asound-host-64 vulkan-host-64 drm-host-64 wayland-client-host-64 GL-host-64 EGL-host-64 \
+            -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1 || { tail -n 360 "$R/build-host.log"; exit 1; }
+          test -x build/Bin/FEX
+          for n in asound vulkan drm wayland-client GL EGL; do
+            test -f "build/HostLibs_64/lib${n}-host.so"
+            cp "build/HostLibs_64/lib${n}-host.so" "$H/lib${n}-host.so"
+          done
+
+      - name: Build stock and NODELETE guest thunk sets
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp ThunkLibs/GuestLibs/CMakeLists.txt "$R/CMakeLists.nodelete.txt"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s = p.read_text()
+          block = '''  if (TARGET_TYPE STREQUAL "SHARED")\n    target_link_options(${NAME}-guest PRIVATE "LINKER:-z,nodelete")\n  endif()\n'''
+          if s.count(block) != 1:
+              raise SystemExit(f'expected one NODELETE block, got {s.count(block)}')
+          p.write_text(s.replace(block, '', 1))
+          PY
+          git diff --check
+          git diff -- ThunkLibs/GuestLibs/CMakeLists.txt > "$R/stock-policy.diff"
+
+          cmake -S ThunkLibs/GuestLibs -B guest-stock -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-stock.log" 2>&1
+          cmake --build guest-stock --target \
+            asound-guest vulkan-guest drm-guest wayland-client-guest GL-guest EGL-guest \
+            -- -j"$(nproc)" -v > "$R/build-stock.log" 2>&1 || { tail -n 360 "$R/build-stock.log"; exit 1; }
+
+          git checkout -- ThunkLibs/GuestLibs/CMakeLists.txt
+          git diff --check
+          cmake -S ThunkLibs/GuestLibs -B guest-nodelete -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ > "$R/cmake-nodelete.log" 2>&1
+          cmake --build guest-nodelete --target \
+            asound-guest vulkan-guest drm-guest wayland-client-guest GL-guest EGL-guest \
+            -- -j"$(nproc)" -v > "$R/build-nodelete.log" 2>&1 || { tail -n 360 "$R/build-nodelete.log"; exit 1; }
+
+          mkdir -p "$R/elf"
+          for variant in stock nodelete; do
+            for n in asound vulkan drm wayland-client GL EGL; do
+              f="guest-${variant}/lib${n}-guest.so"
+              test -f "$f"
+              readelf -d "$f" > "$R/elf/${variant}-${n}.dynamic.txt"
+            done
+          done
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/elf/stock-vulkan.dynamic.txt"
+          ! grep -q 'FLAGS_1.*NODELETE' "$R/elf/stock-GL.dynamic.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/elf/nodelete-vulkan.dynamic.txt"
+          grep -q 'FLAGS_1.*NODELETE' "$R/elf/nodelete-GL.dynamic.txt"
+
+      - name: Create amd64 rootfs and memory probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat > /tmp/x11stub.c <<'EOF'
+          typedef int (*XErrorHandler)(void *, void *);
+          int XSync(void *display, int discard) { (void)display; (void)discard; return 0; }
+          void *XGetVisualInfo(void *display, long mask, void *templ, int *count) {
+            (void)display; (void)mask; (void)templ; if (count) *count = 0; return 0;
+          }
+          const char *XDisplayString(void *display) { (void)display; return ":0"; }
+          XErrorHandler XSetErrorHandler(XErrorHandler handler) { return handler; }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat > /tmp/rssprobe.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <malloc.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+
+          static const char *libs[] = {
+            "libasound.so.2",
+            "libvulkan.so.1",
+            "libdrm.so.2",
+            "libwayland-client.so.0.20.0",
+            "libGL.so.1",
+            "libEGL.so.1",
+          };
+
+          struct meminfo {
+            long rss, pss, private_clean, private_dirty, shared_clean, shared_dirty;
+            unsigned long thunk_map_bytes;
+            unsigned thunk_map_count;
+          };
+
+          static int is_thunk_path(const char *line) {
+            for (unsigned i = 0; i < sizeof(libs) / sizeof(libs[0]); ++i) {
+              if (strstr(line, libs[i])) return 1;
+            }
+            return 0;
+          }
+
+          static struct meminfo snapshot(const char *tag) {
+            struct meminfo m = {0};
+            FILE *f = fopen("/proc/self/smaps_rollup", "r");
+            char line[1024];
+            if (!f) { perror("smaps_rollup"); exit(70); }
+            while (fgets(line, sizeof(line), f)) {
+              if (sscanf(line, "Rss: %ld kB", &m.rss) == 1) continue;
+              if (sscanf(line, "Pss: %ld kB", &m.pss) == 1) continue;
+              if (sscanf(line, "Private_Clean: %ld kB", &m.private_clean) == 1) continue;
+              if (sscanf(line, "Private_Dirty: %ld kB", &m.private_dirty) == 1) continue;
+              if (sscanf(line, "Shared_Clean: %ld kB", &m.shared_clean) == 1) continue;
+              if (sscanf(line, "Shared_Dirty: %ld kB", &m.shared_dirty) == 1) continue;
+            }
+            fclose(f);
+
+            f = fopen("/proc/self/maps", "r");
+            if (!f) { perror("maps"); exit(71); }
+            while (fgets(line, sizeof(line), f)) {
+              unsigned long a = 0, b = 0;
+              if (sscanf(line, "%lx-%lx", &a, &b) == 2 && is_thunk_path(line)) {
+                m.thunk_map_bytes += b - a;
+                ++m.thunk_map_count;
+              }
+            }
+            fclose(f);
+            fprintf(stderr,
+                    "SNAP %s rss_kb=%ld pss_kb=%ld private_clean_kb=%ld private_dirty_kb=%ld shared_clean_kb=%ld shared_dirty_kb=%ld thunk_map_bytes=%lu thunk_map_count=%u\n",
+                    tag, m.rss, m.pss, m.private_clean, m.private_dirty, m.shared_clean, m.shared_dirty,
+                    m.thunk_map_bytes, m.thunk_map_count);
+            return m;
+          }
+
+          static void print_noload(const char *tag) {
+            for (unsigned i = 0; i < sizeof(libs) / sizeof(libs[0]); ++i) {
+              dlerror();
+              void *h = dlopen(libs[i], RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+              fprintf(stderr, "NOLOAD %s lib=%s resident=%d handle=%p\n", tag, libs[i], h != NULL, h);
+              if (h) dlclose(h);
+            }
+          }
+
+          int main(int argc, char **argv) {
+            const char *label = argc > 1 ? argv[1] : "unknown";
+            void *handles[sizeof(libs) / sizeof(libs[0])] = {0};
+            fprintf(stderr, "MODE %s\n", label);
+            snapshot("baseline");
+            for (unsigned i = 0; i < sizeof(libs) / sizeof(libs[0]); ++i) {
+              handles[i] = dlopen(libs[i], RTLD_NOW | RTLD_LOCAL);
+              if (!handles[i]) {
+                fprintf(stderr, "DLOPEN_FAIL lib=%s err=%s\n", libs[i], dlerror());
+                return 10 + (int)i;
+              }
+              fprintf(stderr, "DLOPEN_OK lib=%s handle=%p\n", libs[i], handles[i]);
+            }
+            snapshot("loaded");
+            print_noload("loaded");
+            for (int i = (int)(sizeof(libs) / sizeof(libs[0])) - 1; i >= 0; --i) {
+              if (dlclose(handles[i]) != 0) {
+                fprintf(stderr, "DLCLOSE_FAIL lib=%s err=%s\n", libs[i], dlerror());
+                return 30 + i;
+              }
+            }
+            malloc_trim(0);
+            usleep(100000);
+            snapshot("after_close");
+            print_noload("after_close");
+            fprintf(stderr, "RSS_AB_PROBE_OK mode=%s\n", label);
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/rssprobe.c -ldl -o "$ROOTFS/opt/fex-ci/rssprobe"
+
+      - name: Run stock versus NODELETE
+        shell: bash
+        run: |
+          set -euxo pipefail
+          install_set() {
+            local variant="$1"
+            local d="guest-${variant}"
+            cp "$d/libasound-guest.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libasound.so.2"
+            cp "$d/libvulkan-guest.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+            cp "$d/libdrm-guest.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libdrm.so.2"
+            cp "$d/libwayland-client-guest.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libwayland-client.so.0.20.0"
+            cp "$d/libGL-guest.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libGL.so.1"
+            cp "$d/libEGL-guest.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libEGL.so.1"
+          }
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          for variant in stock nodelete; do
+            install_set "$variant"
+            set +e
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" \
+              "$FEX" /opt/fex-ci/rssprobe "$variant" > "$R/${variant}.out" 2> "$R/${variant}.err"
+            rc=$?
+            set -e
+            echo "$rc" | tee "$R/${variant}.exit"
+            cat "$R/${variant}.err"
+            test "$rc" -eq 0
+            grep -q "RSS_AB_PROBE_OK mode=${variant}" "$R/${variant}.err"
+          done
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          out = []
+          for variant in ('stock', 'nodelete'):
+              text = Path(f'receipts/{variant}.err').read_text()
+              snaps = {}
+              for m in re.finditer(r'^SNAP (\S+) rss_kb=(\d+) pss_kb=(\d+) private_clean_kb=(\d+) private_dirty_kb=(\d+) shared_clean_kb=(\d+) shared_dirty_kb=(\d+) thunk_map_bytes=(\d+) thunk_map_count=(\d+)$', text, re.M):
+                  snaps[m.group(1)] = tuple(map(int, m.groups()[1:]))
+              if {'baseline','loaded','after_close'} - snaps.keys():
+                  raise SystemExit(f'missing snapshots for {variant}: {snaps.keys()}')
+              b, l, a = snaps['baseline'], snaps['loaded'], snaps['after_close']
+              out.append(f'{variant.upper()}_AFTER_MINUS_BASE_RSS_KB={a[0]-b[0]}')
+              out.append(f'{variant.upper()}_AFTER_MINUS_BASE_PSS_KB={a[1]-b[1]}')
+              out.append(f'{variant.upper()}_AFTER_THUNK_MAP_BYTES={a[6]}')
+              out.append(f'{variant.upper()}_AFTER_THUNK_MAP_COUNT={a[7]}')
+          vals = dict(line.split('=', 1) for line in out)
+          out.append(f"NODELETE_MINUS_STOCK_AFTER_RSS_KB={int(vals['NODELETE_AFTER_MINUS_BASE_RSS_KB'])-int(vals['STOCK_AFTER_MINUS_BASE_RSS_KB'])}")
+          out.append(f"NODELETE_MINUS_STOCK_AFTER_PSS_KB={int(vals['NODELETE_AFTER_MINUS_BASE_PSS_KB'])-int(vals['STOCK_AFTER_MINUS_BASE_PSS_KB'])}")
+          Path('receipts/summary.txt').write_text('\n'.join(out) + '\n')
+          print('\n'.join(out))
+          PY
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodelete-rss-ab-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
