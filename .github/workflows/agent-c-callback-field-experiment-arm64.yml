@@ -11,7 +11,7 @@ permissions:
 
 env:
   FEX_SHA: ca9efc95c0657a4161e89f5b8388caed49d49705
-  FIELDWORK_SHA: 3e147eac0a82be073d662a2868f7d69f9883b0e4
+  FIELDWORK_SHA: 4c1f17faf90cda12e91b4ea94b1d376ad9ac1a8d
   DEBIAN_FRONTEND: noninteractive
   ROOTFS: ${{ github.workspace }}/rootfs-amd64
   HOST: ${{ github.workspace }}/host
@@ -59,22 +59,28 @@ jobs:
           echo "$LVP_ICD" | tee "$R/lvp-icd.txt"
           VK_DRIVER_FILES="$LVP_ICD" vulkaninfo --summary >"$R/native-vulkaninfo.out" 2>"$R/native-vulkaninfo.err"
 
-      - name: Build probes and native callback controls
+      - name: Build probes and native controls
         shell: bash
         run: |
           set -euxo pipefail
           CB=fieldwork/investigations/fex-vulkan-thunk-lifecycle/fex_vulkan_callback_probe.c
           FULL=fieldwork/investigations/fex-vulkan-thunk-lifecycle/instance_pnext_callback_full_integrity_probe.c
+          RO=fieldwork/investigations/fex-vulkan-thunk-lifecycle/readonly_full_callback_chain_probe.c
           INC=-Isrc/External/Vulkan-Headers/include
           cc -O2 -g -Wall -Wextra -Werror "$CB" -ldl -o /tmp/callback-arm64
           x86_64-linux-gnu-gcc -O2 -g -Wall -Wextra -Werror "$CB" -ldl -o /tmp/callback-x86_64
           x86_64-linux-gnu-gcc -O2 -g -std=gnu11 -Wall -Wextra -Werror $INC "$FULL" -ldl -o /tmp/full-integrity-x86_64
-          file /tmp/callback-arm64 /tmp/callback-x86_64 /tmp/full-integrity-x86_64 | tee "$R/probes.file.txt"
+          cc -O2 -g -std=gnu11 -Wall -Wextra -Werror $INC "$RO" -ldl -o /tmp/readonly-full-arm64
+          x86_64-linux-gnu-gcc -O2 -g -std=gnu11 -Wall -Wextra -Werror $INC "$RO" -ldl -o /tmp/readonly-full-x86_64
+          file /tmp/callback-arm64 /tmp/callback-x86_64 /tmp/full-integrity-x86_64 /tmp/readonly-full-arm64 /tmp/readonly-full-x86_64 | tee "$R/probes.file.txt"
           LVP_ICD="$(cat "$R/lvp-icd.txt")"
           VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 report gipa positive >"$R/native-report.out" 2>"$R/native-report.err"
           VK_DRIVER_FILES="$LVP_ICD" /tmp/callback-arm64 utils gipa positive >"$R/native-utils.out" 2>"$R/native-utils.err"
           grep -q '^PROBE_FINISH callback_count=[1-9][0-9]* status=0' "$R/native-report.err"
           grep -q '^PROBE_FINISH callback_count=[1-9][0-9]* status=0' "$R/native-utils.err"
+          VK_DRIVER_FILES="$LVP_ICD" /tmp/readonly-full-arm64 >"$R/native-readonly.out" 2>"$R/native-readonly.err"
+          grep -q '^RO_FULL create-return .*pnext_same=1 callbacks_same=1 users_same=1' "$R/native-readonly.err"
+          grep -q '^RO_FULL return unchanged=1' "$R/native-readonly.err"
 
       - name: Build focused experiment Vulkan thunk pair
         shell: bash
@@ -115,6 +121,7 @@ jobs:
           sudo mkdir -p "$ROOTFS/usr/local/bin"
           sudo install -m755 /tmp/callback-x86_64 "$ROOTFS/usr/local/bin/callback-probe"
           sudo install -m755 /tmp/full-integrity-x86_64 "$ROOTFS/usr/local/bin/full-integrity-probe"
+          sudo install -m755 /tmp/readonly-full-x86_64 "$ROOTFS/usr/local/bin/readonly-full-probe"
           X11="$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
           for sym in XSync XGetVisualInfo XDisplayString; do
             x86_64-linux-gnu-readelf -Ws "$X11" | grep -E " ${sym}(@|$)" | head -1
@@ -139,7 +146,7 @@ jobs:
           run_case utils-gipa utils gipa
           printf 'report-direct=0\nreport-gipa=0\nutils-direct=0\nutils-gipa=0\n' | tee "$R/callback-summary.txt"
 
-      - name: Run full guest-input integrity probe
+      - name: Run full after-call integrity probe
         shell: bash
         run: |
           set -euxo pipefail
@@ -154,15 +161,34 @@ jobs:
           ! grep -q '^UNEXPECTED_' "$R/full.err"
           printf 'full_integrity_exit=0\npnext_same=1\ncallbacks_same=1\nusers_same=1\nguest_callbacks=0\n' | tee "$R/full-summary.txt"
 
+      - name: Run fully read-only callback chain through FEX
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          set +e
+          timeout 90s env VK_DRIVER_FILES="$LVP_ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+            "$FEX" /usr/local/bin/readonly-full-probe >"$R/fex-readonly.out" 2>"$R/fex-readonly.err"
+          status=$?
+          set -e
+          echo "$status" | tee "$R/fex-readonly.exit"
+          cat "$R/fex-readonly.err"
+          test "$status" -eq 0
+          grep -q '^RO_FULL create-return .*pnext_same=1 callbacks_same=1 users_same=1' "$R/fex-readonly.err"
+          grep -q '^RO_FULL return unchanged=1' "$R/fex-readonly.err"
+          printf 'readonly_full_exit=0\nreadonly_full_chain=pass\n' | tee "$R/readonly-summary.txt"
+
       - name: Final summary
         shell: bash
         run: |
           set -euxo pipefail
-          cat "$R/callback-summary.txt" "$R/full-summary.txt"
+          cat "$R/callback-summary.txt" "$R/full-summary.txt" "$R/readonly-summary.txt"
           cat >"$R/final-summary.txt" <<EOF
           candidate=$FEX_SHA
           callback_matrix=pass
           full_after_call_integrity=pass
+          fully_readonly_chain=pass
           pnext_same=1
           callbacks_same=1
           users_same=1
