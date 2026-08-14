@@ -5,7 +5,7 @@
 
 static volatile unsigned callback_count;
 
-static PFN_vkVoidFunction VKAPI_PTR direct_gipa_body(VkInstance instance, const char *name) {
+__attribute__((used,noinline)) static PFN_vkVoidFunction VKAPI_PTR direct_gipa_body(VkInstance instance, const char *name) {
   (void)instance;
   ++callback_count;
   fprintf(stderr, "CALLBACK direct-driver count=%u name=%s\n", callback_count, name ? name : "(null)");
