@@ -124,13 +124,13 @@ jobs:
                 emit->_AtomicFetchAdd(IR::OpSize::i64Bit, emit->Constant(1), ActiveAddr);
 
                 auto Target = emit->_LoadMemGPR(IR::OpSize::i64Bit, emit->Constant(reinterpret_cast<uintptr_t>(&Slot->Target)));
-                auto GuestRSP = emit->_LoadRegister(GPRSize, X86State::REG_RSP, IR::RegClass::GPR);
+                auto GuestRSP = emit->_LoadRegister(X86State::REG_RSP, IR::RegClass::GPR, GPRSize);
                 auto CallerRIP = emit->_LoadMemGPR(GPRSize, GuestRSP);
                 emit->_ExitFunction(IR::OpSize::i64Bit, Target, IR::BranchHint::Call, CallerRIP, Epilogue);
 
                 emit->SetCurrentCodeBlock(Epilogue);
                 emit->_AtomicFetchSub(IR::OpSize::i64Bit, emit->Constant(1), ActiveAddr);
-                auto GuestRSPAfter = emit->_LoadRegister(GPRSize, X86State::REG_RSP, IR::RegClass::GPR);
+                auto GuestRSPAfter = emit->_LoadRegister(X86State::REG_RSP, IR::RegClass::GPR, GPRSize);
                 auto ReturnAddressLocation = emit->Sub(GPRSize, GuestRSPAfter, GuestPointerSize);
                 auto ReturnRIP = emit->_LoadMemGPR(GPRSize, ReturnAddressLocation);
                 emit->_ExitFunction(GPRSize, ReturnRIP, IR::BranchHint::None, emit->Invalid(), emit->Invalid());
@@ -154,7 +154,7 @@ jobs:
             -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
             -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
             -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake.log" 2>&1
-          cmake --build build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build.log" 2>&1
+          cmake --build build --target FEX FEXServer -- -j"$(nproc)" -v > "$R/build.log" 2>&1 || { tail -n 200 "$R/build.log"; exit 1; }
           cd /tmp/repro/fex-full-thunk-pair
           make clean
           make HOST_CXX=g++ GUEST_CXX=x86_64-linux-gnu-g++ > "$R/fixture-build.log" 2>&1
