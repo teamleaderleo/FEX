@@ -142,8 +142,10 @@ public:
 
   FEX_DEFAULT_VISIBILITY virtual void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) = 0;
   FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
+  FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeEntry(uint64_t Address) = 0;
   FEX_DEFAULT_VISIBILITY virtual void
   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
+  FEX_DEFAULT_VISIBILITY virtual void InvalidateThreadCachedCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) = 0;
   FEX_DEFAULT_VISIBILITY virtual FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() = 0;
 
   FEX_DEFAULT_VISIBILITY virtual void
@@ -182,6 +184,11 @@ public:
    * @param GuestThunkEntrypoint The thunk entrypoint that the IR handler will redirect to.
    */
   FEX_DEFAULT_VISIBILITY virtual void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) = 0;
+  FEX_DEFAULT_VISIBILITY virtual void RetireThunkTrampolineIRHandler(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) = 0;
+  FEX_DEFAULT_VISIBILITY virtual void ActivateThunkTrampolineIRHandler(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint,
+                                                                       uintptr_t GuestThunkEntrypoint) = 0;
+  FEX_DEFAULT_VISIBILITY virtual bool RemoveThunkTrampolineIRHandlerDefinition(uintptr_t Entrypoint) = 0;
+  FEX_DEFAULT_VISIBILITY virtual void AddRevokedThunkTrampolineIRHandlerDefinition(uintptr_t Entrypoint) = 0;
 
   /**
    * @brief Adds additional per-instruction granularity TSO enable/disable information for the given range.

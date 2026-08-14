@@ -209,6 +209,35 @@ if (BITNESS EQUAL 64)
   target_include_directories_from_pkgconfig(libvulkan-guest-deps "xcb;x11;xrandr;xrender")
   add_guest_lib(vulkan "libvulkan.so.1")
 
+  if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(VULKAN_BRIDGE_THUNKS "${CMAKE_CURRENT_BINARY_DIR}/gen/vulkan_bridge_thunks.inl")
+    set(VULKAN_BRIDGE_SYMBOLS "${CMAKE_CURRENT_BINARY_DIR}/gen/vulkan_bridge_symbols.inl")
+    add_custom_command(
+      OUTPUT "${VULKAN_BRIDGE_THUNKS}" "${VULKAN_BRIDGE_SYMBOLS}"
+      DEPENDS ${GEN_libvulkan}
+              "${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/ExtractBridgeThunks.py"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/ExtractBridgeSymbols.py"
+      COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/ExtractBridgeThunks.py"
+              "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libvulkan.inl" "${VULKAN_BRIDGE_THUNKS}"
+      COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/ExtractBridgeSymbols.py"
+              "${CMAKE_CURRENT_BINARY_DIR}/gen/thunkgen_guest_libvulkan.inl" "${VULKAN_BRIDGE_SYMBOLS}"
+      VERBATIM)
+    add_library(vulkan-bridge-guest SHARED
+      "${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/GuestBridge.cpp"
+      "${VULKAN_BRIDGE_THUNKS}"
+      "${VULKAN_BRIDGE_SYMBOLS}")
+    set_source_files_properties("${VULKAN_BRIDGE_THUNKS}" "${VULKAN_BRIDGE_SYMBOLS}" PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
+    target_include_directories(vulkan-bridge-guest PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen/")
+    target_compile_definitions(vulkan-bridge-guest PRIVATE GUEST_THUNK_LIBRARY)
+    target_link_libraries(vulkan-bridge-guest PRIVATE libvulkan-guest-deps)
+    target_compile_options(vulkan-bridge-guest PRIVATE -fwrapv -msse2 -mfpmath=sse)
+    target_link_options(vulkan-bridge-guest PRIVATE "LINKER:-z,nodelete")
+    set_target_properties(vulkan-bridge-guest PROPERTIES OUTPUT_NAME "fex-vulkan-bridge")
+    target_link_libraries(vulkan-guest PRIVATE vulkan-bridge-guest)
+    target_link_options(vulkan-guest PRIVATE "LINKER:-rpath,$ORIGIN")
+    install(TARGETS vulkan-bridge-guest DESTINATION ${DATA_DIRECTORY}/GuestThunks/)
+  endif()
+
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories_from_pkgconfig(libdrm-guest-deps libdrm /usr/include/drm /usr/include/libdrm)
   add_guest_lib(drm "libdrm.so.2")

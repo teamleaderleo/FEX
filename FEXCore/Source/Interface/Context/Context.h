@@ -219,7 +219,9 @@ public:
   void OnCodeBufferAllocated(const std::shared_ptr<CPU::CodeBuffer>&) override;
   void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) override;
   void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+  void InvalidateCodeBuffersCodeEntry(uint64_t Address) override;
   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
+  void InvalidateThreadCachedCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override;
   FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() override {
     return CodeInvalidationMutex;
   }
@@ -233,6 +235,11 @@ public:
   AddCustomIREntrypoint(uintptr_t Entrypoint, CustomIREntrypointHandler Handler, void* Creator = nullptr, void* Data = nullptr);
 
   void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) override;
+  void RetireThunkTrampolineIRHandler(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) override;
+  void ActivateThunkTrampolineIRHandler(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint,
+                                        uintptr_t GuestThunkEntrypoint) override;
+  bool RemoveThunkTrampolineIRHandlerDefinition(uintptr_t Entrypoint) override;
+  void AddRevokedThunkTrampolineIRHandlerDefinition(uintptr_t Entrypoint) override;
 
   void AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) override;
 

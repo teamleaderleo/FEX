@@ -122,6 +122,11 @@ struct GuestToHostMap {
     return BlockList.erase(Address) != 0;
   }
 
+  bool InvalidateExactEntry(uint64_t Address) {
+    auto lk = AcquireWriteLock();
+    return Erase(Address, lk);
+  }
+
   void InvalidateRange(uint64_t Start, uint64_t Length) {
     auto lk = AcquireWriteLock();
 
@@ -327,6 +332,11 @@ public:
       BlockPointers[PageOffset].GuestCode = 0;
       BlockPointers[PageOffset].HostCode = 0;
     }
+  }
+
+  void InvalidateExactEntry(uint64_t Address) {
+    auto lk = Shared->AcquireWriteLock();
+    InvalidateCache(Address, lk);
   }
 
   // Invalidates all L1/L2 entries for all guest block that intersect the given range

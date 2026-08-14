@@ -231,6 +231,13 @@ public:
   uint64_t GuestMremap(bool Is64Bit, FEXCore::Core::InternalThreadState*, void* old_address, size_t old_size, size_t new_size, int flags,
                        void* new_address);
   uint64_t GuestMprotect(FEXCore::Core::InternalThreadState*, void* addr, size_t len, int prot);
+  void InvalidateGuestCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override { TM.InvalidateGuestCodeEntry(Thread, Address); }
+  void RetireThunkTrampolineEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
+    TM.RetireThunkTrampolineEntry(Thread, Address);
+  }
+  void ActivateThunkTrampolineEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t GuestTarget) override {
+    TM.ActivateThunkTrampolineEntry(Thread, Address, GuestTarget);
+  }
   uint64_t GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadState*, int shmid, const void* shmaddr, int shmflg);
   uint64_t GuestShmdt(bool Is64Bit, FEXCore::Core::InternalThreadState*, const void* shmaddr);
 

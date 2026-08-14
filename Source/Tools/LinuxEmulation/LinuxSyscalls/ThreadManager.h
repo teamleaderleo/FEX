@@ -215,6 +215,39 @@ public:
     ++IdleWaitRefCount;
   }
 
+  void InvalidateGuestCodeEntry(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Address) {
+    std::lock_guard lk(ThreadCreationMutex);
+    auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), CallingThread);
+    CTX->InvalidateCodeBuffersCodeEntry(Address);
+    for (auto& Thread : Threads) CTX->InvalidateThreadCachedCodeEntry(Thread->Thread, Address);
+  }
+
+  void RetireThunkTrampolineEntry(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Address) {
+    // Freeze thread-list changes, then exclude compilation/code mutation before
+    // changing the synthetic definition and every compiled copy of this key.
+    std::lock_guard lk(ThreadCreationMutex);
+    auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), CallingThread);
+    CTX->RemoveThunkTrampolineIRHandlerDefinition(Address);
+    CTX->InvalidateCodeBuffersCodeEntry(Address);
+    for (auto& Thread : Threads) {
+      CTX->InvalidateThreadCachedCodeEntry(Thread->Thread, Address);
+    }
+    CTX->AddRevokedThunkTrampolineIRHandlerDefinition(Address);
+  }
+
+  void ActivateThunkTrampolineEntry(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Address, uint64_t GuestTarget) {
+    // Reactivation uses the same transaction so a compiled revoked handler (or
+    // any prior active generation) cannot survive the state transition.
+    std::lock_guard lk(ThreadCreationMutex);
+    auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), CallingThread);
+    CTX->RemoveThunkTrampolineIRHandlerDefinition(Address);
+    CTX->InvalidateCodeBuffersCodeEntry(Address);
+    for (auto& Thread : Threads) {
+      CTX->InvalidateThreadCachedCodeEntry(Thread->Thread, Address);
+    }
+    CTX->AddThunkTrampolineIRHandler(Address, GuestTarget);
+  }
+
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
     std::lock_guard lk(ThreadCreationMutex);
 
