@@ -10,6 +10,15 @@ on:
       - .github/fieldwork/apply_thunkgen_bridge_roles.py
       - .github/fieldwork/apply_thunkgen_bridge_roles_compat.py
       - .github/workflows/gl-direct-helper-build.yml
+  pull_request:
+    branches: [diagnostic/gl-direct-helper-f3ab-20260814]
+    paths:
+      - LinuxFieldwork/apply_per_library_guest_bridge_helper.py
+      - LinuxFieldwork/apply_gl_helper_direct_bridge.py
+      - .github/fieldwork/apply_thunkgen_guest_bridge_output.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles_compat.py
+      - .github/workflows/gl-direct-helper-build.yml
   workflow_dispatch:
 permissions:
   contents: read
