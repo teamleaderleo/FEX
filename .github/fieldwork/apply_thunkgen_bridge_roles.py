@@ -17,6 +17,7 @@ def main() -> None:
     root = Path(sys.argv[1]).resolve()
     analysis_h = root / "ThunkLibs/Generator/analysis.h"
     analysis_cpp = root / "ThunkLibs/Generator/analysis.cpp"
+    data_layout_cpp = root / "ThunkLibs/Generator/data_layout.cpp"
     gen_cpp = root / "ThunkLibs/Generator/gen.cpp"
 
     replace_once(
@@ -40,6 +41,12 @@ def main() -> None:
         '''            thunked_funcptrs[emitted_function->getNameAsString()] =\n              std::pair {context.getCanonicalType(emitted_function->getFunctionType()), data.param_annotations};\n''',
         '''            thunked_funcptrs[emitted_function->getNameAsString()] =\n              {context.getCanonicalType(emitted_function->getFunctionType()), data.param_annotations, true, false};\n''',
         "indirect call registration")
+
+    replace_once(
+        data_layout_cpp,
+        '''    auto& [type, param_annotations] = funcptr_type_it->second;\n    auto func_type = type->getAs<clang::FunctionProtoType>();\n''',
+        '''    auto& funcptr_info = funcptr_type_it->second;\n    auto* type = funcptr_info.type;\n    auto& param_annotations = funcptr_info.param_annotations;\n    auto func_type = type->getAs<clang::FunctionProtoType>();\n''',
+        "data_layout.cpp function-pointer record")
 
     text = gen_cpp.read_text()
     old = "auto* type = type_it->second.first;"
