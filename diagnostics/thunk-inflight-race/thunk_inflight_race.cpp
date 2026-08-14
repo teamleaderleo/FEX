@@ -16,6 +16,7 @@
 namespace {
 constexpr uintptr_t SyntheticH = 0x0000700000020000ULL;
 constexpr const char* ArmPath = "/tmp/fex-thunk-inflight-arm";
+constexpr const char* TargetPath = "/tmp/fex-thunk-inflight-target";
 constexpr const char* SelectedPath = "/tmp/fex-thunk-inflight-selected";
 constexpr const char* ResumePath = "/tmp/fex-thunk-inflight-resume";
 
@@ -24,29 +25,41 @@ std::atomic<int> WorkerValue {-1};
 
 void EmitReturn(void* Page, uint32_t Value) {
   auto* Code = static_cast<unsigned char*>(Page);
-  // mov eax, imm32 ; ret
   Code[0] = 0xB8;
   std::memcpy(&Code[1], &Value, sizeof(Value));
   Code[5] = 0xC3;
   __builtin___clear_cache(reinterpret_cast<char*>(Page), reinterpret_cast<char*>(Page) + 6);
 }
 
-bool Touch(const char* Path) {
+bool WriteMarker(const char* Path, const char* Data, size_t Length) {
   const int FD = ::open(Path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
   if (FD < 0) {
-    std::fprintf(stderr, "INFLIGHT touch %s failed errno=%d (%s)\n", Path, errno, std::strerror(errno));
+    std::fprintf(stderr, "INFLIGHT open %s failed errno=%d (%s)\n", Path, errno, std::strerror(errno));
     return false;
   }
-  static constexpr char Marker[] = "go\n";
-  const ssize_t Written = ::write(FD, Marker, sizeof(Marker) - 1);
+  const ssize_t Written = ::write(FD, Data, Length);
   const int SavedErrno = errno;
   (void)::close(FD);
-  if (Written != static_cast<ssize_t>(sizeof(Marker) - 1)) {
+  if (Written != static_cast<ssize_t>(Length)) {
     std::fprintf(stderr, "INFLIGHT write %s failed written=%zd errno=%d (%s)\n",
                  Path, Written, SavedErrno, std::strerror(SavedErrno));
     return false;
   }
   return true;
+}
+
+bool Touch(const char* Path) {
+  static constexpr char Marker[] = "go\n";
+  return WriteMarker(Path, Marker, sizeof(Marker) - 1);
+}
+
+bool PublishTarget(uintptr_t Target) {
+  char Buffer[32] {};
+  const int Length = std::snprintf(Buffer, sizeof(Buffer), "%lx\n", Target);
+  if (Length <= 0 || static_cast<size_t>(Length) >= sizeof(Buffer)) {
+    return false;
+  }
+  return WriteMarker(TargetPath, Buffer, static_cast<size_t>(Length));
 }
 
 bool WaitFor(const char* Path) {
@@ -72,6 +85,7 @@ void* WorkerMain(void*) {
 int main() {
   setvbuf(stderr, nullptr, _IONBF, 0);
   (void)::unlink(ArmPath);
+  (void)::unlink(TargetPath);
   (void)::unlink(SelectedPath);
   (void)::unlink(ResumePath);
 
@@ -102,20 +116,25 @@ int main() {
     return 5;
   }
 
-  if (!Touch(ArmPath)) {
+  if (!PublishTarget(reinterpret_cast<uintptr_t>(Target))) {
     return 6;
   }
+  if (!Touch(ArmPath)) {
+    return 7;
+  }
+  std::fprintf(stderr, "INFLIGHT armed H=%p T=%p stage=before-target-selection\n",
+               reinterpret_cast<void*>(SyntheticH), Target);
 
   pthread_t Worker {};
   if (::pthread_create(&Worker, nullptr, WorkerMain, nullptr) != 0) {
     std::fprintf(stderr, "INFLIGHT pthread_create failed\n");
-    return 7;
+    return 8;
   }
 
   if (!WaitFor(SelectedPath)) {
-    return 8;
+    return 9;
   }
-  std::fprintf(stderr, "INFLIGHT selected-before-retire H=%p T=%p\n",
+  std::fprintf(stderr, "INFLIGHT old-H-redirect-pending H=%p T=%p\n",
                reinterpret_cast<void*>(SyntheticH), Target);
 
   void* Replacement = ::mmap(Target, PageSize, PROT_READ | PROT_WRITE,
@@ -123,33 +142,31 @@ int main() {
   if (Replacement == MAP_FAILED || Replacement != Target) {
     std::fprintf(stderr, "INFLIGHT MAP_FIXED failed result=%p errno=%d (%s)\n",
                  Replacement, errno, std::strerror(errno));
-    return 9;
+    return 10;
   }
   EmitReturn(Target, 222);
   if (::mprotect(Target, PageSize, PROT_READ | PROT_EXEC) != 0) {
     std::fprintf(stderr, "INFLIGHT replacement mprotect failed errno=%d (%s)\n", errno, std::strerror(errno));
-    return 10;
+    return 11;
   }
   std::fprintf(stderr, "INFLIGHT replacement-committed H=%p T=%p generation=2 sentinel=222\n",
                reinterpret_cast<void*>(SyntheticH), Target);
 
   if (!Touch(ResumePath)) {
-    return 11;
+    return 12;
   }
   if (::pthread_join(Worker, nullptr) != 0) {
     std::fprintf(stderr, "INFLIGHT pthread_join failed\n");
-    return 12;
+    return 13;
   }
 
   const int Result = WorkerValue.load(std::memory_order_acquire);
   std::fprintf(stderr, "INFLIGHT final worker-value=%d reregister=0\n", Result);
 
   (void)::unlink(ArmPath);
+  (void)::unlink(TargetPath);
   (void)::unlink(SelectedPath);
   (void)::unlink(ResumePath);
 
-  // This diagnostic lane is expected to expose the current in-flight gap:
-  // the worker selected old compiled H before retirement, then executes it
-  // after T has become a new owner generation and reaches sentinel 222.
-  return Result == 222 ? 0 : 13;
+  return Result == 222 ? 0 : 14;
 }
