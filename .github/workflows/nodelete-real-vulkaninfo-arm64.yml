@@ -161,6 +161,7 @@ jobs:
           test -x "$ROOTFS/usr/bin/vulkaninfo"
           file "$ROOTFS/usr/bin/vulkaninfo" | tee "$R/x86-vulkaninfo.file"
           mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu"
+          sudo chown -R "$(id -u):$(id -g)" "$ROOTFS"
 
       - name: Run normal and NODELETE x86 vulkaninfo teardown
         shell: bash
