@@ -58,7 +58,36 @@ jobs:
         run: python3 owner-helper/.github/fieldwork/add_owner_claim_identity.py src
       - name: Upgrade callback tombstone to descriptor
         run: python3 .github/fieldwork/add_callback_descriptor_after_tombstone.py src
-      - name: Apply callback owner-generation lease
+      - name: Attempt callback owner-generation lease
+        continue-on-error: true
         run: python3 .github/fieldwork/add_callback_owner_generation_lease.py src
+      - name: Check owner descriptor phase
+        if: always()
+        run: grep -q 'struct GuestCallbackOwnerGeneration' src/Source/Tools/LinuxEmulation/Thunks.cpp
+      - name: Check owner registry phase
+        if: always()
+        run: grep -q 'CallbackOwnerGenerations' src/Source/Tools/LinuxEmulation/Thunks.cpp
+      - name: Check bool retire declaration phase
+        if: always()
+        run: grep -q 'bool RetireGuestRange(FEXCore::Core::InternalThreadState' src/Source/Tools/LinuxEmulation/Thunks.cpp
+      - name: Check owner dispatcher phase
+        if: always()
+        run: grep -q 'DIAG_CALLBACK_OWNER_ACQUIRE' src/Source/Tools/LinuxEmulation/Thunks.cpp
+      - name: Check owner query phase
+        if: always()
+        run: grep -q 'UnpackerOwnerID' src/Source/Tools/LinuxEmulation/Thunks.cpp
+      - name: Check owner allocation phase
+        if: always()
+        run: grep -q 'DIAG_CALLBACK_OWNER_CREATE' src/Source/Tools/LinuxEmulation/Thunks.cpp
+      - name: Check retire definition phase
+        if: always()
+        run: grep -q 'const uint64_t RetiringOwnerID' src/Source/Tools/LinuxEmulation/Thunks.cpp
+      - name: Check owner retirement phase
+        if: always()
+        run: grep -q 'DIAG_CALLBACK_OWNER_RETIRE' src/Source/Tools/LinuxEmulation/Thunks.cpp
+      - name: Check deferred GuestMunmap phase
+        if: always()
+        run: grep -q 'DIAG_CALLBACK_OWNER_DEFER_HOST_UNMAP' src/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
       - name: Diff check
+        if: always()
         run: git -C src diff --check
