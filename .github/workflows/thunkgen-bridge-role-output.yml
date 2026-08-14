@@ -1,0 +1,123 @@
+name: Thunkgen bridge caller/unpacker roles
+
+on:
+  push:
+    branches: [diagnostic/thunkgen-bridge-role-output-20260814]
+    paths:
+      - .github/fieldwork/apply_thunkgen_guest_bridge_output.py
+      - .github/fieldwork/apply_thunkgen_bridge_roles.py
+      - .github/fieldwork/apply_vulkan_direct_thunkgen_bridge.py
+      - .github/workflows/thunkgen-bridge-role-output.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  role-output:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      R: ${{ github.workspace }}/role-receipts
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies and source transforms
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers
+          python3 .github/fieldwork/apply_thunkgen_guest_bridge_output.py .
+          python3 .github/fieldwork/apply_thunkgen_bridge_roles.py .
+          python3 .github/fieldwork/apply_vulkan_direct_thunkgen_bridge.py .
+          git diff --check
+          git diff -- ThunkLibs/Generator ThunkLibs/GuestLibs/CMakeLists.txt ThunkLibs/libvulkan \
+            > "$R/source.diff"
+
+      - name: Build thunkgen and role-aware guest bridge outputs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-host.log" 2>&1
+          cmake --build build --target thunkgen -- -j"$(nproc)" -v \
+            > "$R/build-thunkgen.log" 2>&1 || { tail -n 300 "$R/build-thunkgen.log"; exit 1; }
+
+          cmake -S ThunkLibs/GuestLibs -B guest -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest --target libGL-guest-bridge-gen libvulkan-guest-bridge-gen vulkan-bridge-guest -- -j"$(nproc)" -v \
+            > "$R/build-guest.log" 2>&1 || { tail -n 320 "$R/build-guest.log"; exit 1; }
+
+      - name: Validate role separation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f guest/gen/thunkgen_bridge_libGL.inl
+          test -f guest/gen/thunkgen_bridge_libvulkan.inl
+          cp guest/gen/thunkgen_bridge_libGL.inl "$R/gl-bridge.inl"
+          cp guest/gen/thunkgen_bridge_libvulkan.inl "$R/vulkan-bridge.inl"
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          def inspect(path):
+              text=Path(path).read_text()
+              roles=[]
+              for m in re.finditer(r'FEX_BRIDGE_ROLE index=(\d+) caller=(\d) unpacker=(\d) (.*)', text):
+                  idx=int(m.group(1)); caller=int(m.group(2)); unpacker=int(m.group(3)); sig=m.group(4)
+                  roles.append((idx,caller,unpacker,sig))
+                  has_unpacker=f'fex_bridge_unpacker_{idx}()' in text
+                  if unpacker != has_unpacker:
+                      raise AssertionError((idx,unpacker,has_unpacker,sig))
+                  has_caller=f'MAKE_CALLBACK_THUNK(callback_{idx},' in text
+                  if caller != has_caller:
+                      raise AssertionError((idx,caller,has_caller,sig))
+              if not roles:
+                  raise AssertionError(f'no role records in {path}')
+              return roles
+
+          gl=inspect('guest/gen/thunkgen_bridge_libGL.inl')
+          vk=inspect('guest/gen/thunkgen_bridge_libvulkan.inl')
+          caller_only=[r for r in gl if r[1] and not r[2]]
+          if not caller_only:
+              raise AssertionError('GL produced no caller-only signatures')
+          summary=[f'gl_total={len(gl)}',f'gl_caller_only={len(caller_only)}',
+                   f'gl_unpacker_only={sum((not c) and u for _,c,u,_ in gl)}',
+                   f'gl_both={sum(c and u for _,c,u,_ in gl)}',
+                   f'vulkan_total={len(vk)}',f'vulkan_caller_only={sum(c and not u for _,c,u,_ in vk)}',
+                   f'vulkan_unpacker_only={sum((not c) and u for _,c,u,_ in vk)}',
+                   f'vulkan_both={sum(c and u for _,c,u,_ in vk)}']
+          Path('role-receipts/role-summary.txt').write_text('\n'.join(summary)+'\n')
+          Path('role-receipts/gl-caller-only.txt').write_text('\n'.join(f'{i}: {s}' for i,c,u,s in caller_only)+'\n')
+          print('\n'.join(summary))
+          PY
+          readelf -d guest/libfex-vulkan-bridge.so | tee "$R/vulkan-bridge.dynamic"
+          grep -q 'FLAGS_1.*NODELETE' "$R/vulkan-bridge.dynamic"
+          echo THUNKGEN_BRIDGE_ROLES_OK
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunkgen-bridge-roles-${{ github.run_id }}
+          path: role-receipts
+          retention-days: 30
