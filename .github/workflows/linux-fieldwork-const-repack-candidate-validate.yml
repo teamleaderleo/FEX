@@ -1,0 +1,104 @@
+name: Validate clean const repack candidate
+on:
+  workflow_dispatch:
+  push:
+    branches: [linux-fieldwork/vulkan-procaddr-native-first-experiment]
+    paths:
+      - .github/workflows/linux-fieldwork-const-repack-candidate-validate.yml
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    env:
+      CANDIDATE_SHA: 715ff36bff2fd9f2353ab31613dc41ae106f3938
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: carrier
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: product
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build nasm clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev libvulkan-dev mesa-vulkan-drivers
+      - name: Apply Vulkan allocator mediation only
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          python3 ../carrier/LINUX_FIELDWORK_ALLOCATOR_TRAMPOLINE.py
+          git diff --check
+      - name: Build focused regression
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=ON -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/
+          cmake --build build --target thunkgentest -- -j"$(nproc)"
+          build/Bin/thunkgentest "StructRepacking"
+      - name: Build FEX and Vulkan thunks
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_x86_64.cmake" -DFEX_PROJECT_SOURCE_DIR="$PWD" -DGENERATOR_EXE="$PWD/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)"
+      - name: Prepare rootfs and probes
+        run: |
+          set -euxo pipefail
+          mkdir -p receipts
+          docker pull --platform=linux/amd64 ubuntu:24.04
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          mkdir rootfs-amd64
+          docker export "$cid" | tar -C rootfs-amd64 -xf -
+          docker rm "$cid"
+          mkdir -p rootfs-amd64/usr/lib/x86_64-linux-gnu rootfs-amd64/opt/fex-ci host-thunks
+          cp product/guest-build/libvulkan-guest.so rootfs-amd64/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+          cp product/build/HostLibs_64/libvulkan-host.so host-thunks/libvulkan-host.so
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o rootfs-amd64/usr/lib/x86_64-linux-gnu/libX11.so.6
+          cc -std=c11 -O0 -g -Wall -Wextra -Werror carrier/LINUX_FIELDWORK_ALLOCATOR_CROSSCALL_TRACE.c -ldl -lvulkan -o receipts/native-buffer
+          x86_64-linux-gnu-gcc -std=c11 -O0 -g -Wall -Wextra -Werror carrier/LINUX_FIELDWORK_ALLOCATOR_CROSSCALL_TRACE.c -ldl -o rootfs-amd64/opt/fex-ci/allocator-buffer
+          cc -std=c11 -O2 -Wall -Wextra -Werror carrier/LINUX_FIELDWORK_ALLOCATOR_EVENT_PROBE.c -ldl -lvulkan -o receipts/native-event
+          x86_64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror carrier/LINUX_FIELDWORK_ALLOCATOR_EVENT_PROBE.c -ldl -o rootfs-amd64/opt/fex-ci/allocator-event
+      - name: Execute candidate matrix
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          set +e
+          VK_DRIVER_FILES="$ICD" timeout 30s receipts/native-buffer >receipts/native-buffer.stdout 2>receipts/native-buffer.stderr
+          native_buffer_rc=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" timeout 30s product/build/Bin/FEX /opt/fex-ci/allocator-buffer >receipts/fex-buffer.stdout 2>receipts/fex-buffer.stderr
+          fex_buffer_rc=$?
+          VK_DRIVER_FILES="$ICD" timeout 30s receipts/native-event >receipts/native-event.stdout 2>receipts/native-event.stderr
+          native_event_rc=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-thunks" timeout 30s product/build/Bin/FEX /opt/fex-ci/allocator-event >receipts/fex-event.stdout 2>receipts/fex-event.stderr
+          fex_event_rc=$?
+          set -e
+          printf 'candidate=%s\nnative_buffer=%s\nfex_buffer=%s\nnative_event=%s\nfex_event=%s\n' "$CANDIDATE_SHA" "$native_buffer_rc" "$fex_buffer_rc" "$native_event_rc" "$fex_event_rc" | tee receipts/final-matrix.txt
+          printf '%s\n' '--- FEX buffer ---'; cat receipts/fex-buffer.stderr
+          printf '%s\n' '--- FEX event ---'; cat receipts/fex-event.stderr
+          test "$native_buffer_rc" -eq 0
+          test "$fex_buffer_rc" -eq 0
+          test "$native_event_rc" -eq 0
+          test "$fex_event_rc" -eq 0
+          grep -q 'CB_FREE_ENTER' receipts/fex-buffer.stderr
+          grep -q 'API_DESTROY_RETURN' receipts/fex-buffer.stderr
+          grep -q 'EVENT_FREE_ENTER' receipts/fex-event.stderr
+          grep -q 'EVENT_DESTROY_RETURN' receipts/fex-event.stderr
+          grep -q 'PASS event allocator lifetime' receipts/fex-event.stderr
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: const-repack-clean-candidate-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
