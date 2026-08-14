@@ -1,0 +1,32 @@
+name: GL split bridge source smoke
+
+on:
+  push:
+    branches: [ci/thunk-callback-descriptor-20260814]
+    paths:
+      - .github/fieldwork/apply_GL_split_bridge.py
+      - .github/workflows/GL-split-bridge-source-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  transform:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: 71afe476751deac24adabd1adb575fd2337b6e0a
+          path: src
+          fetch-depth: 1
+      - name: Apply GL split transformer
+        run: |
+          set -euxo pipefail
+          python3 .github/fieldwork/apply_GL_split_bridge.py src
+          git -C src diff --check
+          python3 -m py_compile src/ThunkLibs/libGL/ExtractBridgeThunks.py src/ThunkLibs/libGL/ExtractBridgeSymbols.py
+          grep -nE 'fex_GL_bridge|GL-bridge-guest|ExtractBridge' \
+            src/ThunkLibs/libGL/libGL_Guest.cpp src/ThunkLibs/libGL/GuestBridge.cpp src/ThunkLibs/GuestLibs/CMakeLists.txt
