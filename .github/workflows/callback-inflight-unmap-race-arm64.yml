@@ -2,7 +2,7 @@ name: Callback in-flight unmap race ARM64
 
 on:
   push:
-    branches: [ci/callback-inflight-unmap-race-20260814]
+    branches: [ci/callback-inflight-unmap-race-v2-20260814]
     paths:
       - .github/workflows/callback-inflight-unmap-race-arm64.yml
       - .github/fieldwork/apply_callback_inflight_pause.py
@@ -110,7 +110,9 @@ jobs:
           HOST="/tmp/repro/fex-full-thunk-pair/host"
           run_case() {
             name="$1"; arg="$2"
-            rm -f /tmp/fex-callback-race-arm /tmp/fex-callback-race-entered /tmp/fex-callback-race-release
+            rm -f "$ROOTFS/opt/fex-ci/full/fex-callback-race-arm" \
+                  "$ROOTFS/opt/fex-ci/full/fex-callback-race-entered" \
+                  "$ROOTFS/opt/fex-ci/full/fex-callback-race-release"
             set +e
             (cd "$ROOTFS/opt/fex-ci/full" && \
               FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
