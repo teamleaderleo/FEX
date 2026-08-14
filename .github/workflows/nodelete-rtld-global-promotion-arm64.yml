@@ -1,0 +1,175 @@
+name: NODELETE RTLD_GLOBAL promotion A/B
+
+on:
+  push:
+    branches: [diagnostic/nodelete-rtld-global-promotion-20260814]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  promote-ab:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      ROOTFS: ${{ github.workspace }}/rootfs
+      R: ${{ github.workspace }}/receipts
+      H: ${{ github.workspace }}/host
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$H"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxrandr-dev libxrender-dev binutils
+          git rev-parse HEAD | tee "$R/fex-sha.txt"
+
+      - name: Build FEX and GL host thunk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "$R/cmake-host.log" 2>&1
+          cmake --build build --target FEXServer GL-host-64 -- -j"$(nproc)" -v > "$R/build-host.log" 2>&1 || { tail -n 300 "$R/build-host.log"; exit 1; }
+          cp build/HostLibs_64/libGL-host.so "$H/libGL-host.so"
+
+      - name: Build stock and NODELETE GL guests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('ThunkLibs/GuestLibs/CMakeLists.txt')
+          s=p.read_text()
+          block='''  if (TARGET_TYPE STREQUAL "SHARED")\n    target_link_options(${NAME}-guest PRIVATE "LINKER:-z,nodelete")\n  endif()\n'''
+          if s.count(block) != 1: raise SystemExit('NODELETE block mismatch')
+          p.write_text(s.replace(block,'',1))
+          PY
+          cmake -S ThunkLibs/GuestLibs -B guest-stock -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-stock.log" 2>&1
+          cmake --build guest-stock --target GL-guest -- -j"$(nproc)" -v > "$R/build-stock.log" 2>&1
+          git checkout -- ThunkLibs/GuestLibs/CMakeLists.txt
+          cmake -S ThunkLibs/GuestLibs -B guest-nodelete -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ > "$R/cmake-nodelete.log" 2>&1
+          cmake --build guest-nodelete --target GL-guest -- -j"$(nproc)" -v > "$R/build-nodelete.log" 2>&1
+          ! readelf -d guest-stock/libGL-guest.so | grep -q 'FLAGS_1.*NODELETE'
+          readelf -d guest-nodelete/libGL-guest.so | grep -q 'FLAGS_1.*NODELETE'
+
+      - name: Create rootfs and promotion probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs-pull.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+
+          cat > /tmp/x11stub.c <<'EOF'
+          typedef int (*XErrorHandler)(void *, void *);
+          int XSync(void *display, int discard) { (void)display; (void)discard; return 0; }
+          void *XGetVisualInfo(void *display, long mask, void *templ, int *count) { (void)display; (void)mask; (void)templ; if (count) *count=0; return 0; }
+          const char *XDisplayString(void *display) { (void)display; return ":0"; }
+          XErrorHandler XSetErrorHandler(XErrorHandler handler) { return handler; }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat > /tmp/promote.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdio.h>
+
+          static void show(const char *tag) {
+            dlerror();
+            void *p = dlsym(RTLD_DEFAULT, "glXGetProcAddress");
+            const char *e = dlerror();
+            fprintf(stderr, "DEFAULT %s ptr=%p err=%s\n", tag, p, e ? e : "none");
+          }
+
+          int main(int argc, char **argv) {
+            const char *mode = argc > 1 ? argv[1] : "unknown";
+            fprintf(stderr, "MODE %s\n", mode);
+            show("initial");
+            void *local = dlopen("libGL.so.1", RTLD_NOW | RTLD_LOCAL);
+            if (!local) { fprintf(stderr, "LOCAL_FAIL %s\n", dlerror()); return 2; }
+            void *direct = dlsym(local, "glXGetProcAddress");
+            if (!direct) return 3;
+            fprintf(stderr, "DIRECT local=%p\n", direct);
+            show("local-open");
+            if (dlclose(local)) return 4;
+            show("local-closed");
+            void *noload = dlopen("libGL.so.1", RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+            fprintf(stderr, "NOLOAD after-local-close resident=%d handle=%p\n", noload != NULL, noload);
+            if (noload) dlclose(noload);
+
+            void *global = dlopen("libGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+            if (!global) { fprintf(stderr, "GLOBAL_FAIL %s\n", dlerror()); return 5; }
+            void *direct2 = dlsym(global, "glXGetProcAddress");
+            fprintf(stderr, "DIRECT global=%p same=%d\n", direct2, direct2 == direct);
+            show("global-open");
+            dlerror();
+            void *from_default = dlsym(RTLD_DEFAULT, "glXGetProcAddress");
+            if (dlerror() || from_default != direct2) return 6;
+            if (dlclose(global)) return 7;
+            show("global-closed");
+            fprintf(stderr, "PROMOTION_PROBE_OK mode=%s\n", mode);
+            return 0;
+          }
+          EOF
+          x86_64-linux-gnu-gcc -O2 -Wall -Wextra -Werror /tmp/promote.c -ldl -o "$ROOTFS/opt/fex-ci/promote"
+
+      - name: Run A/B
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FEX="$GITHUB_WORKSPACE/build/Bin/FEX"
+          for variant in stock nodelete; do
+            cp "guest-${variant}/libGL-guest.so" "$ROOTFS/usr/lib/x86_64-linux-gnu/libGL.so.1"
+            set +e
+            FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$H" "$FEX" /opt/fex-ci/promote "$variant" > "$R/${variant}.out" 2> "$R/${variant}.err"
+            rc=$?
+            set -e
+            echo "$rc" | tee "$R/${variant}.exit"
+            cat "$R/${variant}.err"
+            test "$rc" -eq 0
+            grep -q "PROMOTION_PROBE_OK mode=${variant}" "$R/${variant}.err"
+            grep -q 'DEFAULT global-open ptr=0x' "$R/${variant}.err"
+          done
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodelete-rtld-global-promotion-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
