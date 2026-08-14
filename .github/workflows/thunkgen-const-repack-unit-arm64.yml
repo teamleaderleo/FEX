@@ -1,0 +1,89 @@
+name: Thunkgen const repack unit ARM64
+
+on:
+  push:
+    branches: [ci/thunkgen-const-repack-unit-20260814]
+    paths:
+      - .github/workflows/thunkgen-const-repack-unit-arm64.yml
+      - LINUX_FIELDWORK_PRESERVE_CONST_REPACK.py
+      - LINUX_FIELDWORK_CONST_REPACK_UNIT.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  thunkgen-unit:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    env:
+      PRODUCT_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      R: ${{ github.workspace }}/receipts-const-unit
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+        with:
+          path: carrier
+
+      - name: Checkout exact product
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          submodules: recursive
+
+      - name: Dependencies and identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+          printf 'carrier=%s\nproduct=%s\n' "$(git -C carrier rev-parse HEAD)" "$(git -C product rev-parse HEAD)" > "$R/identity.txt"
+
+      - name: Apply generic fix and regression
+        working-directory: product
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 ../carrier/LINUX_FIELDWORK_PRESERVE_CONST_REPACK.py
+          python3 ../carrier/LINUX_FIELDWORK_CONST_REPACK_UNIT.py
+          git diff --check
+          git diff -- ThunkLibs/Generator/gen.cpp unittests/ThunkLibs/generator.cpp | tee "$R/product.diff"
+
+      - name: Build thunk generator test
+        working-directory: product
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=ON -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake.log" 2>&1
+          cmake --build build --target thunkgentest -- -j"$(nproc)" -v > "$R/build.log" 2>&1 || { tail -n 240 "$R/build.log"; exit 1; }
+
+      - name: Run StructRepacking regression
+        working-directory: product
+        shell: bash
+        run: |
+          set -euxo pipefail
+          testbin="$(find build -type f -name thunkgentest -perm -111 | head -1)"
+          test -n "$testbin"
+          "$testbin" 'StructRepacking' --reporter console --success > "$R/test.log" 2>&1 || { cat "$R/test.log"; exit 1; }
+          grep -q 'Const pointer preserves pointee constness in repack wrapper' "$R/test.log"
+          tail -n 160 "$R/test.log"
+          echo THUNKGEN_CONST_REPACK_UNIT_OK | tee "$R/result.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunkgen-const-repack-unit-${{ github.run_id }}
+          path: receipts-const-unit
+          retention-days: 30
