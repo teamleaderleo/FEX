@@ -60,19 +60,19 @@ __attribute__((used,noinline)) static void *realloc_body(void *user, void *origi
   if (oldh->magic != HEADER_MAGIC) _exit(94);
   size_t old_size = oldh->size;
   if (size == 0) {
-    void *oldbase = oldh->base;
+    uintptr_t oldbase_addr = (uintptr_t)oldh->base;
     oldh->magic = 0;
-    free(oldbase);
-    trace_u64("CB_REALLOC_FREE_RETURN", (uintptr_t)original, (uintptr_t)oldbase, 0);
+    free((void *)oldbase_addr);
+    trace_u64("CB_REALLOC_FREE_RETURN", (uintptr_t)original, oldbase_addr, 0);
     return NULL;
   }
   void *p = alloc_body(user, size, alignment, scope);
   if (!p) return NULL;
   memcpy(p, original, old_size < size ? old_size : size);
-  void *oldbase = oldh->base;
+  uintptr_t oldbase_addr = (uintptr_t)oldh->base;
   oldh->magic = 0;
-  free(oldbase);
-  trace_u64("CB_REALLOC_RETURN", (uintptr_t)p, (uintptr_t)oldbase, (uintptr_t)scope);
+  free((void *)oldbase_addr);
+  trace_u64("CB_REALLOC_RETURN", (uintptr_t)p, oldbase_addr, (uintptr_t)scope);
   return p;
 }
 
@@ -87,10 +87,11 @@ __attribute__((used,noinline)) static void free_body(void *user, void *memory) {
   struct Header *h = (struct Header *)((uintptr_t)memory - sizeof(struct Header));
   trace_u64("CB_FREE_HEADER", (uintptr_t)h->base, h->size, h->magic);
   if (h->magic != HEADER_MAGIC) _exit(95);
-  void *base = h->base;
+  uintptr_t base_addr = (uintptr_t)h->base;
+  uintptr_t last_base_addr = (uintptr_t)last_base;
   h->magic = 0;
-  free(base);
-  trace_u64("CB_FREE_RETURN", (uintptr_t)memory, (uintptr_t)base, (uintptr_t)last_base);
+  free((void *)base_addr);
+  trace_u64("CB_FREE_RETURN", (uintptr_t)memory, base_addr, last_base_addr);
 }
 
 #if defined(__x86_64__)
