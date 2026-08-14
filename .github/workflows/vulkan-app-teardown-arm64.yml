@@ -1,0 +1,226 @@
+name: Vulkan application teardown A-B ARM64
+
+on:
+  push:
+    branches: [ci/vulkan-app-teardown-20260814]
+    paths:
+      - diagnostics/vulkan-app-teardown/vulkan_app_teardown_probe.c
+      - .github/workflows/vulkan-app-teardown-arm64.yml
+      - .github/fieldwork/add_revoked_h_state.py
+      - .github/fieldwork/merge_callback_tombstone.py
+      - .github/fieldwork/fix_retirement_lock_order.py
+      - .github/fieldwork/promote_multiowner_claims.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  app-teardown-ab:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      FEX_SHA: 71afe476751deac24adabd1adb575fd2337b6e0a
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+      R: ${{ github.workspace }}/receipts-app-teardown
+      FEX_PORTABLE: 1
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout carrier
+        uses: actions/checkout@v4
+
+      - name: Checkout exact FEX source
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.FEX_SHA }}
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout integrated retirement helper
+        uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ci/thunk-lifetime-race-20260814
+          path: retirement-helper
+          fetch-depth: 1
+
+      - name: Dependencies and identity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config ccache \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            libcap-dev libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers
+          printf 'fex=%s\ncarrier=%s\nhelper=%s\n' \
+            "$(git -C src rev-parse HEAD)" "$GITHUB_SHA" "$(git -C retirement-helper rev-parse HEAD)" \
+            > "$R/identity.txt"
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          printf '%s\n' "$ICD" > "$R/lvp-icd.txt"
+
+      - name: Build stock FEX and generated Vulkan thunks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S src -B src/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF -DBUILD_THUNKS=ON \
+            -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-stock.log" 2>&1
+          cmake --build src/build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" \
+            > "$R/build-stock-host.log" 2>&1
+          cmake -S src/ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/src/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE/src" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/src/build/Bin/thunkgen" -DX86_DEV_ROOTFS=/ \
+            > "$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" \
+            > "$R/build-guest.log" 2>&1
+          mkdir -p /tmp/fex-stock
+          cp src/build/Bin/FEX src/build/Bin/FEXServer /tmp/fex-stock/
+          sha256sum guest-build/libvulkan-guest.so src/build/HostLibs_64/libvulkan-host.so \
+            > "$R/thunk-sha256-before.txt"
+
+      - name: Prepare amd64 rootfs and application probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04 > "$R/rootfs.log" 2>&1
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$cid" | tar -C "$ROOTFS" -xf -
+          docker rm "$cid"
+          trap - EXIT
+
+          mkdir -p "$ROOTFS/usr/lib/x86_64-linux-gnu" "$ROOTFS/opt/fex-ci" /tmp/vulkan-include
+          cp guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
+          cp -a /usr/include/vulkan /tmp/vulkan-include/
+
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libX11.so.6 /tmp/x11stub.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so.6"
+
+          cat >/tmp/bogus.c <<'EOF'
+          __attribute__((constructor)) static void init_bogus(void) {}
+          int fex_teardown_bogus(void) { return 7; }
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -Wl,-soname,libfex_teardown_bogus.so /tmp/bogus.c \
+            -o "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex_teardown_bogus.so"
+
+          x86_64-linux-gnu-gcc -std=c11 -O2 -g -Wall -Wextra -Werror \
+            -I/tmp/vulkan-include \
+            diagnostics/vulkan-app-teardown/vulkan_app_teardown_probe.c -ldl \
+            -o "$ROOTFS/opt/fex-ci/vulkan-app-teardown"
+          file "$ROOTFS/opt/fex-ci/vulkan-app-teardown" > "$R/probe.file"
+          file "$ROOTFS/usr/lib/x86_64-linux-gnu/libfex_teardown_bogus.so" > "$R/bogus.file"
+
+      - name: Run stock teardown controls
+        shell: bash
+        run: |
+          set -uxo pipefail
+          ICD="$(cat "$R/lvp-icd.txt")"
+          HOST="$GITHUB_WORKSPACE/src/build/HostLibs_64"
+          FEX=/tmp/fex-stock/FEX
+          run_case() {
+            phase="$1"; mode="$2"
+            set +e
+            if [ "$mode" = normal ]; then
+              VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+                "$FEX" /opt/fex-ci/vulkan-app-teardown \
+                > "$R/${phase}-${mode}.stdout" 2> "$R/${phase}-${mode}.stderr"
+            else
+              VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+                "$FEX" /opt/fex-ci/vulkan-app-teardown "$mode" \
+                > "$R/${phase}-${mode}.stdout" 2> "$R/${phase}-${mode}.stderr"
+            fi
+            rc=$?
+            set -e
+            echo "$rc" > "$R/${phase}-${mode}.exit"
+            echo "===== ${phase}-${mode} rc=$rc ====="
+            grep -E 'APP |Input address for AddThunkTrampoline|signal|SIG' \
+              "$R/${phase}-${mode}.stdout" "$R/${phase}-${mode}.stderr" || true
+          }
+          set -e
+          run_case stock normal
+          run_case stock pin
+          run_case stock bogus
+
+      - name: Apply integrated lifetime candidate and rebuild runtime only
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 retirement-helper/.github/fieldwork/apply_multithread_owner_retire_diag.py src all
+          python3 .github/fieldwork/promote_multiowner_claims.py src
+          python3 .github/fieldwork/merge_callback_tombstone.py src
+          python3 .github/fieldwork/fix_retirement_lock_order.py src
+          python3 .github/fieldwork/add_revoked_h_state.py src
+          git -C src diff --check
+          git -C src diff > "$R/candidate.diff"
+          cmake --build src/build --target FEX FEXServer -- -j"$(nproc)" \
+            > "$R/build-candidate-runtime.log" 2>&1
+          sha256sum guest-build/libvulkan-guest.so src/build/HostLibs_64/libvulkan-host.so \
+            > "$R/thunk-sha256-after.txt"
+          diff -u "$R/thunk-sha256-before.txt" "$R/thunk-sha256-after.txt" \
+            > "$R/thunk-sha256.diff"
+
+      - name: Run candidate teardown controls
+        shell: bash
+        run: |
+          set -uxo pipefail
+          ICD="$(cat "$R/lvp-icd.txt")"
+          HOST="$GITHUB_WORKSPACE/src/build/HostLibs_64"
+          FEX="$GITHUB_WORKSPACE/src/build/Bin/FEX"
+          run_case() {
+            phase="$1"; mode="$2"
+            set +e
+            if [ "$mode" = normal ]; then
+              VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+                "$FEX" /opt/fex-ci/vulkan-app-teardown \
+                > "$R/${phase}-${mode}.stdout" 2> "$R/${phase}-${mode}.stderr"
+            else
+              VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" timeout 30s \
+                "$FEX" /opt/fex-ci/vulkan-app-teardown "$mode" \
+                > "$R/${phase}-${mode}.stdout" 2> "$R/${phase}-${mode}.stderr"
+            fi
+            rc=$?
+            set -e
+            echo "$rc" > "$R/${phase}-${mode}.exit"
+            echo "===== ${phase}-${mode} rc=$rc ====="
+            grep -E 'APP |DIAG_REVOKED_H|DIAG_LOCKED|DIAG_MULTI|DIAG_INTEGRATED|signal|SIG' \
+              "$R/${phase}-${mode}.stdout" "$R/${phase}-${mode}.stderr" || true
+          }
+          set -e
+          run_case candidate normal
+          run_case candidate pin
+          run_case candidate bogus
+
+          printf 'stock_normal=%s\nstock_pin=%s\nstock_bogus=%s\ncandidate_normal=%s\ncandidate_pin=%s\ncandidate_bogus=%s\n' \
+            "$(cat "$R/stock-normal.exit")" "$(cat "$R/stock-pin.exit")" "$(cat "$R/stock-bogus.exit")" \
+            "$(cat "$R/candidate-normal.exit")" "$(cat "$R/candidate-pin.exit")" "$(cat "$R/candidate-bogus.exit")" \
+            | tee "$R/matrix.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-app-teardown-ab-${{ github.run_id }}
+          path: receipts-app-teardown
+          retention-days: 30
