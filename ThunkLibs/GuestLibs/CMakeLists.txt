@@ -99,9 +99,7 @@ function(generate NAME SOURCE_FILE)
     DEPENDS "${GENERATOR_EXE}"
     DEPENDS "${SOURCE_FILE}"
     COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
-      # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
-      # Expand include directories to space-separated list of -isystem parameters
       "$<$<BOOL:${prop}>:;-isystem$<JOIN:${prop},;-isystem>>"
     VERBATIM
     COMMAND_EXPAND_LISTS)
@@ -111,6 +109,8 @@ function(generate NAME SOURCE_FILE)
 endfunction()
 
 function(add_guest_lib NAME SONAME)
+  cmake_parse_arguments(PARSE_ARGV 2 ARG "NODELETE" "" "")
+
   set(SOURCE_FILE ../lib${NAME}/lib${NAME}_Guest.cpp)
   get_filename_component(SOURCE_FILE_ABS "${SOURCE_FILE}" ABSOLUTE)
 
@@ -132,6 +132,9 @@ function(add_guest_lib NAME SONAME)
   target_include_directories(${NAME}-guest PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen/")
   target_compile_definitions(${NAME}-guest PRIVATE GUEST_THUNK_LIBRARY)
   target_link_libraries(${NAME}-guest PRIVATE lib${NAME}-guest-deps)
+  if (ARG_NODELETE AND TARGET_TYPE STREQUAL "SHARED")
+    target_link_options(${NAME}-guest PRIVATE "LINKER:-z,nodelete")
+  endif()
 
   ## Make signed overflow well defined 2's complement overflow
   target_compile_options(${NAME}-guest PRIVATE -fwrapv)
@@ -207,7 +210,7 @@ if (BITNESS EQUAL 64)
   generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp)
   target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
   target_include_directories_from_pkgconfig(libvulkan-guest-deps "xcb;x11;xrandr;xrender")
-  add_guest_lib(vulkan "libvulkan.so.1")
+  add_guest_lib(vulkan "libvulkan.so.1" NODELETE)
 
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories_from_pkgconfig(libdrm-guest-deps libdrm /usr/include/drm /usr/include/libdrm)
@@ -215,7 +218,7 @@ if (BITNESS EQUAL 64)
 endif()
 
 generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp)
-add_guest_lib(wayland-client "libwayland-client.so.0.20.0")
+add_guest_lib(wayland-client "libwayland-client.so.0.20.0" NODELETE)
 target_include_directories_from_pkgconfig(libwayland-client-guest-deps wayland-client /usr/include/wayland)
 
 generate(libVDSO ${CMAKE_CURRENT_SOURCE_DIR}/../libVDSO/libVDSO_interface.cpp)
@@ -254,7 +257,7 @@ endif()
 generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp)
 target_include_directories_from_pkgconfig(libGL-guest-deps gl)
 target_include_directories_from_pkgconfig(libGL-guest-deps "xcb;x11;xrandr;xrender")
-add_guest_lib(GL "libGL.so.1")
+add_guest_lib(GL "libGL.so.1" NODELETE)
 
 generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp)
 target_include_directories_from_pkgconfig(libEGL-guest-deps egl)
@@ -268,4 +271,4 @@ set_target_properties(PlaceholderX11 PROPERTIES NO_SONAME ON)
 target_link_libraries(GL-guest PRIVATE PlaceholderX11)
 
 generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp)
-add_guest_lib(cuda "libcuda.so.1")
+add_guest_lib(cuda "libcuda.so.1" NODELETE)
