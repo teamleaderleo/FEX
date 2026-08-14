@@ -1,0 +1,186 @@
+name: Vulkan debug allocator distinct-A/B matrix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/vulkan-debug-allocator-forwarding-clean-20260814]
+    paths:
+      - .github/workflows/vulkan-debug-allocator-dual-ab.yml
+      - LinuxFieldwork/vk_allocator_debug_dual.c
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    env:
+      PRODUCT_SHA: 1698747b977cfc426896a30fef471e2cfccd044e
+      PRODUCT_PARENT: 715ff36bff2fd9f2353ab31613dc41ae106f3938
+      FEX_PORTABLE: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: carrier
+      - uses: actions/checkout@v4
+        with:
+          repository: teamleaderleo/FEX
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          fetch-depth: 2
+          submodules: recursive
+
+      - name: Install dependencies and prove untouched product
+        run: |
+          set -euxo pipefail
+          test "$(git -C product rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git -C product rev-parse HEAD^)" = "$PRODUCT_PARENT"
+          test -z "$(git -C product status --porcelain)"
+          grep -n -E 'vkCreateDebugReportCallbackEXT\)\(a_0, &overridden_callback, nullptr, a_3\)|vkDestroyDebugReportCallbackEXT\)\(a_0, a_1, nullptr\)|vkCreateDebugUtilsMessengerEXT\)\(a_0, &overridden_callback, nullptr, a_3\)' product/ThunkLibs/libvulkan/Host.cpp | tee baseline-discard-sites.txt
+          test "$(wc -l < baseline-discard-sites.txt)" -eq 3
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build nasm clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev libgl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            libvulkan-dev mesa-vulkan-drivers
+
+      - name: Build untouched product once
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$PWD" -DGENERATOR_EXE="$PWD/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)"
+          mkdir -p ../host-baseline ../host-patched
+          cp build/HostLibs_64/libvulkan-host.so ../host-baseline/libvulkan-host.so
+
+      - name: Apply only three debug allocator forwards and rebuild host thunk
+        working-directory: product
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ThunkLibs/libvulkan/Host.cpp')
+          s = p.read_text()
+          repls = {
+              'return LDR_PTR(vkCreateDebugReportCallbackEXT)(a_0, &overridden_callback, nullptr, a_3);':
+                  'return LDR_PTR(vkCreateDebugReportCallbackEXT)(a_0, &overridden_callback, a_2, a_3);',
+              'LDR_PTR(vkDestroyDebugReportCallbackEXT)(a_0, a_1, nullptr);':
+                  'LDR_PTR(vkDestroyDebugReportCallbackEXT)(a_0, a_1, a_2);',
+              'return LDR_PTR(vkCreateDebugUtilsMessengerEXT)(a_0, &overridden_callback, nullptr, a_3);':
+                  'return LDR_PTR(vkCreateDebugUtilsMessengerEXT)(a_0, &overridden_callback, a_2, a_3);',
+          }
+          for old, new in repls.items():
+              assert s.count(old) == 1, (old, s.count(old))
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+          git diff --check
+          git diff --name-only | tee ../patched-files.txt
+          test "$(cat ../patched-files.txt)" = "ThunkLibs/libvulkan/Host.cpp"
+          grep -n -E 'vkCreateDebugReportCallbackEXT\)\(a_0, &overridden_callback, a_2, a_3\)|vkDestroyDebugReportCallbackEXT\)\(a_0, a_1, a_2\)|vkCreateDebugUtilsMessengerEXT\)\(a_0, &overridden_callback, a_2, a_3\)' ThunkLibs/libvulkan/Host.cpp | tee ../patched-forward-sites.txt
+          test "$(wc -l < ../patched-forward-sites.txt)" -eq 3
+          cmake --build build --target vulkan-host-64 -- -j"$(nproc)"
+          cp build/HostLibs_64/libvulkan-host.so ../host-patched/libvulkan-host.so
+
+      - name: Prepare one rootfs and distinct-allocator probes
+        run: |
+          set -euxo pipefail
+          mkdir -p receipts
+          cc -O0 -g -Wall -Wextra -Werror carrier/LinuxFieldwork/vk_allocator_debug_dual.c -ldl -o receipts/native-probe
+          docker pull --platform=linux/amd64 ubuntu:24.04
+          cid="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir rootfs-amd64
+          docker export "$cid" | tar -C rootfs-amd64 -xf -
+          docker rm "$cid"
+          trap - EXIT
+          mkdir -p rootfs-amd64/usr/lib/x86_64-linux-gnu rootfs-amd64/opt/fex-ci
+          cp product/guest-build/libvulkan-guest.so rootfs-amd64/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+          x86_64-linux-gnu-gcc -O0 -g -Wall -Wextra -Werror carrier/LinuxFieldwork/vk_allocator_debug_dual.c -ldl -o rootfs-amd64/opt/fex-ci/debug-dual-probe
+          cat >/tmp/x11stub.c <<'EOF'
+          int XSync(void *d, int discard){(void)d;(void)discard;return 0;}
+          void *XGetVisualInfo(void *d, long mask, void *t, int *n){(void)d;(void)mask;(void)t;if(n)*n=0;return 0;}
+          char *XDisplayString(void *d){(void)d;static char s[] = ":0";return s;}
+          EOF
+          x86_64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wextra -Werror -Wl,-soname,libX11.so.6 /tmp/x11stub.c -o rootfs-amd64/usr/lib/x86_64-linux-gnu/libX11.so.6
+
+      - name: Execute native, untouched, and patched A/B matrix
+        run: |
+          set -uxo pipefail
+          ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$ICD"
+          set +e
+          VK_DRIVER_FILES="$ICD" timeout 30s receipts/native-probe >receipts/native.stdout 2>receipts/native.stderr
+          native_rc=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-baseline" \
+            timeout 30s product/build/Bin/FEX /opt/fex-ci/debug-dual-probe \
+            >receipts/baseline.stdout 2>receipts/baseline.stderr
+          baseline_rc=$?
+          VK_DRIVER_FILES="$ICD" FEX_ROOTFS="$PWD/rootfs-amd64" FEX_THUNKHOSTLIBS="$PWD/host-patched" \
+            timeout 30s product/build/Bin/FEX /opt/fex-ci/debug-dual-probe \
+            >receipts/patched.stdout 2>receipts/patched.stderr
+          patched_rc=$?
+          set -e
+          printf 'product=%s\nnative=%s\nbaseline=%s\npatched=%s\n' "$PRODUCT_SHA" "$native_rc" "$baseline_rc" "$patched_rc" | tee receipts/final-ab.txt
+          printf '%s\n' '--- native ---'; cat receipts/native.stderr
+          printf '%s\n' '--- untouched ---'; cat receipts/baseline.stderr
+          printf '%s\n' '--- patched ---'; cat receipts/patched.stderr
+          test "$native_rc" -eq 0
+          test "$patched_rc" -eq 0
+          grep -q 'PASS debug dual allocator matrix' receipts/native.stderr
+          grep -q 'PASS debug dual allocator matrix' receipts/patched.stderr
+          grep -E '^(EXTENSIONS|INSTANCE_CREATE|DEBUG_UTILS_CREATE|DEBUG_UTILS_DESTROY|DEBUG_REPORT_CREATE|DEBUG_REPORT_DESTROY|INSTANCE_DESTROY)' receipts/native.stderr > receipts/native-canonical.txt
+          grep -E '^(EXTENSIONS|INSTANCE_CREATE|DEBUG_UTILS_CREATE|DEBUG_UTILS_DESTROY|DEBUG_REPORT_CREATE|DEBUG_REPORT_DESTROY|INSTANCE_DESTROY)' receipts/patched.stderr > receipts/patched-canonical.txt
+          diff -u receipts/native-canonical.txt receipts/patched-canonical.txt
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('receipts/native-canonical.txt').read_text()
+          creates = [line for line in text.splitlines() if line.startswith(('DEBUG_UTILS_CREATE','DEBUG_REPORT_CREATE'))]
+          destroys = [line for line in text.splitlines() if line.startswith(('DEBUG_UTILS_DESTROY','DEBUG_REPORT_DESTROY'))]
+          assert creates and destroys, text
+          for line in creates:
+              oa = int(re.search(r'object_alloc_delta=(\d+)', line).group(1))
+              ia = int(re.search(r'instance_alloc_delta=(\d+)', line).group(1))
+              assert oa > 0 and ia == 0, line
+          for line in destroys:
+              of = int(re.search(r'object_free_delta=(\d+)', line).group(1))
+              inf = int(re.search(r'instance_free_delta=(\d+)', line).group(1))
+              assert of > 0 and inf == 0, line
+          PY
+          if test "$baseline_rc" -eq 0; then
+            grep -E '^(EXTENSIONS|INSTANCE_CREATE|DEBUG_UTILS_CREATE|DEBUG_UTILS_DESTROY|DEBUG_REPORT_CREATE|DEBUG_REPORT_DESTROY|INSTANCE_DESTROY)' receipts/baseline.stderr > receipts/baseline-canonical.txt
+            if diff -q receipts/native-canonical.txt receipts/baseline-canonical.txt >/dev/null; then
+              echo 'BASELINE_UNEXPECTEDLY_MATCHED_NATIVE' | tee -a receipts/final-ab.txt
+              exit 1
+            fi
+            echo 'BASELINE_DIFFERED_FROM_NATIVE' | tee -a receipts/final-ab.txt
+          else
+            echo "BASELINE_FAILED_RC=$baseline_rc" | tee -a receipts/final-ab.txt
+          fi
+          printf '%s\n' 'OUTCOME=three_debug_allocator_forwards_decisive_native_match' >> receipts/final-ab.txt
+
+      - name: Upload A/B receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-debug-allocator-dual-ab-${{ github.run_id }}
+          path: |
+            receipts
+            baseline-discard-sites.txt
+            patched-files.txt
+            patched-forward-sites.txt
+          retention-days: 30
