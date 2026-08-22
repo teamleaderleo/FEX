@@ -1,0 +1,245 @@
+name: SmolRunner hot ARM probe
+
+on:
+  push:
+    branches:
+      - research/smolrunner-hot-arm-probe
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe-${{ matrix.runner[1] }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - [self-hosted, ARMv8.0]
+          - [self-hosted, ARMv8.2]
+          - [self-hosted, ARMv8.4]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Probe host, filesystem, reflink, and Git worktrees
+        env:
+          PROBE_LABEL: ${{ matrix.runner[1] }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import platform
+          import shutil
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve()
+          label = os.environ["PROBE_LABEL"]
+          root = Path(tempfile.mkdtemp(prefix="smolrunner-hot-", dir=runner_temp))
+          result_path = workspace / f"smolrunner-hot-arm-{label}.json"
+          worktrees = []
+
+          def command(argv, cwd=None):
+              started = time.monotonic_ns()
+              proc = subprocess.run(
+                  argv,
+                  cwd=cwd,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+              elapsed_ms = (time.monotonic_ns() - started) / 1_000_000
+              return {
+                  "argv": argv,
+                  "returncode": proc.returncode,
+                  "elapsed_ms": round(elapsed_ms, 3),
+                  "stdout": proc.stdout.strip()[:8192],
+                  "stderr": proc.stderr.strip()[:8192],
+              }
+
+          def output(argv, cwd=None):
+              record = command(argv, cwd=cwd)
+              return record["stdout"] if record["returncode"] == 0 else None
+
+          def fs_used_bytes(path):
+              value = output(["df", "-B1", "--output=used", str(path)])
+              if not value:
+                  return None
+              lines = [line.strip() for line in value.splitlines() if line.strip()]
+              if len(lines) < 2:
+                  return None
+              return int(lines[-1])
+
+          def statvfs_used_bytes(path):
+              stat = os.statvfs(path)
+              return (stat.f_blocks - stat.f_bfree) * stat.f_frsize
+
+          def timed(name, fn):
+              started = time.monotonic_ns()
+              value = fn()
+              return {
+                  "name": name,
+                  "elapsed_ms": round((time.monotonic_ns() - started) / 1_000_000, 3),
+                  "value": value,
+              }
+
+          try:
+              probe = {
+                  "schema_version": 1,
+                  "label": label,
+                  "runner": {
+                      "os": os.environ.get("RUNNER_OS"),
+                      "arch": os.environ.get("RUNNER_ARCH"),
+                      "name": os.environ.get("RUNNER_NAME"),
+                      "hostname": platform.node(),
+                  },
+                  "host": {
+                      "machine": platform.machine(),
+                      "kernel": platform.release(),
+                      "platform": platform.platform(),
+                      "cpu_count": os.cpu_count(),
+                      "lscpu": output(["lscpu"]),
+                  },
+                  "filesystem": {
+                      "workspace_findmnt": output(["findmnt", "-T", str(workspace), "-n", "-o", "SOURCE,FSTYPE,OPTIONS"]),
+                      "temp_findmnt": output(["findmnt", "-T", str(runner_temp), "-n", "-o", "SOURCE,FSTYPE,OPTIONS"]),
+                      "workspace_df": output(["df", "-T", "-B1", str(workspace)]),
+                      "temp_df": output(["df", "-T", "-B1", str(runner_temp)]),
+                      "workspace_statfs": output(["stat", "-f", "-c", "%T block=%S blocks=%b free=%f", str(workspace)]),
+                      "temp_statfs": output(["stat", "-f", "-c", "%T block=%S blocks=%b free=%f", str(runner_temp)]),
+                  },
+                  "tools": {
+                      "git": output(["git", "--version"]),
+                      "cp": output(["cp", "--version"]),
+                      "python": platform.python_version(),
+                  },
+              }
+
+              # Reflink versus ordinary copy on the exact runner-temp filesystem.
+              source = root / "source.bin"
+              block = os.urandom(1024 * 1024)
+              create = timed("create_64m_source", lambda: source.write_bytes(block * 64))
+              probe["source_create"] = create
+
+              before = fs_used_bytes(root)
+              reflink = root / "reflink.bin"
+              reflink_copy = command(["cp", "--reflink=always", str(source), str(reflink)])
+              after = fs_used_bytes(root)
+              probe["reflink"] = {
+                  "copy": reflink_copy,
+                  "filesystem_used_before": before,
+                  "filesystem_used_after": after,
+                  "filesystem_used_delta": None if before is None or after is None else after - before,
+              }
+              if reflink_copy["returncode"] == 0:
+                  before_cow = fs_used_bytes(root)
+                  started = time.monotonic_ns()
+                  with reflink.open("r+b", buffering=0) as handle:
+                      handle.write(os.urandom(1024 * 1024))
+                      handle.flush()
+                  cow_ms = (time.monotonic_ns() - started) / 1_000_000
+                  after_cow = fs_used_bytes(root)
+                  probe["reflink"]["first_1m_write_ms"] = round(cow_ms, 3)
+                  probe["reflink"]["cow_used_delta"] = None if before_cow is None or after_cow is None else after_cow - before_cow
+
+              ordinary = root / "ordinary.bin"
+              before_copy = fs_used_bytes(root)
+              ordinary_copy = command(["cp", "--reflink=never", str(source), str(ordinary)])
+              after_copy = fs_used_bytes(root)
+              probe["ordinary_copy"] = {
+                  "copy": ordinary_copy,
+                  "filesystem_used_before": before_copy,
+                  "filesystem_used_after": after_copy,
+                  "filesystem_used_delta": None if before_copy is None or after_copy is None else after_copy - before_copy,
+              }
+
+              # Metadata-heavy small-file churn.
+              small = root / "small-files"
+              small.mkdir()
+              payload = b"smolrunner-hot\n" * 16
+              started = time.monotonic_ns()
+              for index in range(20_000):
+                  (small / f"f-{index:05d}").write_bytes(payload)
+              probe["small_file_create_20k_ms"] = round((time.monotonic_ns() - started) / 1_000_000, 3)
+              started = time.monotonic_ns()
+              for entry in small.iterdir():
+                  entry.stat()
+              probe["small_file_stat_20k_ms"] = round((time.monotonic_ns() - started) / 1_000_000, 3)
+              started = time.monotonic_ns()
+              shutil.rmtree(small)
+              probe["small_file_delete_20k_ms"] = round((time.monotonic_ns() - started) / 1_000_000, 3)
+
+              # Real repository worktree baseline and split --no-checkout materialization timing.
+              plain = root / "plain-worktree"
+              before_plain = fs_used_bytes(root)
+              plain_add = command(["git", "worktree", "add", "--detach", str(plain), "HEAD"], cwd=workspace)
+              worktrees.append(plain)
+              after_plain = fs_used_bytes(root)
+              plain_remove = command(["git", "worktree", "remove", "--force", str(plain)], cwd=workspace)
+              worktrees.remove(plain)
+              probe["git_worktree_plain"] = {
+                  "add": plain_add,
+                  "remove": plain_remove,
+                  "filesystem_used_delta_after_add": None if before_plain is None or after_plain is None else after_plain - before_plain,
+              }
+
+              split = root / "split-worktree"
+              before_split = fs_used_bytes(root)
+              split_add = command(["git", "worktree", "add", "--detach", "--no-checkout", str(split), "HEAD"], cwd=workspace)
+              worktrees.append(split)
+              after_metadata = fs_used_bytes(root)
+              split_materialize = command(["git", "reset", "--hard", "HEAD"], cwd=split) if split_add["returncode"] == 0 else None
+              after_materialize = fs_used_bytes(root)
+              split_remove = command(["git", "worktree", "remove", "--force", str(split)], cwd=workspace) if split_add["returncode"] == 0 else None
+              if split in worktrees:
+                  worktrees.remove(split)
+              probe["git_worktree_split"] = {
+                  "metadata_add": split_add,
+                  "materialize": split_materialize,
+                  "remove": split_remove,
+                  "metadata_filesystem_used_delta": None if before_split is None or after_metadata is None else after_metadata - before_split,
+                  "materialization_filesystem_used_delta": None if after_metadata is None or after_materialize is None else after_materialize - after_metadata,
+              }
+
+              probe["filesystem"]["probe_statvfs_used_bytes_final"] = statvfs_used_bytes(root)
+              result_path.write_text(json.dumps(probe, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              print(json.dumps(probe, indent=2, sort_keys=True))
+          finally:
+              for worktree in list(worktrees):
+                  subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=workspace, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Publish probe summary
+        if: always()
+        run: |
+          set -euo pipefail
+          result="smolrunner-hot-arm-${{ matrix.runner[1] }}.json"
+          if [ -f "$result" ]; then
+            {
+              echo '```json'
+              cat "$result"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload probe result
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: smolrunner-hot-arm-${{ matrix.runner[1] }}
+          path: smolrunner-hot-arm-${{ matrix.runner[1] }}.json
+          if-no-files-found: warn
+          retention-days: 3
