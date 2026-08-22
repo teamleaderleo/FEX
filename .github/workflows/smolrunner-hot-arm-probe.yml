@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   probe:
@@ -26,7 +26,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 1
-          persist-credentials: false
 
       - name: Probe host, filesystem, reflink, and Git worktrees
         env:
@@ -127,11 +126,9 @@ jobs:
                   },
               }
 
-              # Reflink versus ordinary copy on the exact runner-temp filesystem.
               source = root / "source.bin"
               block = os.urandom(1024 * 1024)
-              create = timed("create_64m_source", lambda: source.write_bytes(block * 64))
-              probe["source_create"] = create
+              probe["source_create"] = timed("create_64m_source", lambda: source.write_bytes(block * 64))
 
               before = fs_used_bytes(root)
               reflink = root / "reflink.bin"
@@ -165,7 +162,6 @@ jobs:
                   "filesystem_used_delta": None if before_copy is None or after_copy is None else after_copy - before_copy,
               }
 
-              # Metadata-heavy small-file churn.
               small = root / "small-files"
               small.mkdir()
               payload = b"smolrunner-hot\n" * 16
@@ -181,14 +177,15 @@ jobs:
               shutil.rmtree(small)
               probe["small_file_delete_20k_ms"] = round((time.monotonic_ns() - started) / 1_000_000, 3)
 
-              # Real repository worktree baseline and split --no-checkout materialization timing.
               plain = root / "plain-worktree"
               before_plain = fs_used_bytes(root)
               plain_add = command(["git", "worktree", "add", "--detach", str(plain), "HEAD"], cwd=workspace)
-              worktrees.append(plain)
+              if plain_add["returncode"] == 0:
+                  worktrees.append(plain)
               after_plain = fs_used_bytes(root)
-              plain_remove = command(["git", "worktree", "remove", "--force", str(plain)], cwd=workspace)
-              worktrees.remove(plain)
+              plain_remove = command(["git", "worktree", "remove", "--force", str(plain)], cwd=workspace) if plain_add["returncode"] == 0 else None
+              if plain in worktrees:
+                  worktrees.remove(plain)
               probe["git_worktree_plain"] = {
                   "add": plain_add,
                   "remove": plain_remove,
@@ -198,7 +195,8 @@ jobs:
               split = root / "split-worktree"
               before_split = fs_used_bytes(root)
               split_add = command(["git", "worktree", "add", "--detach", "--no-checkout", str(split), "HEAD"], cwd=workspace)
-              worktrees.append(split)
+              if split_add["returncode"] == 0:
+                  worktrees.append(split)
               after_metadata = fs_used_bytes(root)
               split_materialize = command(["git", "reset", "--hard", "HEAD"], cwd=split) if split_add["returncode"] == 0 else None
               after_materialize = fs_used_bytes(root)
@@ -243,3 +241,20 @@ jobs:
           path: smolrunner-hot-arm-${{ matrix.runner[1] }}.json
           if-no-files-found: warn
           retention-days: 3
+
+      - name: Persist result on fork research branch
+        if: always()
+        env:
+          PROBE_LABEL: ${{ matrix.runner[1] }}
+        run: |
+          set -euo pipefail
+          result="smolrunner-hot-arm-${PROBE_LABEL}.json"
+          test -f "$result"
+          safe_label="$(printf '%s' "$PROBE_LABEL" | tr '.:' '--')"
+          result_branch="research/results-smolrunner-hot-${safe_label}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C "$result_branch"
+          git add -- "$result"
+          git commit -m "research: record SmolRunner ARM probe ${PROBE_LABEL}"
+          git push --force origin "HEAD:refs/heads/${result_branch}"
