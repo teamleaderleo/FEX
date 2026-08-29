@@ -14,11 +14,14 @@ $end_info$
 
 #include "common/Guest.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <dlfcn.h>
 #include <functional>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "thunkgen_guest_libvulkan.inl"
 
@@ -63,6 +66,47 @@ static PFN_vkVoidFunction MakeGuestCallable(const char* origin, PFN_vkVoidFuncti
   return func;
 }
 
+VkResult vkEnumerateInstanceExtensionProperties(const char* layer_name, uint32_t* property_count, VkExtensionProperties* properties_out) {
+  constexpr unsigned MAX_ENUMERATION_ATTEMPTS = 4;
+  std::vector<VkExtensionProperties> properties;
+  VkResult result = VK_INCOMPLETE;
+
+  for (unsigned attempt = 0; attempt < MAX_ENUMERATION_ATTEMPTS; ++attempt) {
+    uint32_t count = 0;
+    result = fexfn_pack_vkEnumerateInstanceExtensionProperties(layer_name, &count, nullptr);
+    if (result != VK_SUCCESS) {
+      return result;
+    }
+
+    properties.resize(count);
+    result = fexfn_pack_vkEnumerateInstanceExtensionProperties(layer_name, &count, properties.data());
+    properties.resize(count);
+    if (result != VK_INCOMPLETE) {
+      break;
+    }
+  }
+
+  if (result != VK_SUCCESS) {
+    return result;
+  }
+
+  std::erase_if(properties, [](const VkExtensionProperties& property) {
+    return std::strcmp(property.extensionName, VK_LUNARG_DIRECT_DRIVER_LOADING_EXTENSION_NAME) == 0;
+  });
+
+  if (!properties_out) {
+    *property_count = static_cast<uint32_t>(properties.size());
+    return VK_SUCCESS;
+  }
+
+  const uint32_t capacity = *property_count;
+  const uint32_t available = static_cast<uint32_t>(properties.size());
+  const uint32_t written = std::min(capacity, available);
+  std::copy_n(properties.begin(), written, properties_out);
+  *property_count = written;
+  return written < available ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
 PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice a_0, const char* a_1) {
   auto Ret = fexfn_pack_vkGetDeviceProcAddr(a_0, a_1);
   if (!Ret) {
@@ -87,6 +131,9 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1) {
   }
   if (a_1 == std::string_view {"vkGetDeviceProcAddr"}) {
     return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+  }
+  if (a_1 == std::string_view {"vkEnumerateInstanceExtensionProperties"}) {
+    return (PFN_vkVoidFunction)vkEnumerateInstanceExtensionProperties;
   }
 
   return MakeGuestCallable(__FUNCTION__, Ret, a_1);
