@@ -3,6 +3,9 @@
 This is an internal research profile for `teamleaderleo/FEX`. It is not an upstream contribution
 recipe and it is not ARM runtime acceptance.
 
+For a beginner-oriented map of Vulkan GIPA/GDPA, custom host wrappers, and the focused inventory
+test, see [Vulkan proc-address routing](VulkanProcAddressRouting.md).
+
 ## One target, not everything
 
 Initialize the pinned submodules once, then build only the target that owns the current question:
