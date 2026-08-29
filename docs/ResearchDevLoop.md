@@ -28,6 +28,57 @@ a content-addressed digest of the complete pinned commit/path inventory. Use `--
 smaller explicit bound. Git checkout progress goes to stderr; stdout is one parseable JSON receipt,
 so a carrier can redirect it without mixing progress lines into the evidence file.
 
+### Sharing immutable submodule packs between retained worktrees
+
+Ordinary `git submodule update --depth 1` deliberately copies objects when its source repository is
+shallow, even for a same-filesystem local clone. When two or more exact research worktrees retain
+the same recursive pins on one filesystem, opt in to the fork's content-addressed pack cache:
+
+```sh
+./Scripts/ResearchDevBuild.py \
+  --cache-root /same/filesystem/fex-research \
+  --source /same/filesystem/fex-worktree \
+  submodules --jobs 16 --pack-cache
+```
+
+The ordinary shallow update and complete recursive-pin verification still happen first. The helper
+then creates one generation named by that verified pin-inventory digest, hashes every eligible pack
+file with SHA-256, and atomically hardlinks identical immutable data into the consumer. It accepts
+only current-user, mode-`0444` regular `.pack`, `.idx`, and `.rev` files, holds one cache-wide
+exclusive lock, rechecks each target before replacement, verifies the complete pin identity again,
+and fails closed on unknown pack-directory files or a cross-filesystem cache. It never writes a Git
+alternate. Removing the pool therefore removes only one directory entry per inode; retained
+consumer links still contain the objects. A later consumer repack/garbage collection writes or
+renames its own files instead of modifying another consumer's link, as verified by the bounded
+destructive-isolation control.
+
+This is an explicit multi-consumer storage optimization, not the default setup path. At exact FEX
+head `a5ef2fdad7a486ad43115ce76fe2ddcd357cdd7e` on big-red ext4, three ordinary fresh consumers had a
+median 173,588,480-byte marginal module store. Three pack-cache consumers had a median 15,790,080
+bytes of marginal allocation, a 90.90% reduction. The cache path added 2.06% to median
+materialization time (72.03 versus 70.58 seconds), within the preregistered 20% ceiling. Pool plus
+two consumers used 191,438,848 bytes, 44.86% less than two ordinary stores; three consumers saved
+313,536,512 bytes, or 60.21%. A first consumer plus the pool can cost slightly more than an ordinary
+consumer, so the hosted ARM carrier and other disposable one-consumer jobs intentionally remain on
+the ordinary path.
+
+Inspect retained generations without changing them:
+
+```sh
+./Scripts/ResearchDevBuild.py \
+  --cache-root /same/filesystem/fex-research \
+  submodule-cache
+```
+
+The inventory obtains a nonblocking shared lock and reports generation, entry, allocated,
+consumer-linked, and pool-only reclaimable bytes. It does not delete or evict anything. Review
+process/worktree ownership before removing a generation; a `reclaimableAllocatedBytes` value is
+evidence about link count, not deletion authority. Ordinary `du` reports hardlinked blocks once per
+path and can therefore double-count the pool plus consumer; use the bootstrap receipt's
+`consumerUniqueMarginalBytes` and the inventory's inode-aware totals for decisions. The pool is a
+local optimization, never provenance: exact source SHA and recursive pin digest remain the receipt
+identity.
+
 The helper checks every recursive submodule before it configures anything. It fails immediately when
 a submodule is uninitialized, conflicted, or not at the superproject's pinned commit, and prints the
 exact bounded Git recovery command. This keeps missing third-party sources from turning into a long wall of

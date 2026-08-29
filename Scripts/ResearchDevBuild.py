@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 
+import SubmodulePackCache as submodule_pack_cache
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LANE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -74,6 +76,15 @@ def parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=DEFAULT_SUBMODULE_JOBS,
         help="parallel submodule clone/fetch workers",
+    )
+    submodules.add_argument(
+        "--pack-cache",
+        action="store_true",
+        help="deduplicate immutable shallow pack files in the exact-pin cache generation",
+    )
+    subparsers.add_parser(
+        "submodule-cache",
+        help="inventory submodule pack-cache generations without changing them",
     )
     subparsers.add_parser(
         "lanes",
@@ -638,6 +649,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "lanes":
             print(json.dumps(lane_inventory(cache_root), indent=2, sort_keys=True))
             return 0
+        if args.action == "submodule-cache":
+            print(json.dumps(submodule_pack_cache.inventory(cache_root), indent=2, sort_keys=True))
+            return 0
         source = args.source.resolve(strict=True)
         lane_root = cache_root / "views" / lane
         source_view = lane_root / "src"
@@ -662,6 +676,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             require_pinned_submodules(source)
             repositories, digest = pinned_submodule_identity(source)
+            pack_cache = None
+            if args.pack_cache:
+                pack_cache = submodule_pack_cache.compact(
+                    source,
+                    cache_root,
+                    digest,
+                    repositories,
+                )
+                require_pinned_submodules(source)
+                post_repositories, post_digest = pinned_submodule_identity(source)
+                if (post_repositories, post_digest) != (repositories, digest):
+                    raise RuntimeError("pack-cache compaction changed recursive pin identity")
             identity = source_identity(source)
             receipt = {
                 "format": "teamleaderleo-fex-submodule-bootstrap-receipt-v1",
@@ -672,6 +698,8 @@ def main(argv: list[str] | None = None) -> int:
                 "pinnedDigest": digest,
                 "elapsedSeconds": round(time.monotonic() - started, 6),
             }
+            if pack_cache is not None:
+                receipt["packCache"] = pack_cache
             print(json.dumps(receipt, sort_keys=True))
             return 0
 
