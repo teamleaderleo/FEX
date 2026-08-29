@@ -11,6 +11,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -73,6 +74,10 @@ def parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=DEFAULT_SUBMODULE_JOBS,
         help="parallel submodule clone/fetch workers",
+    )
+    subparsers.add_parser(
+        "lanes",
+        help="inventory stable build lanes without mutating them",
     )
     subparsers.add_parser("configure", help="freshly configure the lane")
     subparsers.add_parser(
@@ -398,6 +403,204 @@ def profile_matches(path: Path, expected: dict[str, object]) -> bool:
         return False
 
 
+def read_small_json(path: Path, limit: int = 1024 * 1024) -> tuple[str, object | None]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "unsafe", None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+            return "unsafe", None
+        chunks = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if len(payload) > limit:
+        return "unsafe", None
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "invalid", None
+    if not isinstance(value, dict):
+        return "invalid", None
+    return "valid", value
+
+
+def allocated_bytes_no_follow(root: Path) -> int:
+    """Match du-style allocated bytes without following links or crossing filesystems."""
+    root_metadata = os.lstat(root)
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        raise RuntimeError(f"lane root is not a directory: {root}")
+    root_device = root_metadata.st_dev
+    pending = [root]
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    while pending:
+        path = pending.pop()
+        metadata = os.lstat(path)
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        total += metadata.st_blocks * 512
+        if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+            if metadata.st_dev != root_device:
+                raise RuntimeError(f"lane crosses a filesystem boundary: {path}")
+            with os.scandir(path) as entries:
+                pending.extend(Path(entry.path) for entry in entries)
+    return total
+
+
+def source_view_state(source_view: Path) -> tuple[str, str | None]:
+    try:
+        metadata = os.lstat(source_view)
+    except FileNotFoundError:
+        return "missing", None
+    if not stat.S_ISLNK(metadata.st_mode):
+        return "unsafe", None
+    target = Path(os.path.realpath(source_view))
+    return ("live" if target.is_dir() else "dead"), str(target)
+
+
+def lane_lock_state(lock_path: Path) -> str:
+    try:
+        descriptor = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unsafe"
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return "unsafe"
+        try:
+            # Concurrent read-only inventories may share this probe. The helper's
+            # actual lane owner holds an exclusive lock, which still blocks it.
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "active"
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return "inactive"
+    finally:
+        os.close(descriptor)
+
+
+def lane_build_state(build: Path) -> str:
+    try:
+        metadata = os.lstat(build)
+    except FileNotFoundError:
+        return "missing"
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        return "unsafe"
+    try:
+        marker = os.lstat(build / "build.ninja")
+    except FileNotFoundError:
+        return "unconfigured"
+    return "configured" if stat.S_ISREG(marker.st_mode) else "unsafe"
+
+
+def lane_inventory(cache_root: Path) -> dict[str, object]:
+    views = cache_root / "views"
+    locks = cache_root / "locks"
+    records = []
+    try:
+        views_metadata = os.lstat(views)
+    except FileNotFoundError:
+        views_metadata = None
+    if views_metadata is not None:
+        if not stat.S_ISDIR(views_metadata.st_mode) or stat.S_ISLNK(views_metadata.st_mode):
+            raise RuntimeError(f"views root is not a directory: {views}")
+        try:
+            locks_metadata = os.lstat(locks)
+        except FileNotFoundError:
+            locks_safe = True
+        else:
+            locks_safe = stat.S_ISDIR(locks_metadata.st_mode) and not stat.S_ISLNK(locks_metadata.st_mode)
+        for lane_root in sorted(views.iterdir(), key=lambda path: path.name):
+            lane = lane_root.name
+            lane_state = "valid" if LANE_PATTERN.fullmatch(lane) else "unsafe"
+            try:
+                metadata = os.lstat(lane_root)
+                if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                    lane_state = "unsafe"
+            except OSError:
+                lane_state = "unsafe"
+            if lane_state == "valid":
+                source_state, source_target = source_view_state(lane_root / "src")
+                lock_state = lane_lock_state(locks / f"{lane}.lock") if locks_safe else "unsafe"
+                receipt_state, receipt = read_small_json(lane_root / "last-receipt.json")
+                profile_state, _ = read_small_json(lane_root / "profile.json")
+                build_state = lane_build_state(lane_root / "build")
+                try:
+                    allocated_bytes = allocated_bytes_no_follow(lane_root)
+                except (OSError, RuntimeError):
+                    allocated_bytes = None
+                    lane_state = "unsafe"
+                if build_state == "unsafe" or lock_state == "unsafe":
+                    lane_state = "unsafe"
+            else:
+                source_state, source_target = "unsafe", None
+                lock_state = "unsafe"
+                receipt_state, receipt = "unsafe", None
+                profile_state = "unsafe"
+                allocated_bytes = None
+                build_state = "unsafe"
+            receipt_summary = None
+            if isinstance(receipt, dict):
+                receipt_summary = {
+                    key: receipt.get(key)
+                    for key in ("format", "head", "dirty", "target", "test", "exitCode")
+                }
+            records.append(
+                {
+                    "lane": lane,
+                    "laneState": lane_state,
+                    "sourceState": source_state,
+                    "sourceTarget": source_target,
+                    "lockState": lock_state,
+                    "allocatedBytes": allocated_bytes,
+                    "buildState": build_state,
+                    "receiptState": receipt_state,
+                    "receipt": receipt_summary,
+                    "profileState": profile_state,
+                    "reviewCandidate": (
+                        lane_state == "valid"
+                        and source_state == "dead"
+                        and lock_state in {"inactive", "missing"}
+                        and receipt_state == "valid"
+                    ),
+                }
+            )
+    totals = {
+        "lanes": len(records),
+        "allocatedBytes": sum(
+            record["allocatedBytes"]
+            for record in records
+            if isinstance(record["allocatedBytes"], int)
+        ),
+        "bySourceState": {
+            state: sum(record["sourceState"] == state for record in records)
+            for state in ("live", "dead", "missing", "unsafe")
+        },
+        "reviewCandidates": sum(record["reviewCandidate"] for record in records),
+    }
+    return {
+        "format": "teamleaderleo-fex-dev-lane-inventory-v1",
+        "cacheRoot": str(cache_root),
+        "lanes": records,
+        "totals": totals,
+    }
+
+
 def configuration_mode(
     action: str,
     switched: bool,
@@ -431,8 +634,11 @@ def main(argv: list[str] | None = None) -> int:
         selected_profile = CONFIGURE_PROFILES[args.profile]
         profile_id = str(selected_profile["id"])
         configure_options = list(selected_profile["options"])
-        source = args.source.resolve(strict=True)
         cache_root = args.cache_root.expanduser().resolve()
+        if args.action == "lanes":
+            print(json.dumps(lane_inventory(cache_root), indent=2, sort_keys=True))
+            return 0
+        source = args.source.resolve(strict=True)
         lane_root = cache_root / "views" / lane
         source_view = lane_root / "src"
         build = lane_root / "build"
