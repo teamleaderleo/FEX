@@ -37,12 +37,14 @@ Custom exit repacking is still invoked. That is intentional because a custom hoo
 
 ## Bounded proof on big-red
 
-Source head: `6a741ede248ef29d903b37efa028765983339b97`, based on fork `origin/main` at `8fe2f3d1e2fd29d78b1927616daf0e973df54816`.
+Original product head: `6a741ede248ef29d903b37efa028765983339b97`, based on fork `origin/main` at `8fe2f3d1e2fd29d78b1927616daf0e973df54816`.
 
 - Focused target `thunkgentest` built successfully with the cached Clang 21/Ninja lane.
 - With the fix present, the single Catch2 case `StructRepacking` passed 28 assertions for both x86-32 and x86-64 guest ABIs in 0.98 seconds, with 99,256 KiB peak RSS.
 - Negative control: with only the generator behavior temporarily reverted and the new test retained, the same case failed twice. The emitted `make_repack_wrapper<...>` type lacked `const` for both guest ABIs.
 - Restoring the fix rebuilt the target in 0.52 seconds and returned the same focused case to green.
+
+After the fork merged upstream `98964c552773b374676610776357a030a6825e53`, the refreshed product head `4086fa083dd4aacbb532f6fb6ddd4f95e1940ea5` rebuilt the same focused target in 2.19 seconds. `StructRepacking` again passed 28 assertions in 1.47 seconds with 99,396 KiB peak RSS. The upstream refresh changed the exact product head, so this rerun was warranted; it still does not imply a broad suite.
 
 This proves code generation preserves the qualifier and proves the regression test detects the old behavior. It does not by itself prove every thunk or an ARM64 runtime workload; those are separate scopes.
 
