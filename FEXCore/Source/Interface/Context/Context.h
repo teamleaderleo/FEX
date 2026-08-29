@@ -10,6 +10,7 @@
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/HostFeatures.h>
+#include <FEXCore/Core/DiskCache.h>
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
@@ -121,14 +122,17 @@ public:
    * Note that FEX relocations are unrelated to ELF/PE relocations.
    *
    * @param GuestDelta Guest address offset to apply to RIP-relative data
-   * @param RelocationOffset Offset to subtract from relocation target offsets
    * @param ForStorage True for serializing data (producing deterministic output); false for de-serializing it (resolving dynamic symbols)
    *
    * @return Returns true on success
    */
   [[nodiscard]]
-  bool ApplyCodeRelocations(uint64_t GuestDelta, std::span<std::byte> Code, std::span<const CPU::Relocation> Relocations,
-                            uint32_t RelocationOffset, bool ForStorage);
+  bool ApplyCodeRelocations(uint64_t GuestDelta, std::span<std::byte> Code, std::span<const CPU::Relocation> Relocations, bool ForStorage);
+
+  // Same but on disk cache packed relocations
+  [[nodiscard]]
+  bool ApplyPackedCodeRelocations(uint64_t GuestDelta, std::span<std::byte> Code, std::span<const DiskCache::BlobSmallRelocation> SmallRelocs,
+                                  std::span<const DiskCache::BlobThunkRelocation> ThunkRelocs, bool ForStorage);
 };
 
 class ContextImpl final : public FEXCore::Context::Context, public CPU::SharedCodeBufferManager {
@@ -156,32 +160,32 @@ public:
   void SetXMMRegistersFromState(FEXCore::Core::InternalThreadState* Thread, const __uint128_t* XMM_Low, const __uint128_t* YMM_High) override;
 
   /**
-   * @brief Used to create FEX thread objects in preparation for creating a true OS thread. Does set a TID or PID.
+   * @brief Used to create FEX thread objects in preparation for creating a true OS thread.
    *
-   * @param InitialRIP The starting RIP of this thread
-   * @param StackPointer The starting RSP of this thread
    * @param NewThreadState The initial thread state to setup for our state, if inheriting.
    *
    * @return The InternalThreadState object that tracks all of the emulated thread's state
    *
    * Usecases:
    *  Parent thread Creation:
-   *    - Thread = CreateThread(InitialRIP, InitialStack, nullptr, 0);
+   *    - Thread = CreateThread();
+   *    - Thread->CurrentFrame->State.rip = InitialRIP;
+   *    - Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP] = InitialStack;
    *    - CTX->ExecuteThread(Thread);
    *  OS thread Creation:
-   *    - Thread = CreateThread(0, 0, NewState, PPID);
+   *    - Thread = CreateThread(NewState);
    *    - Thread->ExecutionThread = FEXCore::Threads::Thread::Create(ThreadHandler, Arg);
    *    - ThreadHandler calls `CTX->ExecuteThread(Thread)`
    *  OS fork (New thread created with a clone of thread state):
    *    - clone{2, 3}
-   *    - Thread = CreateThread(0, 0, CopyOfThreadState, PPID);
+   *    - Thread = CreateThread(CopyOfThreadState);
    *    - ExecuteThread(Thread); // Starts executing without creating another host thread
    *  Thunk callback executing guest code from native host thread
-   *    - Thread = CreateThread(0, 0, NewState, PPID);
+   *    - Thread = CreateThread(NewState);
    *    - HandleCallback(Thread, RIP);
    */
 
-  FEXCore::Core::InternalThreadState* CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXCore::Core::CPUState* NewThreadState) override;
+  FEXCore::Core::InternalThreadState* CreateThread(const FEXCore::Core::CPUState* NewThreadState) override;
 
   /**
    * @brief Destroys this FEX thread object and stops tracking it internally
@@ -201,6 +205,8 @@ public:
   FEXCore::CPUID::FunctionResults RunCPUIDFunction(uint32_t Function, uint32_t Leaf) override;
   FEXCore::CPUID::XCRResults RunXCRFunction(uint32_t Function) override;
   FEXCore::CPUID::FunctionResults RunCPUIDFunctionName(uint32_t Function, uint32_t Leaf, uint32_t CPU) override;
+
+  virtual void InitDiskCache() override {}
 
   CodeCache& GetCodeCache() override {
     return CodeCache;
@@ -375,6 +381,7 @@ public:
   FEXCore::HLE::SourcecodeResolver* SourcecodeResolver {};
   FEXCore::ThunkHandler* ThunkHandler {};
   fextl::unique_ptr<FEXCore::CPU::Dispatcher> Dispatcher;
+  DiskCache::DiskCache DiskCache;
   CodeCache CodeCache;
   fextl::unique_ptr<CodeMapWriter> CodeMapWriter;
 

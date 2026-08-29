@@ -10,6 +10,8 @@ The human owner explicitly authorizes research execution through GitHub Actions 
 
 Agents may create disposable workflow branches, add or edit workflow files, trigger workflows by authorized pushes or dispatches, rerun failed jobs, iterate on harnesses, download and inspect artifacts/logs, and delete or abandon temporary CI machinery when it has served its purpose. This includes ARM64 runners and other owned-fork CI used to reproduce, instrument, or discriminate bugs.
 
+Read `docs/OwnedForkCI.md` before scheduling validation. Broad inherited matrices are opt-in in this fork; prefer the smallest exact-head target or runtime discriminator that answers the open question, and record its scope and receipt.
+
 Keep runtime provenance precise: when an experiment is meant to test an exact FEX product revision, build product source from that exact revision or clearly document any source delta. Policy-only or workflow-only fork commits must not be described as product-source changes.
 
 Workflow authority is limited to owned repositories/forks. It does not authorize writes, workflow dispatches, comments, reactions, reviews, issues, pull requests, or other interaction in third-party/upstream repositories.
