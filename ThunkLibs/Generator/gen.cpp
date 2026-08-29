@@ -5,6 +5,7 @@
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Basic/DiagnosticOptions.h>
 
+#include <algorithm>
 #include <fstream>
 #include <numeric>
 #include <iostream>
@@ -138,8 +139,12 @@ struct compare_by_struct_dependency {
 
 void GenerateThunkLibsAction::EmitLayoutWrappers(clang::ASTContext& context, std::ofstream& file,
                                                  std::unordered_map<const clang::Type*, TypeCompatibility>& type_compat) {
-  // Sort struct types by dependency so that repacking code is emitted in an order that compiles fine
+  // Give unrelated types a deterministic order before moving dependencies ahead
+  // of their dependees. The source map's iteration order is not stable.
   std::vector<std::pair<const clang::Type*, RepackedType>> types {this->types.begin(), this->types.end()};
+  std::sort(types.begin(), types.end(), [&](const auto& lhs, const auto& rhs) {
+    return get_type_name(context, lhs.first) < get_type_name(context, rhs.first);
+  });
   BubbleSort(types.begin(), types.end(), compare_by_struct_dependency {context});
 
   for (const auto& [type, type_repack_info] : types) {
