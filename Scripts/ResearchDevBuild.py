@@ -22,6 +22,7 @@ LANE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 LINUX_TEST_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 PROFILE = "x86-host-dev-v1"
 CCACHE_SLOPPINESS = "time_macros"
+DEFAULT_SUBMODULE_JOBS = min(os.cpu_count() or 1, 16)
 CONFIGURE_OPTIONS = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
     "-DENABLE_LTO=False",
@@ -46,7 +47,7 @@ CONFIGURE_PROFILES = {
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Configure or build one exact FEX target in an isolated stable-path lane."
+        description="Initialize sources, configure, or build one exact FEX target."
     )
     result.add_argument("--lane", default="dev", help="isolated stable-path lane name")
     result.add_argument("--source", type=Path, default=REPO_ROOT, help="FEX worktree to expose")
@@ -63,6 +64,16 @@ def parser() -> argparse.ArgumentParser:
         help="external build/cache root",
     )
     subparsers = result.add_subparsers(dest="action", required=True)
+    submodules = subparsers.add_parser(
+        "submodules",
+        help="explicitly initialize and verify pinned recursive submodules",
+    )
+    submodules.add_argument(
+        "--jobs",
+        type=positive_int,
+        default=DEFAULT_SUBMODULE_JOBS,
+        help="parallel submodule clone/fetch workers",
+    )
     subparsers.add_parser("configure", help="freshly configure the lane")
     subparsers.add_parser(
         "editor",
@@ -226,6 +237,22 @@ def git_output(source: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
+def submodule_update_command(source: Path, jobs: int) -> list[str]:
+    return [
+        required_tool("git"),
+        "-C",
+        str(source),
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+        "--depth",
+        "1",
+        "--jobs",
+        str(jobs),
+    ]
+
+
 def source_identity(source: Path) -> dict[str, object]:
     return {
         "head": git_output(source, "rev-parse", "HEAD"),
@@ -249,8 +276,35 @@ def require_pinned_submodules(source: Path) -> None:
         return
 
     paths = [line[1:].strip().split(maxsplit=1)[1].split(" ", 1)[0] for line in invalid]
-    command = f"git -C {source} submodule update --init --recursive --depth 1"
+    command = (
+        f"git -C {source} submodule update --init --recursive --depth 1 "
+        f"--jobs {DEFAULT_SUBMODULE_JOBS}"
+    )
     raise RuntimeError(f"submodules are uninitialized or not pinned: {', '.join(paths)}; run: {command}")
+
+
+def pinned_submodule_identity(source: Path) -> tuple[int, str]:
+    completed = subprocess.run(
+        [required_tool("git"), "-C", str(source), "submodule", "status", "--recursive"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    normalized = []
+    for line in completed.stdout.splitlines():
+        if line[:1] in {"-", "+", "U"}:
+            raise RuntimeError("cannot identify uninitialized or unpinned submodules")
+        if len(line) < 43:
+            raise RuntimeError("cannot parse recursive submodule status")
+        commit = line[1:41]
+        path = line[42:].split(" (", 1)[0]
+        if not re.fullmatch(r"[0-9a-f]{40}", commit) or not path:
+            raise RuntimeError("cannot parse recursive submodule status")
+        normalized.append(f"{commit} {path}")
+    if not normalized:
+        raise RuntimeError("recursive submodule status is empty")
+    payload = "\n".join(sorted(normalized)) + "\n"
+    return len(normalized), hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def atomic_source_view(source_view: Path, source: Path) -> None:
@@ -391,6 +445,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"build={build}")
             if receipt_path.is_file():
                 print(receipt_path.read_text(encoding="utf-8"), end="")
+            return 0
+
+        if args.action == "submodules":
+            started = time.monotonic()
+            subprocess.run(submodule_update_command(source, args.jobs), check=True)
+            require_pinned_submodules(source)
+            repositories, digest = pinned_submodule_identity(source)
+            identity = source_identity(source)
+            receipt = {
+                "format": "teamleaderleo-fex-submodule-bootstrap-receipt-v1",
+                "head": identity["head"],
+                "dirty": identity["dirty"],
+                "jobs": args.jobs,
+                "repositories": repositories,
+                "pinnedDigest": digest,
+                "elapsedSeconds": round(time.monotonic() - started, 6),
+            }
+            print(json.dumps(receipt, sort_keys=True))
             return 0
 
         require_pinned_submodules(source)

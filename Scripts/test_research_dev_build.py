@@ -72,6 +72,29 @@ class ResearchDevBuildTest(unittest.TestCase):
 
         self.assertEqual(command[-4:], ["--target", "vulkan-host-64", "--parallel", "8"])
 
+    def test_submodule_action_uses_bounded_parallel_shallow_update(self):
+        with mock.patch.object(dev_build, "required_tool", return_value="/tool/git"):
+            command = dev_build.submodule_update_command(Path("/worktree"), 16)
+
+        self.assertEqual(
+            command,
+            [
+                "/tool/git",
+                "-C",
+                "/worktree",
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+                "--depth",
+                "1",
+                "--jobs",
+                "16",
+            ],
+        )
+        args = dev_build.parser().parse_args(["submodules", "--jobs", "4"])
+        self.assertEqual((args.action, args.jobs), ("submodules", 4))
+
     def test_linux_test_commands_name_one_guest_build(self):
         with mock.patch.object(dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"):
             configure = dev_build.configure_linux_test_command(
@@ -106,7 +129,7 @@ class ResearchDevBuildTest(unittest.TestCase):
             with mock.patch.object(dev_build.subprocess, "run", return_value=completed):
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    r"External/missing, External/wrong.*submodule update --init --recursive --depth 1",
+                    r"External/missing, External/wrong.*submodule update --init --recursive --depth 1 --jobs",
                 ):
                     dev_build.require_pinned_submodules(Path("/worktree"))
 
@@ -117,6 +140,63 @@ class ResearchDevBuildTest(unittest.TestCase):
         with mock.patch.object(dev_build, "required_tool", return_value="/tool/git"):
             with mock.patch.object(dev_build.subprocess, "run", return_value=completed):
                 dev_build.require_pinned_submodules(Path("/worktree"))
+
+    def test_pinned_submodule_identity_is_content_addressed(self):
+        status = """ 2222222222222222222222222222222222222222 External/zeta (heads/main)
+ 1111111111111111111111111111111111111111 External/alpha (v1.0)
+"""
+        completed = subprocess.CompletedProcess([], 0, stdout=status)
+        expected = __import__("hashlib").sha256(
+            (
+                "1111111111111111111111111111111111111111 External/alpha\n"
+                "2222222222222222222222222222222222222222 External/zeta\n"
+            ).encode("utf-8")
+        ).hexdigest()
+        with mock.patch.object(dev_build, "required_tool", return_value="/tool/git"):
+            with mock.patch.object(dev_build.subprocess, "run", return_value=completed):
+                count, digest = dev_build.pinned_submodule_identity(Path("/worktree"))
+
+        self.assertEqual(count, 2)
+        self.assertEqual(digest, expected)
+
+    def test_submodule_action_verifies_and_emits_receipt_without_build_tools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            output = __import__("io").StringIO()
+            completed = subprocess.CompletedProcess(["git", "submodule", "update"], 0)
+            with mock.patch.object(
+                dev_build,
+                "submodule_update_command",
+                return_value=["/tool/git", "submodule", "update"],
+            ):
+                with mock.patch.object(dev_build.subprocess, "run", return_value=completed) as run:
+                    with mock.patch.object(dev_build, "require_pinned_submodules") as require:
+                        with mock.patch.object(
+                            dev_build,
+                            "pinned_submodule_identity",
+                            return_value=(18, "a" * 64),
+                        ):
+                            with mock.patch.object(
+                                dev_build,
+                                "source_identity",
+                                return_value={"head": "b" * 40, "dirty": False},
+                            ):
+                                with mock.patch.object(
+                                    dev_build.time, "monotonic", side_effect=(10.0, 12.5)
+                                ):
+                                    with mock.patch("sys.stdout", output):
+                                        result = dev_build.main(
+                                            ["--source", str(source), "submodules", "--jobs", "4"]
+                                        )
+
+        receipt = __import__("json").loads(output.getvalue())
+        self.assertEqual(result, 0)
+        run.assert_called_once_with(["/tool/git", "submodule", "update"], check=True)
+        require.assert_called_once_with(source.resolve())
+        self.assertEqual(receipt["repositories"], 18)
+        self.assertEqual(receipt["pinnedDigest"], "a" * 64)
+        self.assertEqual(receipt["elapsedSeconds"], 2.5)
+        self.assertEqual(receipt["jobs"], 4)
 
     def test_profile_marker_must_match_exactly(self):
         expected = dev_build.expected_profile("cache-namespace")
