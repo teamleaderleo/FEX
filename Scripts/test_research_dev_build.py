@@ -106,7 +106,7 @@ class ResearchDevBuildTest(unittest.TestCase):
             with mock.patch.object(dev_build.subprocess, "run", return_value=completed):
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    r"External/missing, External/wrong.*submodule update --init --recursive",
+                    r"External/missing, External/wrong.*submodule update --init --recursive --depth 1",
                 ):
                     dev_build.require_pinned_submodules(Path("/worktree"))
 

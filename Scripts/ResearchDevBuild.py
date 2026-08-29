@@ -249,7 +249,7 @@ def require_pinned_submodules(source: Path) -> None:
         return
 
     paths = [line[1:].strip().split(maxsplit=1)[1].split(" ", 1)[0] for line in invalid]
-    command = f"git -C {source} submodule update --init --recursive"
+    command = f"git -C {source} submodule update --init --recursive --depth 1"
     raise RuntimeError(f"submodules are uninitialized or not pinned: {', '.join(paths)}; run: {command}")
 
 
