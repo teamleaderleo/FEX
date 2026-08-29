@@ -22,12 +22,40 @@ static uint32_t fexfn_impl_libfex_thunk_test_QueryOffsetOf(guest_layout<Reorderi
   }
 }
 
+static uint32_t CustomRepackAllocations {};
+static uint32_t CustomRepackDeallocations {};
+static uint32_t CustomRepackExits {};
+static uint32_t CustomRepackCleanups {};
+
+static void fexfn_impl_libfex_thunk_test_ResetCustomRepackStats() {
+  CustomRepackAllocations = 0;
+  CustomRepackDeallocations = 0;
+  CustomRepackExits = 0;
+  CustomRepackCleanups = 0;
+}
+
+static uint32_t fexfn_impl_libfex_thunk_test_ReadCustomRepackStats() {
+  return CustomRepackAllocations | (CustomRepackDeallocations << 8) | (CustomRepackExits << 16) | (CustomRepackCleanups << 24);
+}
+
 void fex_custom_repack_entry(host_layout<CustomRepackedType>& to, const guest_layout<CustomRepackedType>& from) {
+  to.data.cleanup_cookie = new uint32_t {0xC1EA'4EAD};
   to.data.custom_repack_invoked = 1;
+  ++CustomRepackAllocations;
 }
 
 bool fex_custom_repack_exit(guest_layout<CustomRepackedType>& to, const host_layout<CustomRepackedType>& from) {
-  return false;
+  delete static_cast<uint32_t*>(from.data.cleanup_cookie);
+  to.data.custom_repack_invoked = from.data.custom_repack_invoked;
+  ++CustomRepackDeallocations;
+  ++CustomRepackExits;
+  return true;
+}
+
+void fex_custom_repack_cleanup(const host_layout<CustomRepackedType>& from) {
+  delete static_cast<uint32_t*>(from.data.cleanup_cookie);
+  ++CustomRepackDeallocations;
+  ++CustomRepackCleanups;
 }
 
 template<StructType TypeIndex, typename Type>
@@ -86,6 +114,15 @@ static void default_fex_custom_repack_reverse(guest_layout<TestBaseStruct>& into
   free((void*)NextHost);
 }
 
+static void default_fex_custom_repack_cleanup(const TestBaseStruct& from) {
+  auto next = from.Next;
+  while (next) {
+    auto child = next;
+    next = next->Next;
+    free(child);
+  }
+}
+
 #define CREATE_INFO_DEFAULT_CUSTOM_REPACK(name)                                                                                  \
   void fex_custom_repack_entry(host_layout<name>& into, const guest_layout<name>& from) {                                        \
     default_fex_custom_repack_entry(*(TestBaseStruct*)&into.data, reinterpret_cast<const guest_layout<TestBaseStruct>*>(&from)); \
@@ -98,6 +135,10 @@ static void default_fex_custom_repack_reverse(guest_layout<TestBaseStruct>& into
     into = to_guest(from);                                                                                                       \
     into.data.Next = prev_next;                                                                                                  \
     return true;                                                                                                                 \
+  }                                                                                                                              \
+                                                                                                                                 \
+  void fex_custom_repack_cleanup(const host_layout<name>& from) {                                                               \
+    default_fex_custom_repack_cleanup(reinterpret_cast<const TestBaseStruct&>(from.data));                                      \
   }
 
 CREATE_INFO_DEFAULT_CUSTOM_REPACK(TestStruct1)
@@ -110,6 +151,10 @@ void fex_custom_repack_entry(host_layout<TestBaseStruct>&, const guest_layout<Te
 bool fex_custom_repack_exit(guest_layout<TestBaseStruct>&, const host_layout<TestBaseStruct>&) {
   std::abort();
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<TestBaseStruct>&) {
+  std::abort();
 }
 
 EXPORTS(libfex_thunk_test)

@@ -139,6 +139,11 @@ bool fex_custom_repack_exit(guest_layout<wl_interface>&, const host_layout<wl_in
   fprintf(stderr, "Should not be called: %s\n", __PRETTY_FUNCTION__);
   std::abort();
 }
+
+void fex_custom_repack_cleanup(const host_layout<wl_interface>&) {
+  // Host interface mirrors are process-lifetime registry entries.
+}
+
 void fex_custom_repack_entry(host_layout<wl_message>& into, const guest_layout<wl_message>& from) {
   auto& host_method = into.data;
   auto num_types = std::ranges::count_if(std::string_view {host_method.signature}, isalpha);
@@ -153,6 +158,10 @@ void fex_custom_repack_entry(host_layout<wl_message>& into, const guest_layout<w
 bool fex_custom_repack_exit(guest_layout<wl_message>&, const host_layout<wl_message>&) {
   fprintf(stderr, "Should not be called: %s\n", __PRETTY_FUNCTION__);
   std::abort();
+}
+
+void fex_custom_repack_cleanup(const host_layout<wl_message>&) {
+  // Message mirrors are owned by their process-lifetime interface entry.
 }
 #else
 const wl_interface* lookup_wl_interface(guest_layout<const wl_interface*> interface) {

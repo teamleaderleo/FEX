@@ -87,6 +87,8 @@ bool fex_custom_repack_exit(guest_layout<VkXcbSurfaceCreateInfoKHR>&, const host
   return false;
 }
 
+void fex_custom_repack_cleanup(const host_layout<VkXcbSurfaceCreateInfoKHR>&) {}
+
 void fex_custom_repack_entry(host_layout<VkXlibSurfaceCreateInfoKHR>& to, const guest_layout<VkXlibSurfaceCreateInfoKHR>& from) {
   to.data.dpy = x11_manager.GuestToHostDisplay(const_cast<Display*>(from.data.dpy.force_get_host_pointer()));
 }
@@ -95,6 +97,8 @@ bool fex_custom_repack_exit(guest_layout<VkXlibSurfaceCreateInfoKHR>&, const hos
   x11_manager.HostXFlush(from.data.dpy);
   return false;
 }
+
+void fex_custom_repack_cleanup(const host_layout<VkXlibSurfaceCreateInfoKHR>&) {}
 
 static VkResult fexfn_impl_libvulkan_vkAcquireXlibDisplayEXT(VkPhysicalDevice a_0, guest_layout<Display*> a_1, VkDisplayKHR a_2) {
   auto host_display = x11_manager.GuestToHostDisplay(a_1.force_get_host_pointer());
@@ -391,6 +395,14 @@ void DeleteRepackedStructArray(uint32_t Count, T* HostData, guest_layout<T*>& Gu
   delete[] HostData;
 }
 
+template<typename T>
+void CleanupRepackedStructArray(uint32_t Count, T* HostData) {
+  for (uint32_t i = 0; i < Count; ++i) {
+    fex_apply_custom_repacking_cleanup(to_host_layout(HostData[i]));
+  }
+  delete[] HostData;
+}
+
 void fexfn_impl_libvulkan_vkCmdSetVertexInputEXT(
   VkCommandBuffer Buffer, uint32_t BindingDescCount, guest_layout<const VkVertexInputBindingDescription2EXT*> GuestBindingDescs,
   uint32_t AttributeDescCount, guest_layout<const VkVertexInputAttributeDescription2EXT*> GuestAttributeDescs) {
@@ -403,8 +415,8 @@ void fexfn_impl_libvulkan_vkCmdSetVertexInputEXT(
 
   fexldr_ptr_libvulkan_vkCmdSetVertexInputEXT(Buffer, BindingDescCount, BindingDescs.data(), AttributeDescCount, AttributeDescs.data());
 
-  delete[] AttributeDescs.data();
-  delete[] BindingDescs.data();
+  CleanupRepackedStructArray(AttributeDescCount, AttributeDescs.data());
+  CleanupRepackedStructArray(BindingDescCount, BindingDescs.data());
 }
 
 void fexfn_impl_libvulkan_vkUpdateDescriptorSets(VkDevice device, unsigned int descriptorWriteCount,
@@ -418,15 +430,15 @@ void fexfn_impl_libvulkan_vkUpdateDescriptorSets(VkDevice device, unsigned int d
   fexldr_ptr_libvulkan_vkUpdateDescriptorSets(device, descriptorWriteCount, HostDescriptorWrites.data(), descriptorCopyCount,
                                               HostDescriptorCopies.data());
 
-  delete[] HostDescriptorCopies.data();
-  delete[] HostDescriptorWrites.data();
+  CleanupRepackedStructArray(descriptorCopyCount, HostDescriptorCopies.data());
+  CleanupRepackedStructArray(descriptorWriteCount, HostDescriptorWrites.data());
 }
 
 VkResult fexfn_impl_libvulkan_vkQueueSubmit(VkQueue queue, uint32_t submit_count, guest_layout<const VkSubmitInfo*> submit_infos, VkFence fence) {
 
   auto HostSubmitInfos = RepackStructArray(submit_count, submit_infos);
   auto ret = fexldr_ptr_libvulkan_vkQueueSubmit(queue, submit_count, HostSubmitInfos.data(), fence);
-  delete[] HostSubmitInfos.data();
+  CleanupRepackedStructArray(submit_count, HostSubmitInfos.data());
   return ret;
 }
 
@@ -1029,6 +1041,21 @@ static void default_fex_custom_repack_reverse(guest_layout<VkBaseOutStructure>& 
   free(pNextHost);
 }
 
+template<typename T>
+void default_fex_custom_repack_reverse_pnext(guest_layout<T>& into, const host_layout<T>& from) {
+  default_fex_custom_repack_reverse(*reinterpret_cast<guest_layout<VkBaseOutStructure>*>(&into),
+                                    &reinterpret_cast<const VkBaseOutStructure&>(from.data));
+}
+
+static void default_fex_custom_repack_cleanup(const VkBaseOutStructure& from) {
+  auto next = from.pNext;
+  while (next) {
+    auto child = next;
+    next = next->pNext;
+    free(child);
+  }
+}
+
 // Default repacking functions that only traverses and repacks the pNext chain.
 // If other members need to be repacked, use VULKAN_NONDEFAULT_CUSTOM_REPACK instead
 #define VULKAN_DEFAULT_CUSTOM_REPACK(name)                                                             \
@@ -1044,6 +1071,10 @@ static void default_fex_custom_repack_reverse(guest_layout<VkBaseOutStructure>& 
     into = to_guest(from);                                                                             \
     into.data.pNext = prev_next;                                                                       \
     return true;                                                                                       \
+  }                                                                                                    \
+                                                                                                       \
+  void fex_custom_repack_cleanup(const host_layout<name>& from) {                                     \
+    default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));        \
   }
 
 // Intentionally left empty. This macro doesn't automate anything, but it
@@ -2077,10 +2108,13 @@ VULKAN_NONDEFAULT_CUSTOM_REPACK(VkXlibSurfaceCreateInfoKHR)
 void fex_custom_repack_entry(host_layout<VkInstanceCreateInfo>& into, const guest_layout<VkInstanceCreateInfo>& from) {
   default_fex_custom_repack_entry(into, from);
 
-  auto HostApplicationInfo = new host_layout<VkApplicationInfo> {*from.data.pApplicationInfo.get_pointer()};
-  fex_apply_custom_repacking_entry(*HostApplicationInfo, *from.data.pApplicationInfo.get_pointer());
-
-  into.data.pApplicationInfo = &HostApplicationInfo->data;
+  if (from.data.pApplicationInfo.get_pointer()) {
+    auto HostApplicationInfo = new host_layout<VkApplicationInfo> {*from.data.pApplicationInfo.get_pointer()};
+    fex_apply_custom_repacking_entry(*HostApplicationInfo, *from.data.pApplicationInfo.get_pointer());
+    into.data.pApplicationInfo = &HostApplicationInfo->data;
+  } else {
+    into.data.pApplicationInfo = nullptr;
+  }
 
   auto extension_count = from.data.enabledExtensionCount.data;
   into.data.ppEnabledExtensionNames = RepackStructArray<false>(extension_count, from.data.ppEnabledExtensionNames).data();
@@ -2090,10 +2124,24 @@ void fex_custom_repack_entry(host_layout<VkInstanceCreateInfo>& into, const gues
 }
 
 bool fex_custom_repack_exit(guest_layout<VkInstanceCreateInfo>& into, const host_layout<VkInstanceCreateInfo>& from) {
-  delete from.data.pApplicationInfo;
+  default_fex_custom_repack_reverse_pnext(into, from);
+  if (from.data.pApplicationInfo) {
+    fex_apply_custom_repacking_exit(*into.data.pApplicationInfo.get_pointer(), to_host_layout(*from.data.pApplicationInfo));
+    delete from.data.pApplicationInfo;
+  }
   delete[] from.data.ppEnabledExtensionNames;
   delete[] from.data.ppEnabledLayerNames;
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkInstanceCreateInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  if (from.data.pApplicationInfo) {
+    fex_apply_custom_repacking_cleanup(to_host_layout(*from.data.pApplicationInfo));
+    delete from.data.pApplicationInfo;
+  }
+  delete[] from.data.ppEnabledExtensionNames;
+  delete[] from.data.ppEnabledLayerNames;
 }
 
 void fex_custom_repack_entry(host_layout<VkMemoryToImageCopyEXT>& into, const guest_layout<VkMemoryToImageCopyEXT>& from) {
@@ -2102,15 +2150,24 @@ void fex_custom_repack_entry(host_layout<VkMemoryToImageCopyEXT>& into, const gu
 }
 
 bool fex_custom_repack_exit(guest_layout<VkMemoryToImageCopyEXT>& into, const host_layout<VkMemoryToImageCopyEXT>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkMemoryToImageCopyEXT>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
 }
 
 void fex_custom_repack_entry(host_layout<VkDeviceCreateInfo>& into, const guest_layout<VkDeviceCreateInfo>& from) {
   default_fex_custom_repack_entry(into, from);
 
-  auto HostQueueCreateInfo = new host_layout<VkDeviceQueueCreateInfo> {*from.data.pQueueCreateInfos.get_pointer()};
-  fex_apply_custom_repacking_entry(*HostQueueCreateInfo, *from.data.pQueueCreateInfos.get_pointer());
-  into.data.pQueueCreateInfos = &HostQueueCreateInfo->data;
+  if (from.data.pQueueCreateInfos.get_pointer()) {
+    auto HostQueueCreateInfo = new host_layout<VkDeviceQueueCreateInfo> {*from.data.pQueueCreateInfos.get_pointer()};
+    fex_apply_custom_repacking_entry(*HostQueueCreateInfo, *from.data.pQueueCreateInfos.get_pointer());
+    into.data.pQueueCreateInfos = &HostQueueCreateInfo->data;
+  } else {
+    into.data.pQueueCreateInfos = nullptr;
+  }
 
   auto layer_count = from.data.enabledExtensionCount.data;
   fprintf(stderr, "  Repacking %d ppEnabledLayerNames\n", layer_count);
@@ -2122,10 +2179,24 @@ void fex_custom_repack_entry(host_layout<VkDeviceCreateInfo>& into, const guest_
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDeviceCreateInfo>& into, const host_layout<VkDeviceCreateInfo>& from) {
-  delete from.data.pQueueCreateInfos;
+  default_fex_custom_repack_reverse_pnext(into, from);
+  if (from.data.pQueueCreateInfos) {
+    fex_apply_custom_repacking_exit(*into.data.pQueueCreateInfos.get_pointer(), to_host_layout(*from.data.pQueueCreateInfos));
+    delete from.data.pQueueCreateInfos;
+  }
   delete[] from.data.ppEnabledExtensionNames;
   delete[] from.data.ppEnabledLayerNames;
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkDeviceCreateInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  if (from.data.pQueueCreateInfos) {
+    fex_apply_custom_repacking_cleanup(to_host_layout(*from.data.pQueueCreateInfos));
+    delete from.data.pQueueCreateInfos;
+  }
+  delete[] from.data.ppEnabledExtensionNames;
+  delete[] from.data.ppEnabledLayerNames;
 }
 
 void fex_custom_repack_entry(host_layout<VkDescriptorSetLayoutCreateInfo>& into, const guest_layout<VkDescriptorSetLayoutCreateInfo>& from) {
@@ -2134,8 +2205,14 @@ void fex_custom_repack_entry(host_layout<VkDescriptorSetLayoutCreateInfo>& into,
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDescriptorSetLayoutCreateInfo>& into, const host_layout<VkDescriptorSetLayoutCreateInfo>& from) {
-  delete[] from.data.pBindings;
+  default_fex_custom_repack_reverse_pnext(into, from);
+  DeleteRepackedStructArray(from.data.bindingCount, from.data.pBindings, into.data.pBindings);
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkDescriptorSetLayoutCreateInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  CleanupRepackedStructArray(from.data.bindingCount, from.data.pBindings);
 }
 
 void fex_custom_repack_entry(host_layout<VkRenderPassCreateInfo>& into, const guest_layout<VkRenderPassCreateInfo>& from) {
@@ -2144,8 +2221,14 @@ void fex_custom_repack_entry(host_layout<VkRenderPassCreateInfo>& into, const gu
 }
 
 bool fex_custom_repack_exit(guest_layout<VkRenderPassCreateInfo>& into, const host_layout<VkRenderPassCreateInfo>& from) {
-  delete[] from.data.pSubpasses;
+  default_fex_custom_repack_reverse_pnext(into, from);
+  DeleteRepackedStructArray(from.data.subpassCount, from.data.pSubpasses, into.data.pSubpasses);
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkRenderPassCreateInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  CleanupRepackedStructArray(from.data.subpassCount, from.data.pSubpasses);
 }
 
 void fex_custom_repack_entry(host_layout<VkRenderPassCreateInfo2>& into, const guest_layout<VkRenderPassCreateInfo2>& from) {
@@ -2156,10 +2239,18 @@ void fex_custom_repack_entry(host_layout<VkRenderPassCreateInfo2>& into, const g
 }
 
 bool fex_custom_repack_exit(guest_layout<VkRenderPassCreateInfo2>& into, const host_layout<VkRenderPassCreateInfo2>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   DeleteRepackedStructArray(from.data.attachmentCount, from.data.pAttachments, into.data.pAttachments);
   DeleteRepackedStructArray(from.data.subpassCount, from.data.pSubpasses, into.data.pSubpasses);
   DeleteRepackedStructArray(from.data.dependencyCount, from.data.pDependencies, into.data.pDependencies);
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkRenderPassCreateInfo2>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  CleanupRepackedStructArray(from.data.attachmentCount, from.data.pAttachments);
+  CleanupRepackedStructArray(from.data.subpassCount, from.data.pSubpasses);
+  CleanupRepackedStructArray(from.data.dependencyCount, from.data.pDependencies);
 }
 
 void fex_custom_repack_entry(host_layout<VkSubpassDescription2>& into, const guest_layout<VkSubpassDescription2>& from) {
@@ -2179,6 +2270,7 @@ void fex_custom_repack_entry(host_layout<VkSubpassDescription2>& into, const gue
 }
 
 bool fex_custom_repack_exit(guest_layout<VkSubpassDescription2>& into, const host_layout<VkSubpassDescription2>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   DeleteRepackedStructArray(from.data.inputAttachmentCount, from.data.pInputAttachments, into.data.pInputAttachments);
   DeleteRepackedStructArray(from.data.colorAttachmentCount, from.data.pColorAttachments, into.data.pColorAttachments);
   DeleteRepackedStructArray(from.data.colorAttachmentCount, from.data.pResolveAttachments, into.data.pResolveAttachments);
@@ -2187,6 +2279,17 @@ bool fex_custom_repack_exit(guest_layout<VkSubpassDescription2>& into, const hos
     delete from.data.pDepthStencilAttachment;
   }
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkSubpassDescription2>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  CleanupRepackedStructArray(from.data.inputAttachmentCount, from.data.pInputAttachments);
+  CleanupRepackedStructArray(from.data.colorAttachmentCount, from.data.pColorAttachments);
+  CleanupRepackedStructArray(from.data.colorAttachmentCount, from.data.pResolveAttachments);
+  if (from.data.pDepthStencilAttachment) {
+    fex_apply_custom_repacking_cleanup(to_host_layout(*from.data.pDepthStencilAttachment));
+    delete from.data.pDepthStencilAttachment;
+  }
 }
 
 void fex_custom_repack_entry(host_layout<VkRenderingInfo>& into, const guest_layout<VkRenderingInfo>& from) {
@@ -2214,6 +2317,7 @@ void fex_custom_repack_entry(host_layout<VkRenderingInfo>& into, const guest_lay
 }
 
 bool fex_custom_repack_exit(guest_layout<VkRenderingInfo>& into, const host_layout<VkRenderingInfo>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   DeleteRepackedStructArray(from.data.colorAttachmentCount, from.data.pColorAttachments, into.data.pColorAttachments);
   if (from.data.pDepthAttachment) {
     fex_apply_custom_repacking_exit(*into.data.pDepthAttachment.get_pointer(), to_host_layout(*from.data.pDepthAttachment));
@@ -2224,6 +2328,19 @@ bool fex_custom_repack_exit(guest_layout<VkRenderingInfo>& into, const host_layo
     delete from.data.pStencilAttachment;
   }
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkRenderingInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  CleanupRepackedStructArray(from.data.colorAttachmentCount, from.data.pColorAttachments);
+  if (from.data.pDepthAttachment) {
+    fex_apply_custom_repacking_cleanup(to_host_layout(*from.data.pDepthAttachment));
+    delete from.data.pDepthAttachment;
+  }
+  if (from.data.pStencilAttachment) {
+    fex_apply_custom_repacking_cleanup(to_host_layout(*from.data.pStencilAttachment));
+    delete from.data.pStencilAttachment;
+  }
 }
 
 void fex_custom_repack_entry(host_layout<VkDescriptorGetInfoEXT>& into, const guest_layout<VkDescriptorGetInfoEXT>& from) {
@@ -2275,13 +2392,19 @@ void fex_custom_repack_entry(host_layout<VkDescriptorGetInfoEXT>& into, const gu
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDescriptorGetInfoEXT>& into, const host_layout<VkDescriptorGetInfoEXT>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   switch (from.data.type) {
   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-  case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+  case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+    guest_layout<VkDescriptorAddressInfoEXT*> guest_ptr;
+    memcpy(&guest_ptr, into.data.data.union_storage, sizeof(guest_ptr));
+    default_fex_custom_repack_reverse_pnext(*guest_ptr.get_pointer(), to_host_layout(*from.data.data.pUniformBuffer));
     // Delete storage allocated on entry
     free((void*)from.data.data.pUniformBuffer);
+    break;
+  }
 
   default:
     // Nothing to do for the rest
@@ -2290,14 +2413,35 @@ bool fex_custom_repack_exit(guest_layout<VkDescriptorGetInfoEXT>& into, const ho
   return false;
 }
 
+void fex_custom_repack_cleanup(const host_layout<VkDescriptorGetInfoEXT>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  switch (from.data.type) {
+  case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+  case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+  case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+  case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+    default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(*from.data.data.pUniformBuffer));
+    free((void*)from.data.data.pUniformBuffer);
+    break;
+
+  default: break;
+  }
+}
+
 void fex_custom_repack_entry(host_layout<VkCopyMemoryToImageInfoEXT>& into, const guest_layout<VkCopyMemoryToImageInfoEXT>& from) {
   default_fex_custom_repack_entry(into, from);
   into.data.pRegions = RepackStructArray(from.data.regionCount.data, from.data.pRegions).data();
 }
 
 bool fex_custom_repack_exit(guest_layout<VkCopyMemoryToImageInfoEXT>& into, const host_layout<VkCopyMemoryToImageInfoEXT>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   DeleteRepackedStructArray(from.data.regionCount, from.data.pRegions, into.data.pRegions);
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkCopyMemoryToImageInfoEXT>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  CleanupRepackedStructArray(from.data.regionCount, from.data.pRegions);
 }
 
 void fex_custom_repack_entry(host_layout<VkDependencyInfo>& into, const guest_layout<VkDependencyInfo>& from) {
@@ -2308,10 +2452,18 @@ void fex_custom_repack_entry(host_layout<VkDependencyInfo>& into, const guest_la
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDependencyInfo>& into, const host_layout<VkDependencyInfo>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   DeleteRepackedStructArray(from.data.memoryBarrierCount, from.data.pMemoryBarriers, into.data.pMemoryBarriers);
   DeleteRepackedStructArray(from.data.imageMemoryBarrierCount, from.data.pImageMemoryBarriers, into.data.pImageMemoryBarriers);
   DeleteRepackedStructArray(from.data.bufferMemoryBarrierCount, from.data.pBufferMemoryBarriers, into.data.pBufferMemoryBarriers);
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkDependencyInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  CleanupRepackedStructArray(from.data.memoryBarrierCount, from.data.pMemoryBarriers);
+  CleanupRepackedStructArray(from.data.imageMemoryBarrierCount, from.data.pImageMemoryBarriers);
+  CleanupRepackedStructArray(from.data.bufferMemoryBarrierCount, from.data.pBufferMemoryBarriers);
 }
 
 void fex_custom_repack_entry(host_layout<VkDescriptorUpdateTemplateCreateInfo>& into,
@@ -2321,8 +2473,14 @@ void fex_custom_repack_entry(host_layout<VkDescriptorUpdateTemplateCreateInfo>& 
 }
 
 bool fex_custom_repack_exit(guest_layout<VkDescriptorUpdateTemplateCreateInfo>& into, const host_layout<VkDescriptorUpdateTemplateCreateInfo>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   DeleteRepackedStructArray(from.data.descriptorUpdateEntryCount, from.data.pDescriptorUpdateEntries, into.data.pDescriptorUpdateEntries);
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkDescriptorUpdateTemplateCreateInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  CleanupRepackedStructArray(from.data.descriptorUpdateEntryCount, from.data.pDescriptorUpdateEntries);
 }
 
 void fex_custom_repack_entry(host_layout<VkPipelineShaderStageCreateInfo>& into, const guest_layout<VkPipelineShaderStageCreateInfo>& from) {
@@ -2334,8 +2492,13 @@ void fex_custom_repack_entry(host_layout<VkPipelineShaderStageCreateInfo>& into,
 }
 
 bool fex_custom_repack_exit(guest_layout<VkPipelineShaderStageCreateInfo>& into, const host_layout<VkPipelineShaderStageCreateInfo>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   // TODO
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkPipelineShaderStageCreateInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
 }
 
 void fex_custom_repack_entry(host_layout<VkGraphicsPipelineCreateInfo>& into, const guest_layout<VkGraphicsPipelineCreateInfo>& from) {
@@ -2400,7 +2563,8 @@ void fex_custom_repack_entry(host_layout<VkGraphicsPipelineCreateInfo>& into, co
 }
 
 bool fex_custom_repack_exit(guest_layout<VkGraphicsPipelineCreateInfo>& into, const host_layout<VkGraphicsPipelineCreateInfo>& from) {
-  delete[] from.data.pStages;
+  default_fex_custom_repack_reverse_pnext(into, from);
+  DeleteRepackedStructArray(from.data.stageCount, from.data.pStages, into.data.pStages);
   delete from.data.pVertexInputState;
   delete from.data.pInputAssemblyState;
   delete from.data.pTessellationState;
@@ -2413,14 +2577,34 @@ bool fex_custom_repack_exit(guest_layout<VkGraphicsPipelineCreateInfo>& into, co
   return false;
 }
 
+void fex_custom_repack_cleanup(const host_layout<VkGraphicsPipelineCreateInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  CleanupRepackedStructArray(from.data.stageCount, from.data.pStages);
+  delete from.data.pVertexInputState;
+  delete from.data.pInputAssemblyState;
+  delete from.data.pTessellationState;
+  delete from.data.pViewportState;
+  delete from.data.pRasterizationState;
+  delete from.data.pMultisampleState;
+  delete from.data.pDepthStencilState;
+  delete from.data.pColorBlendState;
+  delete from.data.pDynamicState;
+}
+
 void fex_custom_repack_entry(host_layout<VkSubmitInfo>& into, const guest_layout<VkSubmitInfo>& from) {
   default_fex_custom_repack_entry(into, from);
   into.data.pCommandBuffers = RepackStructArray<false>(from.data.commandBufferCount.data, from.data.pCommandBuffers).data();
 }
 
 bool fex_custom_repack_exit(guest_layout<VkSubmitInfo>& into, const host_layout<VkSubmitInfo>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   delete[] from.data.pCommandBuffers;
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkSubmitInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  delete[] from.data.pCommandBuffers;
 }
 
 void fex_custom_repack_entry(host_layout<VkCommandBufferBeginInfo>& into, const guest_layout<VkCommandBufferBeginInfo>& from) {
@@ -2437,8 +2621,14 @@ void fex_custom_repack_entry(host_layout<VkCommandBufferBeginInfo>& into, const 
 }
 
 bool fex_custom_repack_exit(guest_layout<VkCommandBufferBeginInfo>& into, const host_layout<VkCommandBufferBeginInfo>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   delete from.data.pInheritanceInfo;
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkCommandBufferBeginInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
+  delete from.data.pInheritanceInfo;
 }
 
 void fex_custom_repack_entry(host_layout<VkPipelineCacheCreateInfo>& into, const guest_layout<VkPipelineCacheCreateInfo>& from) {
@@ -2449,8 +2639,13 @@ void fex_custom_repack_entry(host_layout<VkPipelineCacheCreateInfo>& into, const
 }
 
 bool fex_custom_repack_exit(guest_layout<VkPipelineCacheCreateInfo>& into, const host_layout<VkPipelineCacheCreateInfo>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   // Nothing to do
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkPipelineCacheCreateInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
 }
 
 void fex_custom_repack_entry(host_layout<VkRenderPassBeginInfo>& into, const guest_layout<VkRenderPassBeginInfo>& from) {
@@ -2461,8 +2656,13 @@ void fex_custom_repack_entry(host_layout<VkRenderPassBeginInfo>& into, const gue
 }
 
 bool fex_custom_repack_exit(guest_layout<VkRenderPassBeginInfo>& into, const host_layout<VkRenderPassBeginInfo>& from) {
+  default_fex_custom_repack_reverse_pnext(into, from);
   // Nothing to do
   return false;
+}
+
+void fex_custom_repack_cleanup(const host_layout<VkRenderPassBeginInfo>& from) {
+  default_fex_custom_repack_cleanup(reinterpret_cast<const VkBaseOutStructure&>(from.data));
 }
 #endif
 

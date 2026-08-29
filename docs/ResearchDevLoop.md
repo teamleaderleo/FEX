@@ -6,6 +6,9 @@ recipe and it is not ARM runtime acceptance.
 For a beginner-oriented map of Vulkan GIPA/GDPA, custom host wrappers, and the focused inventory
 test, see [Vulkan proc-address routing](VulkanProcAddressRouting.md).
 
+For the custom struct-repacking lifecycle, const-safe host cleanup, Vulkan `pNext` ownership, and
+its allocation-balance oracle, see [Custom thunk repacking](ThunkRepacking.md).
+
 ## One target, not everything
 
 Initialize the pinned submodules once, then build only the target that owns the current question:
