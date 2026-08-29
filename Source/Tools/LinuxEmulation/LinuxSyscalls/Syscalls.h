@@ -264,12 +264,19 @@ public:
   }
 
   void InvalidateCodeRangeIfNecessaryOnRemap(FEXCore::Core::InternalThreadState* Thread, uint64_t OldAddress, uint64_t NewAddress,
-                                             size_t OldSize, size_t NewSize) {
+                                             size_t OldSize, size_t NewSize, int Flags) {
     if (SMCChecks != FEXCore::Config::CONFIG_SMC_NONE) {
       if (OldAddress != NewAddress) {
         if (OldSize != 0) {
           // This also handles the MREMAP_DONTUNMAP case
           TM.InvalidateGuestCodeRange(Thread, OldAddress, OldSize);
+        }
+        if ((Flags & MREMAP_FIXED) && NewSize != 0) {
+          // MREMAP_FIXED replaces any mapping already at the destination. Its
+          // numeric guest address can therefore still own cached translations
+          // for the replaced bytes. A non-fixed move chooses a free range and
+          // does not need this extra invalidation.
+          TM.InvalidateGuestCodeRange(Thread, NewAddress, NewSize);
         }
       } else {
         // If mapping shrunk, flush the unmapped region
