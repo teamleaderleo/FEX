@@ -1,10 +1,6 @@
 name: steamrt4 build
 
 on:
-  pull_request:
-    branches:
-      - main
-    types: [labeled]
   workflow_dispatch:
 
 env:
@@ -15,7 +11,6 @@ env:
 
 jobs:
   steamrt4_build:
-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'ci:full'
     runs-on: ${{ matrix.arch }}
     strategy:
       matrix:
