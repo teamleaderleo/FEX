@@ -1,0 +1,94 @@
+name: Focused MREMAP_FIXED destination cache ARM64
+
+on:
+  push:
+    branches: [codex/mremap-fixed-destination-cache]
+    paths:
+      - Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.h
+      - Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
+      - unittests/FEXLinuxTests/tests/smc/smc-2.cpp
+      - .github/workflows/mremap-fixed-destination-cache-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mremap-fixed-destination-cache-arm64
+  cancel-in-progress: true
+
+jobs:
+  focused-mremap-fixed:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      FEX_PORTABLE: 1
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64
+
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install focused build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake g++-x86-64-linux-gnu gcc-x86-64-linux-gnu \
+            libcap-dev lld ninja-build pkg-config
+
+      - name: Build exact FEX runtime prerequisites
+        run: |
+          set -euxo pipefail
+          CC=clang CXX=clang++ cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DUSE_LINKER=lld \
+            -DENABLE_LTO=OFF \
+            -DENABLE_ASSERTIONS=ON \
+            -DBUILD_TESTING=ON \
+            -DBUILD_FEX_LINUX_TESTS=ON \
+            -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF \
+            -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none \
+            -DX86_DEV_ROOTFS=/
+          cmake --build build --target FEX FEXServer --parallel "$(nproc)"
+
+      - name: Build only the 64-bit smc-2 guest test
+        run: |
+          set -euxo pipefail
+          cmake -S unittests/FEXLinuxTests/tests \
+            -B build/unittests/FEXLinuxTests/FEXLinuxTests_64 \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/Data/CMake/toolchain_x86_64.cmake" \
+            -DENABLE_CLANG_THUNKS=ON \
+            -DBITNESS=64
+          cmake --build build/unittests/FEXLinuxTests/FEXLinuxTests_64 \
+            --target smc-2.64 --parallel "$(nproc)"
+
+      - name: Prepare a disposable amd64 rootfs
+        run: |
+          set -euxo pipefail
+          docker pull --platform=linux/amd64 ubuntu:24.04
+          container_id="$(docker create --platform=linux/amd64 ubuntu:24.04 /bin/true)"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "$ROOTFS"
+          docker export "$container_id" | tar -C "$ROOTFS" -xf -
+          docker rm "$container_id"
+          trap - EXIT
+          mkdir -p "$ROOTFS/opt/fex-ci" "$ROOTFS/usr/lib/x86_64-linux-gnu"
+          cp build/unittests/FEXLinuxTests/FEXLinuxTests_64/smc-2.64 "$ROOTFS/opt/fex-ci/"
+          cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/"
+
+      - name: Run only the replaced-destination discriminator
+        run: |
+          set -euxo pipefail
+          FEX_ROOTFS="$ROOTFS" timeout 20s "$PWD/build/Bin/FEX" \
+            /opt/fex-ci/smc-2.64 \
+            'SMC: fixed mremap replaces cached destination' -s
