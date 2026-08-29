@@ -11,6 +11,9 @@ target_compile_definitions(thunkgentest PRIVATE
 add_test(NAME VulkanCustomRouteInventory.ThunkGen
   COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_custom_route_inventory.py" "${CMAKE_SOURCE_DIR}")
 
+add_test(NAME VulkanInstancePNextCopyInventory.ThunkGen
+  COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_instance_pnext_copy_inventory.py" "${CMAKE_SOURCE_DIR}")
+
 add_custom_target(thunkgen_tests
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
   USES_TERMINAL
