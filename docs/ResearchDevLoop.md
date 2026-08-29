@@ -15,8 +15,12 @@ git submodule update --init --recursive --depth 1
 
 The helper configures Clang, Ninja, lld, ccache, `RelWithDebInfo`, assertions, thunks and tests,
 without LTO or the GUI. It prints and stores a receipt containing the exact source head, dirty bit,
-target, worker count, duration, result and cache namespace. A target build does not claim a full
-build or full-test pass.
+target, worker count, duration, result, cache namespace and ccache sloppiness policy. FEX's CMake
+already elects `time_macros` reuse for sources that embed `__DATE__` or `__TIME__`; the helper
+exports that setting explicitly because the CMake 4.2/Ninja launcher observed on big-red retained
+`ccache` but dropped its policy argument. A cache hit can therefore retain an earlier embedded build
+timestamp, as intended by that repository policy. A target build does not claim a full build or
+full-test pass.
 
 When the question needs an x86 guest Linux test binary, select the bounded profile explicitly:
 
@@ -96,6 +100,25 @@ Ninja 1.13.2 and ccache 4.12.3:
 The stable view cut that clean target rebuild by 72.2%, not to zero. Generated/dependency-sensitive
 steps still missed. Ordinary edits should stay in one warm lane; worktree switching is for isolation,
 review and exact-head experiments.
+
+A follow-up at source head `cf33899aed10a9ce0ccf2a6f285f0054ee18874d`, with eight workers and
+a route-private copy of the same frozen cache, measured the two remaining causes separately:
+
+| clean exact-head replay | target time | wrapper wall | cache result |
+| --- | ---: | ---: | --- |
+| deterministic Vulkan thunk output | 5.76 s | 12.58 s | 294/298 cacheable calls hit |
+| explicit `time_macros` policy | 1.00 s | 7.07 s | 298/298 cacheable calls hit |
+
+The first row is the realized benefit of sorting thunk declarations deterministically before the
+existing dependency pass: the generated 1,951,591-byte include remained byte-identical, and the
+4,890,688-byte Vulkan `Host.cpp` object changed from a roughly 4.8-second compilation to a direct
+hit. The second row validates this helper's explicit export of FEX's already-selected timestamp
+policy: all three sources containing `__DATE__` or `__TIME__` became direct hits. The full change
+from the fixed-head cache-population build (21.43 s target) to the final replay (1.00 s) was 95.3%,
+but part of that combined improvement came from populating the second worktree-path manifest for
+`Context.cpp`; it must not all be attributed to timestamp handling. Wrapper time is now dominated
+by the roughly 5.8-second configure/source-switch phase. These are target-build measurements, not
+runtime or test-suite results.
 
 ## Ubuntu development packages used on big-red
 

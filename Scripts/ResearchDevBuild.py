@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 LANE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 LINUX_TEST_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 PROFILE = "x86-host-dev-v1"
+CCACHE_SLOPPINESS = "time_macros"
 CONFIGURE_OPTIONS = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
     "-DENABLE_LTO=False",
@@ -138,6 +139,7 @@ def environment(cache_root: Path, lane_root: Path, profile: str = PROFILE) -> di
             "CCACHE_BASEDIR": str(lane_root),
             "CCACHE_NOHASHDIR": "true",
             "CCACHE_NAMESPACE": cpu_namespace(profile),
+            "CCACHE_SLOPPINESS": CCACHE_SLOPPINESS,
         }
     )
     return result
@@ -311,6 +313,7 @@ def expected_profile(
         "profile": profile,
         "configureOptions": configure_options,
         "cacheNamespace": cache_namespace,
+        "ccacheSloppiness": CCACHE_SLOPPINESS,
     }
 
 
@@ -448,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
                     "elapsedSeconds": round(time.monotonic() - started, 6),
                     "exitCode": completed.returncode,
                     "cacheNamespace": env["CCACHE_NAMESPACE"],
+                    "ccacheSloppiness": env["CCACHE_SLOPPINESS"],
                 }
                 write_receipt(receipt_path, receipt)
                 print(f"guestBinary={guest_build / guest_target}")
@@ -478,6 +482,7 @@ def main(argv: list[str] | None = None) -> int:
                 "elapsedSeconds": round(time.monotonic() - started, 6),
                 "exitCode": completed.returncode,
                 "cacheNamespace": env["CCACHE_NAMESPACE"],
+                "ccacheSloppiness": env["CCACHE_SLOPPINESS"],
             }
             write_receipt(receipt_path, receipt)
             print(json.dumps(receipt, sort_keys=True))

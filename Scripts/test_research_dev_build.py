@@ -29,6 +29,14 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertIn("-DUSE_LINKER=lld", command)
         self.assertNotIn("-DBUILD_FEX_LINUX_TESTS=True", command)
 
+    def test_environment_enforces_and_records_fex_time_macro_policy(self):
+        with mock.patch.object(dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"):
+            environment = dev_build.environment(Path("/cache"), Path("/lane"))
+
+        self.assertEqual(environment["CCACHE_SLOPPINESS"], "time_macros")
+        marker = dev_build.expected_profile(environment["CCACHE_NAMESPACE"])
+        self.assertEqual(marker["ccacheSloppiness"], "time_macros")
+
     def test_linux_test_profile_adds_only_the_explicit_test_surface(self):
         profile = dev_build.CONFIGURE_PROFILES["linux-tests"]
         with mock.patch.object(dev_build, "required_tool", return_value="/tool/cmake"):
