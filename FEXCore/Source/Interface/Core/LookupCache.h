@@ -122,6 +122,13 @@ struct GuestToHostMap {
     return BlockList.erase(Address) != 0;
   }
 
+  // Synthetic CustomIR blocks do not have decoded guest code pages, so they
+  // cannot be discovered by InvalidateRange's reverse index.
+  bool InvalidateExactEntry(uint64_t Address) {
+    auto lk = AcquireWriteLock();
+    return Erase(Address, lk);
+  }
+
   void InvalidateRange(uint64_t Start, uint64_t Length) {
     auto lk = AcquireWriteLock();
 
@@ -333,6 +340,13 @@ public:
       BlockPointers[PageOffset].GuestCode = 0;
       BlockPointers[PageOffset].HostCode = 0;
     }
+  }
+
+  // Invalidates a synthetic entry in this thread's L1/L2 caches without
+  // relying on CachedCodePages.
+  void InvalidateCacheEntry(uint64_t Address) {
+    auto lk = Shared->AcquireWriteLock();
+    InvalidateCache(Address, lk);
   }
 
   // Invalidates all L1/L2 entries for all guest block that intersect the given range

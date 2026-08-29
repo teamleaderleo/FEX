@@ -215,6 +215,23 @@ public:
     ++IdleWaitRefCount;
   }
 
+  void AddThunkTrampolineIRHandler(FEXCore::Core::InternalThreadState* CallingThread, uintptr_t Entrypoint,
+                                   uintptr_t GuestThunkEntrypoint) {
+    std::lock_guard lk(ThreadCreationMutex);
+
+    // Keep registry replacement and cache retirement in one transaction. This
+    // prevents compilation from observing the new handler through stale code.
+    auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), CallingThread);
+    if (!CTX->AddThunkTrampolineIRHandler(Entrypoint, GuestThunkEntrypoint)) {
+      return;
+    }
+
+    CTX->InvalidateCodeBuffersCodeEntry(Entrypoint);
+    for (auto& Thread : Threads) {
+      CTX->InvalidateThreadCachedCodeEntry(Thread->Thread, Entrypoint);
+    }
+  }
+
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
     std::lock_guard lk(ThreadCreationMutex);
 

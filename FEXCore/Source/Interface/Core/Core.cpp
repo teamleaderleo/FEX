@@ -1031,6 +1031,21 @@ void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
   }
 }
 
+void ContextImpl::InvalidateCodeBuffersCodeEntry(uint64_t Address) {
+  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+
+  std::scoped_lock lk {CodeBufferListLock};
+  auto it = CodeBufferList.begin();
+  while (it != CodeBufferList.end()) {
+    if (auto Strong = it->lock()) {
+      Strong->LookupCache->InvalidateExactEntry(Address);
+      ++it;
+    } else {
+      it = CodeBufferList.erase(it);
+    }
+  }
+}
+
 void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
 
@@ -1044,6 +1059,16 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
     // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
     Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
   }
+}
+
+void ContextImpl::InvalidateThreadCachedCodeEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
+  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+
+  Thread->LookupCache->InvalidateCacheEntry(Address);
+
+  // A cached call/return prediction can bypass the ordinary lookup path.
+  // Rebinding native function pointers is rare, so flush it unconditionally.
+  Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
 }
 
 void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
@@ -1067,9 +1092,10 @@ ContextImpl::AddCustomIREntrypoint(uintptr_t Entrypoint, CustomIREntrypointHandl
   return std::nullopt;
 }
 
-void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) {
+bool ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) {
   LOGMAN_THROW_A_FMT(Entrypoint, "Tried to link null pointer address to guest function");
   LOGMAN_THROW_A_FMT(GuestThunkEntrypoint, "Tried to link address to null pointer guest function");
+  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
   if (!Config.Is64BitMode) {
     LOGMAN_THROW_A_FMT((Entrypoint >> 32) == 0, "Tried to link 64-bit address in 32-bit mode");
     LOGMAN_THROW_A_FMT((GuestThunkEntrypoint >> 32) == 0, "Tried to link 64-bit address in 32-bit mode");
@@ -1077,38 +1103,45 @@ void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Gu
 
   LogMan::Msg::DFmt("Thunks: Adding guest trampoline from address {:#x} to guest function {:#x}", Entrypoint, GuestThunkEntrypoint);
 
-  auto Result = AddCustomIREntrypoint(
-    Entrypoint,
-    [this, GuestThunkEntrypoint](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
-      auto IRHeader = emit->_IRHeader(emit->Invalid(), Entrypoint, 0, 0, 0, 0);
-      auto Block = emit->CreateCodeNode(true, 0);
-      IRHeader.first->Blocks = emit->WrapNode(Block);
-      emit->SetCurrentCodeBlock(Block);
+  CustomIREntrypointHandler Handler = [this, GuestThunkEntrypoint](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
+    auto IRHeader = emit->_IRHeader(emit->Invalid(), Entrypoint, 0, 0, 0, 0);
+    auto Block = emit->CreateCodeNode(true, 0);
+    IRHeader.first->Blocks = emit->WrapNode(Block);
+    emit->SetCurrentCodeBlock(Block);
 
-      const auto GPRSize = this->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit;
+    const auto GPRSize = this->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit;
 
-      // Thunk entry-points don't get cached, don't need to be padded.
-      if (GPRSize == IR::OpSize::i64Bit) {
-        IR::Ref R = emit->_StoreRegister(emit->Constant(Entrypoint), GPRSize);
-        R->Reg = IR::PhysicalRegister(IR::RegClass::GPRFixed, X86State::REG_R11).Raw;
-      } else {
-        emit->_StoreContextFPR(GPRSize, emit->_VCastFromGPR(IR::OpSize::i64Bit, IR::OpSize::i64Bit, emit->Constant(Entrypoint)),
-                               offsetof(Core::CPUState, mm[0][0]));
-      }
-      emit->_ExitFunction(IR::OpSize::i64Bit, emit->Constant(GuestThunkEntrypoint), IR::BranchHint::None, emit->Invalid(), emit->Invalid());
-    },
-    ThunkHandler, (void*)GuestThunkEntrypoint);
-
-  if (Result.has_value()) {
-    if (Result->Creator != ThunkHandler) {
-      ERROR_AND_DIE_FMT("Input address for AddThunkTrampoline is already linked by another module");
+    // Thunk entry-points don't get cached, don't need to be padded.
+    if (GPRSize == IR::OpSize::i64Bit) {
+      IR::Ref R = emit->_StoreRegister(emit->Constant(Entrypoint), GPRSize);
+      R->Reg = IR::PhysicalRegister(IR::RegClass::GPRFixed, X86State::REG_R11).Raw;
+    } else {
+      emit->_StoreContextFPR(GPRSize, emit->_VCastFromGPR(IR::OpSize::i64Bit, IR::OpSize::i64Bit, emit->Constant(Entrypoint)),
+                             offsetof(Core::CPUState, mm[0][0]));
     }
-    if (Result->Data != (void*)GuestThunkEntrypoint) {
-      // NOTE: This may happen in Vulkan thunks if the Vulkan driver resolves two different symbols
-      //       to the same function (e.g. vkGetPhysicalDeviceFeatures2/vkGetPhysicalDeviceFeatures2KHR)
-      LogMan::Msg::EFmt("Input address for AddThunkTrampoline is already linked elsewhere");
-    }
+    emit->_ExitFunction(IR::OpSize::i64Bit, emit->Constant(GuestThunkEntrypoint), IR::BranchHint::None, emit->Invalid(), emit->Invalid());
+  };
+
+  std::unique_lock lk(CustomIRMutex);
+  auto Iterator = CustomIRHandlers.find(Entrypoint);
+  if (Iterator == CustomIRHandlers.end()) {
+    CustomIRHandlers.emplace(Entrypoint, CustomIRHandlerEntry {std::move(Handler), ThunkHandler, (void*)GuestThunkEntrypoint});
+    HasCustomIRHandlers = true;
+    return false;
   }
+
+  auto& Existing = Iterator->second;
+  if (Existing.Creator != ThunkHandler) {
+    ERROR_AND_DIE_FMT("Input address for AddThunkTrampoline is already linked by another module");
+  }
+  if (Existing.Data == (void*)GuestThunkEntrypoint) {
+    return false;
+  }
+
+  LogMan::Msg::DFmt("Thunks: Rebinding guest trampoline at address {:#x} from guest function {} to {:#x}", Entrypoint, Existing.Data,
+                    GuestThunkEntrypoint);
+  Existing = CustomIRHandlerEntry {std::move(Handler), ThunkHandler, (void*)GuestThunkEntrypoint};
+  return true;
 }
 
 void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {
@@ -1126,16 +1159,6 @@ void ContextImpl::RemoveForceTSOInformation(uint64_t Address, uint64_t Size) {
 
 void ContextImpl::MarkMonoBackpatcherBlock(uint64_t BlockEntry) {
   MonoBackpatcherBlock.store(BlockEntry, std::memory_order_relaxed);
-}
-
-void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) {
-  LOGMAN_THROW_A_FMT(Config.Is64BitMode || !(Entrypoint >> 32), "64-bit Entrypoint in 32-bit mode {:x}", Entrypoint);
-
-  std::scoped_lock lk(CustomIRMutex);
-
-  CustomIRHandlers.erase(Entrypoint);
-  HasCustomIRHandlers = !CustomIRHandlers.empty();
-  SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
 }
 
 void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {

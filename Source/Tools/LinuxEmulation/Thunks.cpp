@@ -418,8 +418,7 @@ namespace ThunkFunctions {
     };
 
     auto args = reinterpret_cast<args_t*>(argsv);
-    auto CTX = static_cast<FEXCore::Context::Context*>(ThreadObject->Thread->CTX);
-    CTX->AddThunkTrampolineIRHandler(args->original_callee, args->target_addr);
+    FEX::HLE::_SyscallHandler->TM.AddThunkTrampolineIRHandler(ThreadObject->Thread, args->original_callee, args->target_addr);
   }
 
   /**

@@ -19,6 +19,13 @@ git submodule update --init --recursive --depth 1
 ./Scripts/ResearchDevBuild.py --lane vulkan status
 ```
 
+The helper checks every recursive submodule before it configures anything. It fails immediately when
+a submodule is uninitialized, conflicted, or not at the superproject's pinned commit, and prints the
+exact recovery command above. This keeps missing third-party sources from turning into a long wall of
+unrelated CMake errors. It does not update submodules automatically because doing so mutates the
+worktree and can erase the provenance distinction between the requested source and the environment
+that happened to be present.
+
 The helper configures Clang, Ninja, lld, ccache, `RelWithDebInfo`, assertions, thunks and tests,
 without LTO or the GUI. It prints and stores a receipt containing the exact source head, dirty bit,
 target, worker count, configuration mode, setup and target durations, result, cache namespace and
