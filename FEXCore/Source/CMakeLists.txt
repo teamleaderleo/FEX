@@ -18,6 +18,7 @@ set(SRCS
   Common/JitSymbols.cpp
   Interface/Context/Context.cpp
   Interface/Core/LookupCache.cpp
+  Interface/Core/DiskCache.cpp
   Interface/Core/CodeCache.cpp
   Interface/Core/Core.cpp
   Interface/Core/CPUBackend.cpp
@@ -69,6 +70,7 @@ set(SRCS
   Utils/LongJump.cpp
   Utils/Telemetry.cpp
   Utils/Threads.cpp
+  Utils/WorkQueueThread.cpp
   Utils/Profiler.cpp)
 
 if (ARCHITECTURE_arm64)

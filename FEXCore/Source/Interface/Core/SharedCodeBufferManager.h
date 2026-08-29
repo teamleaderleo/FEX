@@ -8,6 +8,7 @@ $end_info$
 #pragma once
 
 #include <FEXCore/fextl/memory.h>
+#include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
 
@@ -20,9 +21,6 @@ struct GuestToHostMap;
 
 namespace FEXCore::CPU {
 struct CodeBuffer {
-  uint8_t* Ptr;
-  size_t AllocatedSize; // including guard page; see UsableSize()
-
   fextl::unique_ptr<GuestToHostMap> LookupCache;
 
   CodeBuffer(size_t Size);
@@ -33,10 +31,73 @@ struct CodeBuffer {
 
   ~CodeBuffer();
 
-  /// Returns the number of bytes available for storing code
+  // Atomically allocate a fixed size buffer out of the current allocated codebuffer.
+  // Lockless because it's just a linear allocator.
+  struct CodeBufferAllocation {
+    const uint8_t* BufferBase;
+    uint8_t* BufferAllocationOffset;
+  };
+
+  CodeBufferAllocation AtomicAllocateBuffer(size_t Size) {
+    Size = FEXCore::AlignUp(Size, 16);
+    LOGMAN_THROW_A_FMT(reinterpret_cast<uintptr_t>(CodeBufferOffset.load()) % 16 == 0, "Buffer needs to always be 16B aligned!");
+
+    auto ExpectedOffset = CodeBufferOffset.load(std::memory_order_relaxed);
+    auto DesiredOffset = ExpectedOffset + Size;
+
+    if (DesiredOffset > CodeBufferEnd) {
+      // Couldn't fit.
+      return {};
+    }
+
+    while (!CodeBufferOffset.compare_exchange_strong(ExpectedOffset, DesiredOffset)) {
+      DesiredOffset = ExpectedOffset + Size;
+
+      if (DesiredOffset > CodeBufferEnd) {
+        // Couldn't fit.
+        return {};
+      }
+    }
+
+    // Managed to fit.
+    return {
+      .BufferBase = Ptr,
+      .BufferAllocationOffset = ExpectedOffset,
+    };
+  }
+
+  // Returns the total number of bytes available for storing code
   size_t UsableSize() const {
     return AllocatedSize - FEXCore::Utils::FEX_PAGE_SIZE;
   }
+
+  // Returns the full size of the buffer, including the guard page.
+  size_t TotalAllocationSize() const {
+    return AllocatedSize;
+  }
+
+  // Returns the num of bytes currently allocated from the allocator.
+  size_t AllocatedSpaceUsed() const {
+    return CodeBufferOffset - Ptr;
+  }
+
+  // Trivially reset the allocator.
+  void Reset() {
+    CodeBufferOffset = Ptr;
+  }
+
+  // Returns the base of the buffer.
+  uint8_t* GetBufferBase() const {
+    return Ptr;
+  }
+
+private:
+  uint8_t* Ptr;
+  uint8_t* CodeBufferEnd;
+  size_t AllocatedSize; // including guard page; see UsableSize()
+
+  // Code buffer allocation information.
+  std::atomic<uint8_t*> CodeBufferOffset {};
 };
 
 /**
@@ -50,6 +111,8 @@ struct CodeBuffer {
  */
 class SharedCodeBufferManager {
 public:
+  virtual ~SharedCodeBufferManager() = default;
+
   // Get the CodeBuffer that was most recently allocated.
   // This is the only CodeBuffer that data may be written to.
   fextl::shared_ptr<CodeBuffer> GetLatest();
@@ -61,12 +124,6 @@ public:
   // Allocate a new CodeBuffer with maximum internal size.
   // Subsequent calls to GetLatest will point to the returned buffer.
   fextl::shared_ptr<CodeBuffer> StartMaximalCodeBuffer();
-
-  // Write offset into the latest CodeBuffer
-  std::size_t LatestOffset {};
-
-  // Protects writes to the latest CodeBuffer and changes to LatestOffset
-  FEXCore::ForkableUniqueMutex CodeBufferWriteMutex;
 
   virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
 

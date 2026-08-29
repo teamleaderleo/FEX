@@ -314,7 +314,7 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
   std::ranges::copy(GIT_HASH, header.FEXVersion);
   header.NumBlocks = LookupCache.BlockList.size();
   header.NumCodePages = LookupCache.CodePages.size();
-  header.CodeBufferSize = FEXCore::AlignUp(CTX.LatestOffset, Utils::FEX_PAGE_SIZE);
+  header.CodeBufferSize = FEXCore::AlignUp(CodeBuffer->AllocatedSpaceUsed(), Utils::FEX_PAGE_SIZE);
   header.NumRelocations = Relocations.size();
   header.SerializedBaseAddress = SerializedBaseAddress;
   ::write(fd, &header, sizeof(header));
@@ -337,7 +337,7 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
 
       Guest -= SourceBinary.FileStartVA;
       ::write(fd, &Guest, sizeof(Guest));
-      uint64_t HostCode = Host->HostCode - reinterpret_cast<uintptr_t>(CodeBuffer->Ptr);
+      uint64_t HostCode = Host->HostCode - reinterpret_cast<uintptr_t>(CodeBuffer->GetBufferBase());
       ::write(fd, &HostCode, sizeof(HostCode));
       uint64_t NumCodePages = Host->CodePages.size();
       ::write(fd, &NumCodePages, sizeof(NumCodePages));
@@ -361,8 +361,9 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
   }
 
   // Dump the host code (relocated for position-independent serialization)
-  std::span CodeBufferData(reinterpret_cast<std::byte*>(CodeBuffer->Ptr), reinterpret_cast<std::byte*>(CodeBuffer->Ptr) + CTX.LatestOffset);
-  if (!ApplyCodeRelocations(SerializedBaseAddress, CodeBufferData, Relocations, 0, true)) {
+  std::span CodeBufferData(reinterpret_cast<std::byte*>(CodeBuffer->GetBufferBase()),
+                           reinterpret_cast<std::byte*>(CodeBuffer->GetBufferBase()) + CodeBuffer->AllocatedSpaceUsed());
+  if (!ApplyCodeRelocations(SerializedBaseAddress, CodeBufferData, Relocations, true)) {
     LOGMAN_THROW_A_FMT(false, "Failed to apply code relocations");
     return false;
   }
@@ -405,7 +406,7 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
       ERROR_AND_DIE_FMT("Failed to create cache load validation context");
     }
 
-    ValidationThread.reset(ValidationCTX->CreateThread(0, 0, nullptr));
+    ValidationThread.reset(ValidationCTX->CreateThread(nullptr));
 
     auto Frame = ValidationThread->CurrentFrame;
     Frame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = &ValidationGDT[0];
@@ -426,11 +427,12 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
   while (CachedCode.size_bytes() > NewCodeBuffer->UsableSize()) {
     ValidationCTX->ClearCodeCache(ValidationThread.get());
     NewCodeBuffer = ValidationCTX->GetLatest();
-    LogMan::Msg::IFmt("Increased cache validation code buffer size to {} MiB", NewCodeBuffer->AllocatedSize / 1024 / 1024);
+    LogMan::Msg::IFmt("Increased cache validation code buffer size to {} MiB", NewCodeBuffer->TotalAllocationSize() / 1024 / 1024);
   }
 
   std::span<std::byte> CodeBufferRangeRef =
-    std::as_writable_bytes(std::span {NewCodeBuffer->Ptr, NewCodeBuffer->Ptr + NewCodeBuffer->UsableSize()}).subspan(0, CachedCode.size_bytes());
+    std::as_writable_bytes(std::span {NewCodeBuffer->GetBufferBase(), NewCodeBuffer->GetBufferBase() + NewCodeBuffer->UsableSize()})
+      .subspan(0, CachedCode.size_bytes());
 
   while (!GuestBlocks.empty()) {
     auto [CompiledBlocks, _, _2, _3, _4] = ValidationCTX->CompileCode(ValidationThread.get(), *GuestBlocks.begin(), 0 /* TODO: Set MaxInst? */);
@@ -444,12 +446,12 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
   NewRelocations.erase(std::remove_if(NewRelocations.begin(), NewRelocations.end(), [](const CPU::Relocation& Reloc) {
     return Reloc.Header.Type != CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL && Reloc.Header.Type != CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE;
   }));
-  (void)ApplyCodeRelocations(Section.FileStartVA, CodeBufferRangeRef, NewRelocations, 0, false);
+  (void)ApplyCodeRelocations(Section.FileStartVA, CodeBufferRangeRef, NewRelocations, false);
 
-  if (ValidationCTX->LatestOffset <= CodeBufferRangeRef.size()) {
+  if (NewCodeBuffer->AllocatedSpaceUsed() <= CodeBufferRangeRef.size()) {
     // Reference compilation produced fewer bytes than our cache, so validation is going to fail.
     // Make sure we don't output any garbage bytes though.
-    CodeBufferRangeRef = CodeBufferRangeRef.subspan(0, ValidationCTX->LatestOffset);
+    CodeBufferRangeRef = CodeBufferRangeRef.subspan(0, NewCodeBuffer->AllocatedSpaceUsed());
   }
 
   auto [Mismatch, _] = std::mismatch(CodeBufferRangeRef.begin(), CodeBufferRangeRef.end(), CachedCode.begin());
@@ -500,47 +502,100 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
 
   // Reset Context state for next validation
   ValidationThread->LookupCache->ClearCache(ValidationThread->LookupCache->AcquireWriteLock());
-  ValidationCTX->LatestOffset = 0;
+  NewCodeBuffer->Reset();
 
   LogMan::Msg::IFmt("            successfully validated cache");
 }
 
-bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> Code,
-                                     std::span<const FEXCore::CPU::Relocation> EntryRelocations, uint32_t RelocationOffset, bool ForStorage) {
-  CPU::Arm64Emitter Emitter(&CTX, Code.data(), Code.size_bytes());
-  for (size_t j = 0; j < EntryRelocations.size(); ++j) {
-    const FEXCore::CPU::Relocation& Reloc = EntryRelocations[j];
-    LOGMAN_THROW_A_FMT(Reloc.Header.Offset >= RelocationOffset, "Invalid relocation offset");
-    LOGMAN_THROW_A_FMT(Reloc.Header.Offset - RelocationOffset < Code.size_bytes(), "Invalid relocation offset");
-    Emitter.SetCursorOffset(Reloc.Header.Offset - RelocationOffset);
+static inline void ApplySymbolLiteralRelocation(ContextImpl& CTX, const CPU::RelocNamedSymbolLiteral::NamedSymbol Symbol,
+                                                uint64_t GuestEntry, CPU::Arm64Emitter& Emitter, bool ForStorage) {
+  // Generate a literal so we can place it
+  uint64_t Pointer = ForStorage ? 0 : GetNamedSymbolLiteral(CTX, Symbol);
+  Emitter.dc64(Pointer);
+}
 
-    switch (Reloc.Header.Type) {
+static inline bool
+ApplyThunkMoveRelocation(ContextImpl& CTX, const IR::SHA256Sum* Symbol, uint32_t RegisterIndex, CPU::Arm64Emitter& Emitter, bool ForStorage) {
+  uint64_t Pointer = ForStorage ? 0 : reinterpret_cast<uint64_t>(CTX.ThunkHandler->LookupThunk(*Symbol));
+  if (Pointer == ~0ULL) {
+    return false;
+  }
+  // TODO: Pointers are required to fit within 48-bit VA space.
+  // But forcing 6-byte broke relocations.
+  Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), Pointer, CPU::Arm64Emitter::PadType::DOPAD);
+  return true;
+}
+
+static inline void ApplyRIPLiteralRelocation(ContextImpl& CTX, uint64_t GuestRIP, uint64_t GuestEntry, CPU::Arm64Emitter& Emitter) {
+  Emitter.dc64(GuestEntry + GuestRIP);
+}
+
+static inline void
+ApplyRIPMoveRelocation(ContextImpl& CTX, uint64_t GuestRIP, uint8_t RegisterIndex, uint64_t GuestEntry, CPU::Arm64Emitter& Emitter) {
+  uint64_t Pointer = GuestRIP + GuestEntry;
+  // TODO: Pointers are required to fit within 48-bit VA space.
+  // But forcing 6-byte broke relocations.
+  Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), Pointer, CPU::Arm64Emitter::PadType::DOPAD);
+}
+
+bool CodeCache::ApplyPackedCodeRelocations(uint64_t GuestEntry, std::span<std::byte> Code,
+                                           std::span<const DiskCache::BlobSmallRelocation> SmallRelocs,
+                                           std::span<const DiskCache::BlobThunkRelocation> ThunkRelocs, bool ForStorage) {
+  CPU::Arm64Emitter Emitter(&CTX, Code.data(), Code.size_bytes());
+  for (auto& Reloc : SmallRelocs) {
+    LOGMAN_THROW_A_FMT(Reloc.Offset < Code.size_bytes(), "Invalid relocation offset");
+    Emitter.SetCursorOffset(Reloc.Offset);
+    switch ((CPU::RelocationTypes)Reloc.Type) {
     case FEXCore::CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL: {
-      // Generate a literal so we can place it
-      uint64_t Pointer = ForStorage ? 0 : GetNamedSymbolLiteral(CTX, Reloc.NamedSymbolLiteral.Symbol);
-      Emitter.dc64(Pointer);
-      break;
-    }
-    case FEXCore::CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE: {
-      uint64_t Pointer = ForStorage ? 0 : reinterpret_cast<uint64_t>(CTX.ThunkHandler->LookupThunk(Reloc.NamedThunkMove.Symbol));
-      if (Pointer == ~0ULL) {
-        return false;
-      }
-      // TODO: Pointers are required to fit within 48-bit VA space.
-      // But forcing 6-byte broke relocations.
-      Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(Reloc.NamedThunkMove.RegisterIndex), Pointer,
-                           CPU::Arm64Emitter::PadType::DOPAD);
+      ApplySymbolLiteralRelocation(CTX, (CPU::RelocNamedSymbolLiteral::NamedSymbol)Reloc.Named.Symbol, GuestEntry, Emitter, ForStorage);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: {
-      Emitter.dc64(GuestEntry + Reloc.GuestRIP.GuestRIP);
+      ApplyRIPLiteralRelocation(CTX, Reloc.RIPLiteral.GuestRIP, GuestEntry, Emitter);
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE: {
-      uint64_t Pointer = Reloc.GuestRIP.GuestRIP + GuestEntry;
-      // TODO: Pointers are required to fit within 48-bit VA space.
-      // But forcing 6-byte broke relocations.
-      Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(Reloc.GuestRIP.RegisterIndex), Pointer, CPU::Arm64Emitter::PadType::DOPAD);
+      ApplyRIPMoveRelocation(CTX, Reloc.RIPMove.GuestRIP, Reloc.RIPMove.RegisterIndex, GuestEntry, Emitter);
+      break;
+    }
+    default: ERROR_AND_DIE_FMT("Unknown packed relocation type {}", ToUnderlying((CPU::RelocationTypes)Reloc.Type));
+    }
+  }
+  for (auto& Reloc : ThunkRelocs) {
+    LOGMAN_THROW_A_FMT(Reloc.Offset < Code.size_bytes(), "Invalid relocation offset");
+    Emitter.SetCursorOffset(Reloc.Offset);
+    if (!ApplyThunkMoveRelocation(CTX, (const IR::SHA256Sum*)Reloc.SymbolHash, Reloc.RegisterIndex, Emitter, ForStorage)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> Code,
+                                     std::span<const FEXCore::CPU::Relocation> EntryRelocations, bool ForStorage) {
+  CPU::Arm64Emitter Emitter(&CTX, Code.data(), Code.size_bytes());
+  for (size_t j = 0; j < EntryRelocations.size(); ++j) {
+    const FEXCore::CPU::Relocation& Reloc = EntryRelocations[j];
+    LOGMAN_THROW_A_FMT(Reloc.Header.Offset < Code.size_bytes(), "Invalid relocation offset");
+    Emitter.SetCursorOffset(Reloc.Header.Offset);
+
+    switch (Reloc.Header.Type) {
+    case FEXCore::CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL: {
+      ApplySymbolLiteralRelocation(CTX, Reloc.NamedSymbolLiteral.Symbol, GuestEntry, Emitter, ForStorage);
+      break;
+    }
+    case FEXCore::CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE: {
+      if (!ApplyThunkMoveRelocation(CTX, &Reloc.NamedThunkMove.Symbol, Reloc.NamedThunkMove.RegisterIndex, Emitter, ForStorage)) {
+        return false;
+      }
+      break;
+    }
+    case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: {
+      ApplyRIPLiteralRelocation(CTX, Reloc.GuestRIP.GuestRIP, GuestEntry, Emitter);
+      break;
+    }
+    case FEXCore::CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE: {
+      ApplyRIPMoveRelocation(CTX, Reloc.GuestRIP.GuestRIP, Reloc.GuestRIP.RegisterIndex, GuestEntry, Emitter);
       break;
     }
 
@@ -871,7 +926,7 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
   auto StagingSpan = std::span {Staging, Size};
   for (size_t i = StartPage; i < EndPage; ++i) {
     auto PageRelocations = SpanPageRelocations(Code, i);
-    (void)ApplyCodeRelocations(Code.GuestBase, StagingSpan, PageRelocations, static_cast<uint32_t>(StartOffset), false);
+    (void)ApplyCodeRelocations(Code.GuestBase, StagingSpan, PageRelocations, false);
     Code.LoadedPages[i] = true;
   }
 
@@ -894,7 +949,7 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
 #endif
   for (size_t i = StartPage; i < EndPage; ++i) {
     auto PageRelocations = SpanPageRelocations(Code, i);
-    (void)ApplyCodeRelocations(Code.GuestBase, Code.CodeBuffer, PageRelocations, 0, false);
+    (void)ApplyCodeRelocations(Code.GuestBase, Code.CodeBuffer, PageRelocations, false);
     Code.LoadedPages[i] = true;
   }
 #endif
