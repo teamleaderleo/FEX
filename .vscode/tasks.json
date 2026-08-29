@@ -25,6 +25,19 @@
       "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
       "args": ["--lane", "editor", "status"],
       "problemMatcher": []
+    },
+    {
+      "label": "FEX: build target and run one exact CTest",
+      "type": "process",
+      "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
+      "args": [
+        "--lane",
+        "editor",
+        "check",
+        "${input:fexCheckTarget}",
+        "${input:fexCTest}"
+      ],
+      "problemMatcher": ["$gcc"]
     }
   ],
   "inputs": [
@@ -33,6 +46,18 @@
       "type": "promptString",
       "description": "Exact CMake target to build (not 'everything')",
       "default": "vulkan-host-64"
+    },
+    {
+      "id": "fexCheckTarget",
+      "type": "promptString",
+      "description": "Exact CMake target that owns the CTest",
+      "default": "thunkgentest"
+    },
+    {
+      "id": "fexCTest",
+      "type": "promptString",
+      "description": "One exact CTest name (not a regex)",
+      "default": "VulkanCustomRouteInventory.ThunkGen"
     }
   ]
 }

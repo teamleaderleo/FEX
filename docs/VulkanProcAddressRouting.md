@@ -83,9 +83,8 @@ Run only this check with:
 ```sh
 python3 unittests/ThunkLibs/vulkan_custom_route_inventory.py "$PWD"
 
-ctest --test-dir PATH_TO_CONFIGURED_BUILD \
-  --output-on-failure \
-  -R '^VulkanCustomRouteInventory\.ThunkGen$'
+./Scripts/ResearchDevBuild.py --lane vulkan check \
+  thunkgentest VulkanCustomRouteInventory.ThunkGen
 ```
 
 For a composition build, the owned-fork focused lane can build only the affected host thunk:

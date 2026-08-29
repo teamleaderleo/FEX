@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -50,7 +51,7 @@ CONFIGURE_PROFILES = {
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Initialize sources, configure, or build one exact FEX target."
+        description="Initialize sources, build one exact FEX target, or run one exact CTest."
     )
     result.add_argument("--lane", default="dev", help="isolated stable-path lane name")
     result.add_argument("--source", type=Path, default=REPO_ROOT, help="FEX worktree to expose")
@@ -100,6 +101,18 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--jobs", type=positive_int, default=min(os.cpu_count() or 1, 16), help="build workers"
     )
+    check = subparsers.add_parser(
+        "check",
+        help="build one named target and run one exact CTest",
+    )
+    check.add_argument("target", help="exact owning target, for example thunkgentest")
+    check.add_argument(
+        "test",
+        help="exact CTest name, for example VulkanCustomRouteInventory.ThunkGen",
+    )
+    check.add_argument(
+        "--jobs", type=positive_int, default=min(os.cpu_count() or 1, 16), help="build workers"
+    )
     linux_test = subparsers.add_parser(
         "linux-test-build",
         help="build FEX prerequisites plus one exact guest Linux test binary",
@@ -134,6 +147,14 @@ def validate_lane(raw: str) -> str:
 def validate_linux_test(raw: str) -> str:
     if not LINUX_TEST_PATTERN.fullmatch(raw):
         raise ValueError("Linux test must be one exact target basename")
+    return raw
+
+
+def validate_ctest_name(raw: str) -> str:
+    if not raw or len(raw) > 512 or raw != raw.strip():
+        raise ValueError("CTest name must be one nonempty exact name of at most 512 characters")
+    if not raw.isprintable() or any(character in raw for character in "\r\n\0"):
+        raise ValueError("CTest name must be one printable line")
     return raw
 
 
@@ -220,6 +241,101 @@ def build_command(build: Path, target: str, jobs: int) -> list[str]:
         "--parallel",
         str(jobs),
     ]
+
+
+def ctest_command(build: Path, names: Path) -> list[str]:
+    return [
+        required_tool("ctest"),
+        "--test-dir",
+        str(build),
+        "--output-on-failure",
+        "--no-tests=error",
+        "--tests-from-file",
+        str(names),
+    ]
+
+
+def generated_ctest_name(line: str) -> str | None:
+    command = re.match(r"\s*add_test\s*\(\s*", line, flags=re.IGNORECASE)
+    if command is None:
+        return None
+    rest = line[command.end():]
+    if rest.startswith("["):
+        bracket = re.match(r"\[(=*)\[(.*?)\]\1\]", rest)
+        if bracket is None:
+            raise RuntimeError("unsupported generated CTest bracket name")
+        name = bracket.group(2)
+    elif rest.startswith('"'):
+        quoted = re.match(r'"([^"\\]*)"', rest)
+        if quoted is None:
+            raise RuntimeError("unsupported escaped generated CTest name")
+        name = quoted.group(1)
+    else:
+        bare = re.match(r"([^\s)]+)", rest)
+        if bare is None:
+            raise RuntimeError("missing generated CTest name")
+        name = bare.group(1)
+    if not name or name == "NAME" or "$" in name:
+        raise RuntimeError(f"unsupported generated CTest name: {name!r}")
+    return name
+
+
+def generated_ctest_registry(build: Path, file_limit: int = 16 * 1024 * 1024) -> dict[str, object]:
+    names: list[str] = []
+    files = 0
+    digest = hashlib.sha256()
+    for root, directories, filenames in os.walk(build, followlinks=False):
+        directories.sort()
+        filenames.sort()
+        for filename in filenames:
+            if not filename.endswith(".cmake"):
+                continue
+            path = Path(root) / filename
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            except OSError as error:
+                raise RuntimeError(f"cannot safely read generated CTest registry: {path}") from error
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > file_limit:
+                    raise RuntimeError(f"unsafe generated CTest registry file: {path}")
+                chunks = []
+                remaining = file_limit + 1
+                while remaining:
+                    chunk = os.read(descriptor, remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                payload = b"".join(chunks)
+            finally:
+                os.close(descriptor)
+            if len(payload) != metadata.st_size:
+                raise RuntimeError(f"cannot read complete generated CTest registry: {path}")
+            try:
+                text = payload.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise RuntimeError(f"invalid generated CTest registry encoding: {path}") from error
+            file_names = [
+                name
+                for line in text.splitlines()
+                if (name := generated_ctest_name(line)) is not None
+            ]
+            if not file_names:
+                continue
+            relative = path.relative_to(build).as_posix()
+            digest.update(relative.encode("utf-8") + b"\0")
+            digest.update(hashlib.sha256(payload).digest())
+            files += 1
+            names.extend(file_names)
+    if not names:
+        raise RuntimeError(f"generated CTest registry is empty: {build}")
+    return {
+        "files": files,
+        "definitions": len(names),
+        "digest": digest.hexdigest(),
+        "names": names,
+    }
 
 
 def focused_linux_test_build(build: Path, bitness: int) -> Path:
@@ -817,6 +933,77 @@ def main(argv: list[str] | None = None) -> int:
                 return completed.returncode
 
             command = build_command(build, args.target, args.jobs)
+            if args.action == "check":
+                test = validate_ctest_name(args.test)
+                print(
+                    f"scope=FOCUSED_CTEST profile={args.profile} lane={lane} "
+                    f"target={args.target} test={test} head={identity['head']} "
+                    f"dirty={str(identity['dirty']).lower()}"
+                )
+                print("one exact CTest is selected; other targets and tests are not implied")
+                sys.stdout.flush()
+                started = time.monotonic()
+                build_started = time.monotonic()
+                completed = subprocess.run(command, env=env)
+                build_elapsed = time.monotonic() - build_started
+                selection_elapsed = 0.0
+                test_elapsed = 0.0
+                selected_tests: list[str] = []
+                registry_receipt: dict[str, object] | None = None
+                if completed.returncode == 0:
+                    with tempfile.TemporaryDirectory(
+                        prefix=".focused-ctest-", dir=lane_root
+                    ) as temporary:
+                        temporary_root = Path(temporary)
+                        names = temporary_root / "tests.txt"
+                        names.write_text(test + "\n", encoding="utf-8")
+                        selection_started = time.monotonic()
+                        registry = generated_ctest_registry(build)
+                        selection_elapsed = time.monotonic() - selection_started
+                        registry_names = registry.pop("names")
+                        registry_receipt = registry
+                        selected_tests = [
+                            name for name in registry_names if name == test
+                        ]
+                        if selected_tests != [test]:
+                            print(
+                                "research dev build: exact CTest selection mismatch: "
+                                f"{selected_tests!r}",
+                                file=sys.stderr,
+                            )
+                            completed = subprocess.CompletedProcess(command, 2)
+                        else:
+                            test_started = time.monotonic()
+                            completed = subprocess.run(
+                                ctest_command(build, names), env=env
+                            )
+                            test_elapsed = time.monotonic() - test_started
+                receipt = {
+                    "format": "teamleaderleo-fex-x86-host-check-receipt-v1",
+                    "profile": profile_id,
+                    "requestedProfile": args.profile,
+                    "lane": lane,
+                    "target": args.target,
+                    "test": test,
+                    "selectedTests": selected_tests,
+                    "testRegistry": registry_receipt,
+                    "head": identity["head"],
+                    "dirty": identity["dirty"],
+                    "sourceSwitched": switched,
+                    "configurationMode": configure_mode,
+                    "setupElapsedSeconds": round(setup_elapsed, 6),
+                    "jobs": args.jobs,
+                    "buildElapsedSeconds": round(build_elapsed, 6),
+                    "selectionElapsedSeconds": round(selection_elapsed, 6),
+                    "testElapsedSeconds": round(test_elapsed, 6),
+                    "elapsedSeconds": round(time.monotonic() - started, 6),
+                    "exitCode": completed.returncode,
+                    "cacheNamespace": env["CCACHE_NAMESPACE"],
+                    "ccacheSloppiness": env["CCACHE_SLOPPINESS"],
+                }
+                write_receipt(receipt_path, receipt)
+                print(json.dumps(receipt, sort_keys=True))
+                return completed.returncode
             print(
                 f"scope=FOCUSED_TARGET profile={args.profile} lane={lane} "
                 f"target={args.target} head={identity['head']} "

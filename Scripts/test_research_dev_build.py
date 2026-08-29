@@ -118,6 +118,76 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertEqual(fex[-4:-2], ["--target", "FEX"])
         self.assertEqual(server[-4:-2], ["--target", "FEXServer"])
 
+    def test_check_parser_and_ctest_name_are_exact(self):
+        args = dev_build.parser().parse_args(
+            ["check", "thunkgentest", "VulkanCustomRouteInventory.ThunkGen"]
+        )
+        self.assertEqual(
+            (args.action, args.target, args.test),
+            ("check", "thunkgentest", "VulkanCustomRouteInventory.ThunkGen"),
+        )
+        self.assertEqual(
+            dev_build.validate_ctest_name("StructRepacking.ThunkGen"),
+            "StructRepacking.ThunkGen",
+        )
+        self.assertEqual(
+            dev_build.validate_ctest_name("regex.*characters.[stay]-literal"),
+            "regex.*characters.[stay]-literal",
+        )
+        for invalid in ("", " leading", "trailing ", "two\nlines", "nul\0byte"):
+            with self.assertRaises(ValueError):
+                dev_build.validate_ctest_name(invalid)
+
+    def test_ctest_command_uses_exact_name_file_and_no_tests_error(self):
+        with mock.patch.object(dev_build, "required_tool", return_value="/tool/ctest"):
+            command = dev_build.ctest_command(
+                Path("/lane/build"), Path("/lane/tests.txt")
+            )
+
+        self.assertEqual(command[0], "/tool/ctest")
+        self.assertIn("--tests-from-file", command)
+        self.assertIn("/lane/tests.txt", command)
+        self.assertIn("--no-tests=error", command)
+        self.assertNotIn("-R", command)
+
+    def test_generated_ctest_name_supports_current_cmake_forms(self):
+        self.assertEqual(
+            dev_build.generated_ctest_name("add_test(Bare.Name /bin/true)"),
+            "Bare.Name",
+        )
+        self.assertEqual(
+            dev_build.generated_ctest_name(
+                "add_test( [==[name with spaces.*]==] /bin/true)"
+            ),
+            "name with spaces.*",
+        )
+        self.assertIsNone(dev_build.generated_ctest_name("set(value add_test(fake))"))
+        for invalid in ('add_test("escaped\\nname" /bin/true)', "add_test(NAME x)"):
+            with self.assertRaises(RuntimeError):
+                dev_build.generated_ctest_name(invalid)
+
+    def test_generated_ctest_registry_counts_literal_names_and_duplicates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            nested = build / "nested"
+            nested.mkdir()
+            (build / "CTestTestfile.cmake").write_text(
+                "add_test(Unique.Test /bin/true)\n",
+                encoding="utf-8",
+            )
+            (nested / "generated_tests.cmake").write_text(
+                "add_test( [=[Duplicate.Test]=] /bin/true)\n"
+                "add_test(Duplicate.Test /bin/true)\n",
+                encoding="utf-8",
+            )
+            registry = dev_build.generated_ctest_registry(build)
+
+        self.assertEqual(registry["files"], 2)
+        self.assertEqual(registry["definitions"], 3)
+        self.assertEqual(registry["names"].count("Unique.Test"), 1)
+        self.assertEqual(registry["names"].count("Duplicate.Test"), 2)
+        self.assertRegex(registry["digest"], r"^[0-9a-f]{64}$")
+
     def test_lane_names_cannot_escape_cache_root(self):
         self.assertEqual(dev_build.validate_lane("callback-fix.2"), "callback-fix.2")
         for invalid in ("../other", "/tmp/other", "two lanes", ""):
