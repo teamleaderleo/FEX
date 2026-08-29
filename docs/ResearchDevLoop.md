@@ -80,6 +80,19 @@ the actual `fresh`, `incremental` or `reuse` mode; do not infer it from target t
 
 Use different lane names for simultaneous experiments. Do not share one active lane.
 
+List every retained lane before reusing or cleaning one:
+
+```sh
+./Scripts/ResearchDevBuild.py lanes
+```
+
+This action is read-only. It inventories each stable lane's source-view liveness, nonblocking lock
+state, allocated bytes without following symlinks, configured-build marker, receipt/profile parse
+state and compact receipt identity. A `reviewCandidate` is only a dead source symlink with no held
+helper lock and a valid receipt. It is a prompt for ownership/process review, not deletion authority;
+the command never removes a lane or shared ccache entry. A non-symlink source view, malformed lane
+root, unsafe metadata file, cross-filesystem tree or size error fails closed as unsafe.
+
 ## VS Code without a mystery build
 
 VS Code is a good FEX editor when it is treated as a view over the same explicit build lane, not as

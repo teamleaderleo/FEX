@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import tempfile
@@ -197,6 +198,102 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertEqual(receipt["pinnedDigest"], "a" * 64)
         self.assertEqual(receipt["elapsedSeconds"], 2.5)
         self.assertEqual(receipt["jobs"], 4)
+
+    def test_lane_inventory_classifies_live_dead_active_and_unsafe_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            views = cache / "views"
+            locks = cache / "locks"
+            live_source = root / "live-source"
+            outside = root / "outside"
+            live_source.mkdir()
+            outside.mkdir()
+            (outside / "large").write_bytes(b"x" * (1024 * 1024))
+            locks.mkdir(parents=True)
+
+            live = views / "live"
+            (live / "build").mkdir(parents=True)
+            os.symlink(live_source, live / "src", target_is_directory=True)
+            (live / "build" / "build.ninja").write_text("", encoding="utf-8")
+            os.symlink(outside, live / "outside", target_is_directory=True)
+            dev_build.write_receipt(
+                live / "last-receipt.json",
+                {"format": "receipt", "head": "a" * 40, "dirty": False, "exitCode": 0},
+            )
+            dev_build.write_receipt(live / "profile.json", {"format": "profile"})
+            live_lock = (locks / "live.lock").open("a+", encoding="utf-8")
+            fcntl = __import__("fcntl")
+            fcntl.flock(live_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            dead = views / "dead"
+            dead.mkdir(parents=True)
+            os.symlink(root / "removed", dead / "src", target_is_directory=True)
+            dev_build.write_receipt(
+                dead / "last-receipt.json",
+                {"format": "receipt", "head": "b" * 40, "dirty": False, "exitCode": 0},
+            )
+            dev_build.write_receipt(dead / "profile.json", {"format": "profile"})
+
+            unsafe = views / "unsafe"
+            unsafe.mkdir(parents=True)
+            (unsafe / "src").write_text("not a symlink", encoding="utf-8")
+            (unsafe / "last-receipt.json").write_text("not json", encoding="utf-8")
+
+            inventory = dev_build.lane_inventory(cache)
+            records = {record["lane"]: record for record in inventory["lanes"]}
+            fcntl.flock(live_lock, fcntl.LOCK_UN)
+            live_lock.close()
+
+        self.assertEqual(inventory["totals"]["lanes"], 3)
+        self.assertEqual(inventory["totals"]["bySourceState"], {
+            "live": 1,
+            "dead": 1,
+            "missing": 0,
+            "unsafe": 1,
+        })
+        self.assertEqual(records["live"]["sourceState"], "live")
+        self.assertEqual(records["live"]["lockState"], "active")
+        self.assertEqual(records["live"]["buildState"], "configured")
+        self.assertEqual(records["live"]["receiptState"], "valid")
+        self.assertLess(records["live"]["allocatedBytes"], 1024 * 1024)
+        self.assertEqual(records["dead"]["sourceState"], "dead")
+        self.assertEqual(records["dead"]["lockState"], "missing")
+        self.assertTrue(records["dead"]["reviewCandidate"])
+        self.assertEqual(records["unsafe"]["sourceState"], "unsafe")
+        self.assertFalse(records["unsafe"]["reviewCandidate"])
+
+    def test_lane_inventory_rejects_symlinked_views_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            outside = root / "outside"
+            outside.mkdir()
+            cache.mkdir()
+            os.symlink(outside, cache / "views", target_is_directory=True)
+
+            with self.assertRaisesRegex(RuntimeError, "views root is not a directory"):
+                dev_build.lane_inventory(cache)
+
+    def test_lanes_action_is_read_only_and_does_not_require_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "missing-cache"
+            output = __import__("io").StringIO()
+            with mock.patch("sys.stdout", output):
+                result = dev_build.main(
+                    [
+                        "--source",
+                        str(Path(temporary) / "missing-source"),
+                        "--cache-root",
+                        str(cache),
+                        "lanes",
+                    ]
+                )
+
+        inventory = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(inventory["totals"]["lanes"], 0)
+        self.assertFalse(cache.exists())
 
     def test_profile_marker_must_match_exactly(self):
         expected = dev_build.expected_profile("cache-namespace")
