@@ -324,6 +324,20 @@ def profile_matches(path: Path, expected: dict[str, object]) -> bool:
         return False
 
 
+def configuration_mode(
+    action: str,
+    switched: bool,
+    build_configured: bool,
+    profile_compatible: bool,
+) -> str:
+    """Choose fresh, incremental, or reused configuration without weakening profile checks."""
+    if action == "configure" or not build_configured or not profile_compatible:
+        return "fresh"
+    if switched:
+        return "incremental"
+    return "reuse"
+
+
 def locked_lane(cache_root: Path, lane: str):
     locks = cache_root / "locks"
     locks.mkdir(parents=True, exist_ok=True)
@@ -365,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         build.mkdir(parents=True, exist_ok=True)
         env = environment(cache_root, lane_root, profile_id)
         with locked_lane(cache_root, lane):
+            setup_started = time.monotonic()
             switched = prepare_source_view(
                 source,
                 source_view,
@@ -378,39 +393,48 @@ def main(argv: list[str] | None = None) -> int:
             profile_marker = expected_profile(
                 env["CCACHE_NAMESPACE"], profile_id, configure_options
             )
-            needs_configure = (
-                args.action == "configure"
-                or switched
-                or not (build / "build.ninja").is_file()
-                or not profile_matches(profile_path, profile_marker)
+            configure_mode = configuration_mode(
+                args.action,
+                switched,
+                (build / "build.ninja").is_file(),
+                profile_matches(profile_path, profile_marker),
             )
-            if needs_configure:
+            if configure_mode == "fresh":
                 subprocess.run(
                     configure_command(source_view, build, configure_options),
                     check=True,
                     env=env,
                 )
                 write_receipt(profile_path, profile_marker)
+            elif configure_mode == "incremental":
+                subprocess.run(
+                    reconfigure_command(source_view, build, configure_options),
+                    check=True,
+                    env=env,
+                )
             if args.action == "configure":
                 print(f"configured lane={lane} source={source} build={build}")
                 return 0
             if args.action == "editor":
-                if not needs_configure:
+                if configure_mode == "reuse":
                     subprocess.run(
                         reconfigure_command(source_view, build, configure_options),
                         check=True,
                         env=env,
                     )
+                    configure_mode = "incremental"
                 destination = source / "compile_commands.json"
                 count = write_editor_compile_commands(
                     source_view, source, build, destination
                 )
                 print(
                     f"editor lane={lane} entries={count} "
+                    f"configuration={configure_mode} "
                     f"compile_commands={destination} build={build}"
                 )
                 return 0
 
+            setup_elapsed = time.monotonic() - setup_started
             identity = source_identity(source)
             if args.action == "linux-test-build":
                 if args.profile != "linux-tests":
@@ -447,6 +471,8 @@ def main(argv: list[str] | None = None) -> int:
                     "head": identity["head"],
                     "dirty": identity["dirty"],
                     "sourceSwitched": switched,
+                    "configurationMode": configure_mode,
+                    "setupElapsedSeconds": round(setup_elapsed, 6),
                     "jobs": args.jobs,
                     "elapsedSeconds": round(time.monotonic() - started, 6),
                     "exitCode": completed.returncode,
@@ -478,6 +504,8 @@ def main(argv: list[str] | None = None) -> int:
                 "head": identity["head"],
                 "dirty": identity["dirty"],
                 "sourceSwitched": switched,
+                "configurationMode": configure_mode,
+                "setupElapsedSeconds": round(setup_elapsed, 6),
                 "jobs": args.jobs,
                 "elapsedSeconds": round(time.monotonic() - started, 6),
                 "exitCode": completed.returncode,

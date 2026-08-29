@@ -118,6 +118,55 @@ class ResearchDevBuildTest(unittest.TestCase):
             marker.write_text("not json", encoding="utf-8")
             self.assertFalse(dev_build.profile_matches(marker, expected))
 
+    def test_matching_warm_worktree_switch_uses_incremental_configure(self):
+        self.assertEqual(
+            dev_build.configuration_mode(
+                "build",
+                switched=True,
+                build_configured=True,
+                profile_compatible=True,
+            ),
+            "incremental",
+        )
+
+    def test_configuration_mode_keeps_fail_closed_fresh_cases(self):
+        self.assertEqual(
+            dev_build.configuration_mode(
+                "configure",
+                switched=False,
+                build_configured=True,
+                profile_compatible=True,
+            ),
+            "fresh",
+        )
+        self.assertEqual(
+            dev_build.configuration_mode(
+                "build",
+                switched=True,
+                build_configured=False,
+                profile_compatible=True,
+            ),
+            "fresh",
+        )
+        self.assertEqual(
+            dev_build.configuration_mode(
+                "build",
+                switched=True,
+                build_configured=True,
+                profile_compatible=False,
+            ),
+            "fresh",
+        )
+        self.assertEqual(
+            dev_build.configuration_mode(
+                "build",
+                switched=False,
+                build_configured=True,
+                profile_compatible=True,
+            ),
+            "reuse",
+        )
+
     def test_editor_database_translates_stable_source_view(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

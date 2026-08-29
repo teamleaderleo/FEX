@@ -15,7 +15,8 @@ git submodule update --init --recursive --depth 1
 
 The helper configures Clang, Ninja, lld, ccache, `RelWithDebInfo`, assertions, thunks and tests,
 without LTO or the GUI. It prints and stores a receipt containing the exact source head, dirty bit,
-target, worker count, duration, result, cache namespace and ccache sloppiness policy. FEX's CMake
+target, worker count, configuration mode, setup and target durations, result, cache namespace and
+ccache sloppiness policy. FEX's CMake
 already elects `time_macros` reuse for sources that embed `__DATE__` or `__TIME__`; the helper
 exports that setting explicitly because the CMake 4.2/Ninja launcher observed on big-red retained
 `ccache` but dropped its policy argument. A cache hit can therefore retain an earlier embedded build
@@ -50,6 +51,11 @@ view, so an older source mtime cannot preserve a stale object. The stable source
 ccache reuse content across exact worktree switches. The cache namespace includes a CPU-model hash
 because this host-development profile uses FEX's `-march=native` default. A versioned profile marker
 prevents a lane from silently adopting a CMake tree configured with different options.
+
+After that clean repoint, a matching configured/profile-marked lane uses ordinary incremental CMake
+regeneration instead of deleting CMake's cache and compiler discovery. An explicit `configure`, a
+missing build graph or any profile-marker mismatch still selects `cmake --fresh`. The receipt names
+the actual `fresh`, `incremental` or `reuse` mode; do not infer it from target time.
 
 Use different lane names for simultaneous experiments. Do not share one active lane.
 
@@ -126,6 +132,30 @@ but part of that combined improvement came from populating the second worktree-p
 `Context.cpp`; it must not all be attributed to timestamp handling. Wrapper time is now dominated
 by the roughly 5.8-second configure/source-switch phase. These are target-build measurements, not
 runtime or test-suite results.
+
+A bounded source-switch experiment then crossed the known CMake graph change from `8fe2f3d1e` to
+`deb871325`: the newer tree added both `DiskCache.cpp` and `WorkQueueThread.cpp`. Three fresh and
+three incremental configurations ran in fresh/incremental/incremental/fresh/fresh/incremental order
+with CMake 4.2.3 and concurrency one:
+
+| treatment | samples (s) | median | result |
+| --- | --- | ---: | --- |
+| fresh | 5.581, 6.758, 6.413 | 6.413 s | semantic graph green |
+| incremental | 2.648, 2.622, 2.630 | 2.630 s | semantic graph green |
+
+Incremental regeneration reduced median configuration wall time by 59.0%. Every treatment produced
+the same 498-entry compile graph, 153-target CMake File API codemodel and 17,312-node product Ninja
+inventory; both new sources and `vulkan-host-64` appeared exactly once. One selected target build
+from each treatment also passed. Their target times are not an A/B measurement: the fresh build ran
+first and populated the shared route-private ccache for the incremental build.
+
+A stricter preliminary oracle was killed rather than relabeled: `ninja -t targets all` exposed 90
+additional fresh-only CMake 4.2.3 compiler-detection module inputs. Incremental had no extra nodes,
+and all non-configuration nodes plus the semantic codemodel matched. This is why the accepted graph
+oracle separates CMake's configure/re-run inputs from product targets instead of silently calling
+the whole raw Ninja listing equivalent. The result covers this exact toolchain and source-addition
+boundary; it does not justify incremental reuse after a profile mismatch, missing graph or explicit
+fresh-configure request.
 
 ## Ubuntu development packages used on big-red
 
