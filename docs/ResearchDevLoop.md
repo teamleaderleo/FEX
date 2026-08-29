@@ -18,6 +18,21 @@ without LTO or the GUI. It prints and stores a receipt containing the exact sour
 target, worker count, duration, result and cache namespace. A target build does not claim a full
 build or full-test pass.
 
+When the question needs an x86 guest Linux test binary, select the bounded profile explicitly:
+
+```sh
+./Scripts/ResearchDevBuild.py --profile linux-tests --lane smc linux-test-build smc-2
+```
+
+This adds `BUILD_FEX_LINUX_TESTS=True` to the same base profile. It still builds only the named
+target. The profile ID participates in both the fail-closed lane marker and the ccache namespace,
+so a Linux-test lane cannot silently reuse a CMake tree or native-code cache namespace from the
+ordinary developer profile. The action builds the exact `FEX` and `FEXServer` runtime
+prerequisites, configures the guest test sub-build, and builds only `smc-2.64`. It does not run the
+binary or build the rest of FEXLinuxTests. The receipt prints both product and guest-binary paths.
+Use `--bitness 32` for the corresponding 32-bit build. Actual emulated execution still belongs in
+an exact ARM64 Actions/Glaeda profile; x86-host-debug FEX is not a product-runtime oracle.
+
 Each named lane owns a stable `src` view, external build tree and nonblocking lock under the user
 cache directory. Switching a lane to another worktree cleans the old outputs before repointing the
 view, so an older source mtime cannot preserve a stale object. The stable source/build spellings let

@@ -19,6 +19,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LANE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+LINUX_TEST_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 PROFILE = "x86-host-dev-v1"
 CONFIGURE_OPTIONS = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
@@ -30,6 +31,16 @@ CONFIGURE_OPTIONS = [
     "-DBUILD_FEXCONFIG=False",
     "-DUSE_LINKER=lld",
 ]
+CONFIGURE_PROFILES = {
+    "dev": {
+        "id": PROFILE,
+        "options": CONFIGURE_OPTIONS,
+    },
+    "linux-tests": {
+        "id": "x86-host-linux-tests-v1",
+        "options": [*CONFIGURE_OPTIONS, "-DBUILD_FEX_LINUX_TESTS=True"],
+    },
+}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -38,6 +49,12 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--lane", default="dev", help="isolated stable-path lane name")
     result.add_argument("--source", type=Path, default=REPO_ROOT, help="FEX worktree to expose")
+    result.add_argument(
+        "--profile",
+        choices=CONFIGURE_PROFILES,
+        default="dev",
+        help="bounded CMake profile; linux-tests builds the guest Linux test binaries",
+    )
     result.add_argument(
         "--cache-root",
         type=Path,
@@ -53,6 +70,15 @@ def parser() -> argparse.ArgumentParser:
     build = subparsers.add_parser("build", help="build one named CMake target")
     build.add_argument("target", help="exact target, for example vulkan-host-64")
     build.add_argument(
+        "--jobs", type=positive_int, default=min(os.cpu_count() or 1, 16), help="build workers"
+    )
+    linux_test = subparsers.add_parser(
+        "linux-test-build",
+        help="build FEX prerequisites plus one exact guest Linux test binary",
+    )
+    linux_test.add_argument("test", help="exact test basename, for example smc-2")
+    linux_test.add_argument("--bitness", type=int, choices=(32, 64), default=64)
+    linux_test.add_argument(
         "--jobs", type=positive_int, default=min(os.cpu_count() or 1, 16), help="build workers"
     )
     subparsers.add_parser("status", help="show the lane and its last build receipt")
@@ -77,6 +103,12 @@ def validate_lane(raw: str) -> str:
     return raw
 
 
+def validate_linux_test(raw: str) -> str:
+    if not LINUX_TEST_PATTERN.fullmatch(raw):
+        raise ValueError("Linux test must be one exact target basename")
+    return raw
+
+
 def required_tool(name: str) -> str:
     path = shutil.which(name)
     if path is None:
@@ -84,7 +116,7 @@ def required_tool(name: str) -> str:
     return path
 
 
-def cpu_namespace() -> str:
+def cpu_namespace(profile: str = PROFILE) -> str:
     model = platform.machine()
     cpuinfo = Path("/proc/cpuinfo")
     if cpuinfo.is_file():
@@ -93,10 +125,10 @@ def cpu_namespace() -> str:
                 model += ":" + line.partition(":")[2].strip()
                 break
     digest = hashlib.sha256(model.encode("utf-8")).hexdigest()[:12]
-    return f"teamleaderleo-FEX:{PROFILE}:{digest}"
+    return f"teamleaderleo-FEX:{profile}:{digest}"
 
 
-def environment(cache_root: Path, lane_root: Path) -> dict[str, str]:
+def environment(cache_root: Path, lane_root: Path, profile: str = PROFILE) -> dict[str, str]:
     result = os.environ.copy()
     result.update(
         {
@@ -105,13 +137,17 @@ def environment(cache_root: Path, lane_root: Path) -> dict[str, str]:
             "CCACHE_DIR": str(cache_root / "ccache"),
             "CCACHE_BASEDIR": str(lane_root),
             "CCACHE_NOHASHDIR": "true",
-            "CCACHE_NAMESPACE": cpu_namespace(),
+            "CCACHE_NAMESPACE": cpu_namespace(profile),
         }
     )
     return result
 
 
-def configure_command(source_view: Path, build: Path) -> list[str]:
+def configure_command(
+    source_view: Path,
+    build: Path,
+    configure_options: list[str] = CONFIGURE_OPTIONS,
+) -> list[str]:
     return [
         required_tool("cmake"),
         "--fresh",
@@ -121,11 +157,15 @@ def configure_command(source_view: Path, build: Path) -> list[str]:
         str(build),
         "-G",
         "Ninja",
-        *CONFIGURE_OPTIONS,
+        *configure_options,
     ]
 
 
-def reconfigure_command(source_view: Path, build: Path) -> list[str]:
+def reconfigure_command(
+    source_view: Path,
+    build: Path,
+    configure_options: list[str] = CONFIGURE_OPTIONS,
+) -> list[str]:
     """Refresh CMake's graph without throwing away a warm build tree."""
     return [
         required_tool("cmake"),
@@ -135,7 +175,7 @@ def reconfigure_command(source_view: Path, build: Path) -> list[str]:
         str(build),
         "-G",
         "Ninja",
-        *CONFIGURE_OPTIONS,
+        *configure_options,
     ]
 
 
@@ -150,6 +190,28 @@ def build_command(build: Path, target: str, jobs: int) -> list[str]:
         target,
         "--parallel",
         str(jobs),
+    ]
+
+
+def focused_linux_test_build(build: Path, bitness: int) -> Path:
+    return build / "unittests" / "FEXLinuxTests" / f"FEXLinuxTests_{bitness}"
+
+
+def configure_linux_test_command(
+    source_view: Path, build: Path, bitness: int
+) -> list[str]:
+    return [
+        required_tool("cmake"),
+        "-S",
+        str(source_view / "unittests" / "FEXLinuxTests" / "tests"),
+        "-B",
+        str(build),
+        "-G",
+        "Ninja",
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+        f"-DCMAKE_TOOLCHAIN_FILE:FILEPATH={source_view / 'Data' / 'CMake' / f'toolchain_x86_{bitness}.cmake'}",
+        "-DENABLE_CLANG_THUNKS=True",
+        f"-DBITNESS={bitness}",
     ]
 
 
@@ -180,6 +242,7 @@ def prepare_source_view(
     source_view: Path,
     build: Path,
     env: dict[str, str],
+    extra_builds: tuple[Path, ...] = (),
     runner=subprocess.run,
 ) -> bool:
     """Expose source at one stable path; clean before switching an existing lane."""
@@ -188,12 +251,20 @@ def prepare_source_view(
     current = source_view.resolve() if source_view.is_symlink() else None
     if current == source:
         return False
-    if current is not None and (build / "build.ninja").is_file():
-        runner(
-            [required_tool("cmake"), "--build", str(build), "--target", "clean"],
-            check=True,
-            env=env,
-        )
+    if current is not None:
+        for old_build in (*extra_builds, build):
+            if (old_build / "build.ninja").is_file():
+                runner(
+                    [
+                        required_tool("cmake"),
+                        "--build",
+                        str(old_build),
+                        "--target",
+                        "clean",
+                    ],
+                    check=True,
+                    env=env,
+                )
     atomic_source_view(source_view, source)
     return True
 
@@ -230,11 +301,15 @@ def write_editor_compile_commands(
     return len(entries)
 
 
-def expected_profile(cache_namespace: str) -> dict[str, object]:
+def expected_profile(
+    cache_namespace: str,
+    profile: str = PROFILE,
+    configure_options: list[str] = CONFIGURE_OPTIONS,
+) -> dict[str, object]:
     return {
         "format": "teamleaderleo-fex-x86-host-dev-profile-v1",
-        "profile": PROFILE,
-        "configureOptions": CONFIGURE_OPTIONS,
+        "profile": profile,
+        "configureOptions": configure_options,
         "cacheNamespace": cache_namespace,
     }
 
@@ -262,6 +337,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         lane = validate_lane(args.lane)
+        selected_profile = CONFIGURE_PROFILES[args.profile]
+        profile_id = str(selected_profile["id"])
+        configure_options = list(selected_profile["options"])
         source = args.source.resolve(strict=True)
         cache_root = args.cache_root.expanduser().resolve()
         lane_root = cache_root / "views" / lane
@@ -282,26 +360,43 @@ def main(argv: list[str] | None = None) -> int:
             required_tool(tool)
         lane_root.mkdir(parents=True, exist_ok=True)
         build.mkdir(parents=True, exist_ok=True)
-        env = environment(cache_root, lane_root)
+        env = environment(cache_root, lane_root, profile_id)
         with locked_lane(cache_root, lane):
-            switched = prepare_source_view(source, source_view, build, env)
-            profile = expected_profile(env["CCACHE_NAMESPACE"])
+            switched = prepare_source_view(
+                source,
+                source_view,
+                build,
+                env,
+                (
+                    focused_linux_test_build(build, 32),
+                    focused_linux_test_build(build, 64),
+                ),
+            )
+            profile_marker = expected_profile(
+                env["CCACHE_NAMESPACE"], profile_id, configure_options
+            )
             needs_configure = (
                 args.action == "configure"
                 or switched
                 or not (build / "build.ninja").is_file()
-                or not profile_matches(profile_path, profile)
+                or not profile_matches(profile_path, profile_marker)
             )
             if needs_configure:
-                subprocess.run(configure_command(source_view, build), check=True, env=env)
-                write_receipt(profile_path, profile)
+                subprocess.run(
+                    configure_command(source_view, build, configure_options),
+                    check=True,
+                    env=env,
+                )
+                write_receipt(profile_path, profile_marker)
             if args.action == "configure":
                 print(f"configured lane={lane} source={source} build={build}")
                 return 0
             if args.action == "editor":
                 if not needs_configure:
                     subprocess.run(
-                        reconfigure_command(source_view, build), check=True, env=env
+                        reconfigure_command(source_view, build, configure_options),
+                        check=True,
+                        env=env,
                     )
                 destination = source / "compile_commands.json"
                 count = write_editor_compile_commands(
@@ -314,10 +409,57 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             identity = source_identity(source)
+            if args.action == "linux-test-build":
+                if args.profile != "linux-tests":
+                    raise ValueError("linux-test-build action requires --profile linux-tests")
+                test = validate_linux_test(args.test)
+                guest_build = focused_linux_test_build(build, args.bitness)
+                guest_target = f"{test}.{args.bitness}"
+                commands = [
+                    build_command(build, "FEX", args.jobs),
+                    build_command(build, "FEXServer", args.jobs),
+                    configure_linux_test_command(source_view, guest_build, args.bitness),
+                    build_command(guest_build, guest_target, args.jobs),
+                ]
+                print(
+                    f"scope=FOCUSED_LINUX_TEST profile={args.profile} lane={lane} "
+                    f"test={test} bitness={args.bitness} head={identity['head']} "
+                    f"dirty={str(identity['dirty']).lower()}"
+                )
+                print("runtime execution and other Linux tests are not implied")
+                sys.stdout.flush()
+                started = time.monotonic()
+                completed = subprocess.CompletedProcess(commands[0], 0)
+                for command in commands:
+                    completed = subprocess.run(command, env=env)
+                    if completed.returncode != 0:
+                        break
+                receipt = {
+                    "format": "teamleaderleo-fex-x86-host-linux-test-build-receipt-v1",
+                    "profile": profile_id,
+                    "requestedProfile": args.profile,
+                    "lane": lane,
+                    "test": test,
+                    "bitness": args.bitness,
+                    "head": identity["head"],
+                    "dirty": identity["dirty"],
+                    "sourceSwitched": switched,
+                    "jobs": args.jobs,
+                    "elapsedSeconds": round(time.monotonic() - started, 6),
+                    "exitCode": completed.returncode,
+                    "cacheNamespace": env["CCACHE_NAMESPACE"],
+                }
+                write_receipt(receipt_path, receipt)
+                print(f"guestBinary={guest_build / guest_target}")
+                print(f"fexBinary={build / 'Bin' / 'FEX'}")
+                print(json.dumps(receipt, sort_keys=True))
+                return completed.returncode
+
             command = build_command(build, args.target, args.jobs)
             print(
-                f"scope=FOCUSED_TARGET lane={lane} target={args.target} "
-                f"head={identity['head']} dirty={str(identity['dirty']).lower()}"
+                f"scope=FOCUSED_TARGET profile={args.profile} lane={lane} "
+                f"target={args.target} head={identity['head']} "
+                f"dirty={str(identity['dirty']).lower()}"
             )
             print("full build and full tests are not implied")
             sys.stdout.flush()
@@ -325,7 +467,8 @@ def main(argv: list[str] | None = None) -> int:
             completed = subprocess.run(command, env=env)
             receipt = {
                 "format": "teamleaderleo-fex-x86-host-dev-receipt-v1",
-                "profile": PROFILE,
+                "profile": profile_id,
+                "requestedProfile": args.profile,
                 "lane": lane,
                 "target": args.target,
                 "head": identity["head"],
