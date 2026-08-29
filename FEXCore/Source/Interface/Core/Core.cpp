@@ -906,9 +906,6 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     return reinterpret_cast<uintptr_t>(CodePtr);
   }
 
-  // if this ever fires, we need to serialize the offset into disk cache
-  LOGMAN_THROW_A_FMT(StartAddr == GuestRIP, "StartAddr offset from GuestRIP");
-
   // The core managed to compile the code.
   if (Config.BlockJITNaming()) {
     auto FragmentBasePtr = CompiledCode.BlockBegin;
@@ -965,6 +962,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   // Disk Cache
   if (Region && Region->FileStartVA != 0 && !CodeCache.IsGeneratingCache) {
+    // Custom IR can redirect an entrypoint to code decoded from another guest
+    // address. Those blocks have no executable file region and aren't stored
+    // in the disk cache. A file-backed block with an offset still needs an
+    // explicit serialized offset before it can be cached safely.
+    LOGMAN_THROW_A_FMT(StartAddr == GuestRIP, "StartAddr offset from GuestRIP");
+
     std::span<const FEXCore::CPU::Relocation> Relocations;
     if (DebugData && DebugData->Relocations) {
       Relocations = *DebugData->Relocations;
