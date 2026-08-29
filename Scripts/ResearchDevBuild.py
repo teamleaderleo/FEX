@@ -46,6 +46,10 @@ def parser() -> argparse.ArgumentParser:
     )
     subparsers = result.add_subparsers(dest="action", required=True)
     subparsers.add_parser("configure", help="freshly configure the lane")
+    subparsers.add_parser(
+        "editor",
+        help="configure as needed and write a worktree-local compile_commands.json",
+    )
     build = subparsers.add_parser("build", help="build one named CMake target")
     build.add_argument("target", help="exact target, for example vulkan-host-64")
     build.add_argument(
@@ -180,10 +184,36 @@ def prepare_source_view(
     return True
 
 
-def write_receipt(destination: Path, receipt: dict[str, object]) -> None:
+def write_receipt(destination: Path, receipt: object) -> None:
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.new")
     temporary.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temporary, destination)
+
+
+def replace_path(value: object, old: str, new: str) -> object:
+    if isinstance(value, str):
+        return value.replace(old, new)
+    if isinstance(value, list):
+        return [replace_path(item, old, new) for item in value]
+    if isinstance(value, dict):
+        return {key: replace_path(item, old, new) for key, item in value.items()}
+    return value
+
+
+def write_editor_compile_commands(
+    source_view: Path, source: Path, build: Path, destination: Path
+) -> int:
+    """Translate the stable-view compilation database to the editor's real worktree."""
+    build_database = build / "compile_commands.json"
+    try:
+        entries = json.loads(build_database.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read compilation database: {build_database}") from error
+    if not isinstance(entries, list) or not entries or not all(isinstance(item, dict) for item in entries):
+        raise RuntimeError(f"invalid or empty compilation database: {build_database}")
+    translated = replace_path(entries, str(source_view), str(source))
+    write_receipt(destination, translated)
+    return len(entries)
 
 
 def expected_profile(cache_namespace: str) -> dict[str, object]:
@@ -253,6 +283,16 @@ def main(argv: list[str] | None = None) -> int:
                 write_receipt(profile_path, profile)
             if args.action == "configure":
                 print(f"configured lane={lane} source={source} build={build}")
+                return 0
+            if args.action == "editor":
+                destination = source / "compile_commands.json"
+                count = write_editor_compile_commands(
+                    source_view, source, build, destination
+                )
+                print(
+                    f"editor lane={lane} entries={count} "
+                    f"compile_commands={destination} build={build}"
+                )
                 return 0
 
             identity = source_identity(source)

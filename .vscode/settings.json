@@ -1,0 +1,11 @@
+{
+  "C_Cpp.intelliSenseEngine": "disabled",
+  "cmake.configureOnOpen": false,
+  "clangd.arguments": [
+    "--background-index",
+    "--completion-style=detailed"
+  ],
+  "files.associations": {
+    "*.inl": "cpp"
+  }
+}

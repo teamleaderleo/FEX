@@ -27,6 +27,40 @@ prevents a lane from silently adopting a CMake tree configured with different op
 
 Use different lane names for simultaneous experiments. Do not share one active lane.
 
+## VS Code without a mystery build
+
+VS Code is a good FEX editor when it is treated as a view over the same explicit build lane, not as
+a second build system. Install the recommended clangd, CMake Tools and Microsoft C/C++ extensions,
+open the repository root, then run **Terminal → Run Task → FEX: prepare editor lane** once.
+
+The task configures the external `editor` lane when needed and writes an ignored
+`compile_commands.json` at the worktree root. That file tells clangd the real compiler flags for
+every translation unit. The helper translates the stable cache-view source paths back to the open
+worktree; this is why simply symlinking the external compilation database is not equivalent.
+
+After preparation:
+
+- use `F12` for definition, `Shift+F12` for references and `Ctrl+P`, then `#`, for symbols;
+- press `Ctrl+Shift+B` for **FEX: build one target** and enter the exact CMake target;
+- run **FEX: show editor lane receipt** before reporting what was built;
+- use the Run and Debug pane with GDB or LLDB only after identifying a runnable x86-host test or
+  tool. The main FEX runtime still requires an ARM64 execution environment.
+
+The Microsoft C++ language engine is disabled for this workspace so it does not duplicate clangd's
+diagnostics and indexing. Its debugger remains available. CMake Tools supplies CMake syntax and
+project affordances, but automatic configuration is disabled so it cannot silently create a second,
+uncached build tree.
+
+Command-line users get the same setup with:
+
+```sh
+./Scripts/ResearchDevBuild.py --lane editor editor
+./Scripts/ResearchDevBuild.py --lane editor build vulkan-host-64
+```
+
+Re-run `editor` after changing CMake structure, switching the lane to another worktree or changing
+the build profile. Ordinary source edits do not require regenerating the database.
+
 ## Measured big-red checkpoint
 
 At exact fork head `8fe2f3d1e2fd29d78b1927616daf0e973df54816`, Clang 21.1.8, CMake 4.2.3,

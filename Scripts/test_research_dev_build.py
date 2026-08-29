@@ -56,6 +56,36 @@ class ResearchDevBuildTest(unittest.TestCase):
             marker.write_text("not json", encoding="utf-8")
             self.assertFalse(dev_build.profile_matches(marker, expected))
 
+    def test_editor_database_translates_stable_source_view(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_view = root / "lane" / "src"
+            source = root / "worktree"
+            build = root / "lane" / "build"
+            destination = source / "compile_commands.json"
+            build.mkdir(parents=True)
+            source.mkdir()
+            database = [
+                {
+                    "directory": str(build),
+                    "command": f"clang++ -I{source_view}/include -c {source_view}/Source/a.cpp",
+                    "file": str(source_view / "Source/a.cpp"),
+                }
+            ]
+            (build / "compile_commands.json").write_text(
+                __import__("json").dumps(database), encoding="utf-8"
+            )
+
+            count = dev_build.write_editor_compile_commands(
+                source_view, source, build, destination
+            )
+            translated = __import__("json").loads(destination.read_text(encoding="utf-8"))
+
+            self.assertEqual(count, 1)
+            self.assertEqual(translated[0]["file"], str(source / "Source/a.cpp"))
+            self.assertIn(f"-I{source}/include", translated[0]["command"])
+            self.assertEqual(translated[0]["directory"], str(build))
+
     def test_worktree_switch_cleans_before_atomic_repoint(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
