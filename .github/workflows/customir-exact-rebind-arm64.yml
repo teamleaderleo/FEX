@@ -1,4 +1,4 @@
-name: Current-head ARM64 fixture-boundary trace
+name: CustomIR exact rebind conservative-feature A/B
 
 on:
   push:
@@ -11,15 +11,26 @@ permissions:
   contents: read
 
 jobs:
-  fixture-boundary-trace:
+  rebind-ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: current-base
+            source_sha: f1f1e6a36af0b7d5e194260a94a1666b899b0097
+          - variant: exact-entry
+            source_sha: 93fe514dc2b96c76fdc55614e4ef5f24fa1851ba
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 55
     env:
-      SOURCE_SHA: f1f1e6a36af0b7d5e194260a94a1666b899b0097
+      SOURCE_SHA: ${{ matrix.source_sha }}
       FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
-      ROOTFS: ${{ github.workspace }}/rootfs-amd64-current-base-trace
-      RECEIPTS: ${{ github.workspace }}/receipts-current-base-trace
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64-${{ matrix.variant }}
+      RECEIPTS: ${{ github.workspace }}/receipts-${{ matrix.variant }}
       FEX_PORTABLE: 1
+      # GitHub's hosted ARM VM advertises LRCPC2 but trapped the emitted LDAPUR
+      # path. Keep TSO enabled and select FEX's conservative fallback codegen.
+      FEX_HOSTFEATURES: disablelrcpc,disablelrcpc2
       DEBIAN_FRONTEND: noninteractive
 
     steps:
@@ -146,22 +157,28 @@ jobs:
             test -s "$RECEIPTS/gdb.txt"
           fi
 
-          if grep -qE 'generation|reload invoker|native host stable' "$RECEIPTS/rebind.stdout"; then
-            echo CURRENT_BASE_TRACE_REACHED_FIXTURE | tee "$RECEIPTS/gate.txt"
-          elif [ "$rc" -ne 0 ] && grep -q 'Program received signal SIGBUS' "$RECEIPTS/gdb.txt"; then
-            echo CURRENT_BASE_TRACE_SIGBUS_CAPTURED | tee "$RECEIPTS/gate.txt"
-          elif [ "$rc" -ne 0 ] && grep -q 'Program received signal SIGILL' "$RECEIPTS/gdb.txt"; then
-            echo CURRENT_BASE_TRACE_SIGILL_CAPTURED | tee "$RECEIPTS/gate.txt"
-          elif [ "$rc" -ne 0 ]; then
-            echo CURRENT_BASE_TRACE_FAILURE_CAPTURED | tee "$RECEIPTS/gate.txt"
+          if [ "$rc" -ne 0 ]; then
+            echo "${{ matrix.variant }}_UNEXPECTED_RUNTIME_FAILURE_CAPTURED" | tee "$RECEIPTS/gate.txt"
+            exit 1
+          elif [ "${{ matrix.variant }}" = current-base ]; then
+            grep -q 'reload invoker.*DIFFERENT' "$RECEIPTS/rebind.stdout"
+            grep -q 'native host stable' "$RECEIPTS/rebind.stdout"
+            grep -q 'fresh/current callback.*rv=10010053 want=10010053' "$RECEIPTS/rebind.stdout"
+            grep -q 'child Link after re-register.*signal=11' "$RECEIPTS/rebind.stdout"
+            echo CURRENT_BASE_REBIND_NEGATIVE_OK | tee "$RECEIPTS/gate.txt"
           else
-            echo CURRENT_BASE_TRACE_COMPLETED_WITHOUT_FIXTURE_ORACLE | tee "$RECEIPTS/gate.txt"
+            grep -q 'reload invoker.*DIFFERENT' "$RECEIPTS/rebind.stdout"
+            grep -q 'native host stable' "$RECEIPTS/rebind.stdout"
+            grep -q 'fresh/current callback.*rv=10010053 want=10010053' "$RECEIPTS/rebind.stdout"
+            grep -q 'child Link after re-register.*rv=1001035' "$RECEIPTS/rebind.stdout"
+            grep -q 'child Link after re-register.*exit=0' "$RECEIPTS/rebind.stdout"
+            echo EXACT_ENTRY_REBIND_OK | tee "$RECEIPTS/gate.txt"
           fi
 
       - name: Upload exact-head diagnostic receipt
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: arm64-current-base-trace-${{ github.run_id }}
-          path: receipts-current-base-trace
+          name: customir-rebind-${{ matrix.variant }}-${{ github.run_id }}
+          path: receipts-${{ matrix.variant }}
           retention-days: 30
