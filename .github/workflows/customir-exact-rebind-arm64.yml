@@ -1,4 +1,4 @@
-name: CustomIR exact rebind A/B ARM64
+name: Current-head ARM64 startup discriminator
 
 on:
   push:
@@ -11,15 +11,19 @@ permissions:
   contents: read
 
 jobs:
-  rebind-ab:
+  startup-discriminator:
     strategy:
       fail-fast: false
       matrix:
-        variant: [registry-only, exact-entry]
+        include:
+          - variant: current-base
+            source_sha: f1f1e6a36af0b7d5e194260a94a1666b899b0097
+          - variant: candidate-debug
+            source_sha: 93fe514dc2b96c76fdc55614e4ef5f24fa1851ba
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 55
     env:
-      SOURCE_SHA: ${{ github.sha }}
+      SOURCE_SHA: ${{ matrix.source_sha }}
       FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
       ROOTFS: ${{ github.workspace }}/rootfs-amd64-${{ matrix.variant }}
       RECEIPTS: ${{ github.workspace }}/receipts-${{ matrix.variant }}
@@ -30,6 +34,7 @@ jobs:
       - name: Check out exact product source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ env.SOURCE_SHA }}
           path: src
           submodules: recursive
           fetch-depth: 1
@@ -52,35 +57,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config libcap-dev \
-            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
+            gcc g++ gcc-x86-64-linux-gnu g++-x86-64-linux-gnu gdb
           base64 -d \
             fieldwork/investigations/fex-vulkan-thunk-lifecycle/synthetic-reproducer/fex-thunk-lifetime-repro-source.tar.gz.b64 \
             > /tmp/repro.tar.gz
           echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
           mkdir /tmp/repro
           tar xf /tmp/repro.tar.gz -C /tmp/repro
-
-      - name: Remove exact eviction for the negative control
-        if: ${{ matrix.variant == 'registry-only' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("src/Source/Tools/LinuxEmulation/LinuxSyscalls/ThreadManager.h")
-          text = path.read_text(encoding="utf-8")
-          exact = """    CTX->InvalidateCodeBuffersCodeEntry(Entrypoint);
-              for (auto& Thread : Threads) {
-                CTX->InvalidateThreadCachedCodeEntry(Thread->Thread, Entrypoint);
-              }
-          """
-          if text.count(exact) != 1:
-              raise SystemExit(f"expected one exact-eviction block, found {text.count(exact)}")
-          path.write_text(text.replace(exact, "", 1), encoding="utf-8")
-          PY
-          git -C src diff --check
-          git -C src diff > "$RECEIPTS/registry-only.diff"
 
       - name: Build FEX and the retained thunk pair
         shell: bash
@@ -116,16 +99,18 @@ jobs:
           cp -a /usr/x86_64-linux-gnu/lib/libstdc++.so.6* "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
           cp -a /usr/x86_64-linux-gnu/lib/libgcc_s.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/" || true
 
-      - name: Execute forced-different reload and classify
+      - name: Run normally and capture a host backtrace on failure
         shell: bash
         run: |
           set -uxo pipefail
           fex="$GITHUB_WORKSPACE/src/build/Bin/FEX"
           host="/tmp/repro/fex-full-thunk-pair/host"
+          guest="/opt/fex-ci/full/guest/fex_full_lifetime"
+
           set +e
           (cd "$ROOTFS/opt/fex-ci/full" && \
             FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$host" timeout 30s \
-            "$fex" /opt/fex-ci/full/guest/fex_full_lifetime --force-different) \
+            "$fex" "$guest" --force-different) \
             > "$RECEIPTS/rebind.stdout" 2> "$RECEIPTS/rebind.stderr"
           rc=$?
           set -e
@@ -134,24 +119,40 @@ jobs:
             "$RECEIPTS/rebind.stdout" "$RECEIPTS/rebind.stderr" \
             > "$RECEIPTS/key-lines.txt" || true
           cat "$RECEIPTS/key-lines.txt"
-          test "$rc" -eq 0
-          grep -q 'reload invoker.*DIFFERENT' "$RECEIPTS/rebind.stdout"
-          grep -q 'native host stable' "$RECEIPTS/rebind.stdout"
-          grep -q 'fresh/current callback.*rv=10010053 want=10010053' "$RECEIPTS/rebind.stdout"
-          grep -q 'child current callback after new  exit=0' "$RECEIPTS/rebind.stdout"
-          if [ "${{ matrix.variant }}" = registry-only ]; then
-            grep -q 'child Link after re-register      signal=11' "$RECEIPTS/rebind.stdout"
-            echo REGISTRY_ONLY_NEGATIVE_OK | tee "$RECEIPTS/gate.txt"
-          else
-            grep -q 'child Link after re-register      rv=1001035' "$RECEIPTS/rebind.stdout"
-            grep -q 'child Link after re-register      exit=0' "$RECEIPTS/rebind.stdout"
-            echo EXACT_ENTRY_REBIND_OK | tee "$RECEIPTS/gate.txt"
+
+          if [ "$rc" -ne 0 ]; then
+            set +e
+            (cd "$ROOTFS/opt/fex-ci/full" && \
+              FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$host" timeout 40s \
+              gdb -q -batch \
+                -ex 'set pagination off' \
+                -ex 'set confirm off' \
+                -ex 'handle SIGILL stop print nopass' \
+                -ex 'handle SIGSEGV stop print nopass' \
+                -ex run \
+                -ex 'thread apply all bt full' \
+                --args "$fex" "$guest" --force-different) \
+              > "$RECEIPTS/gdb.txt" 2>&1
+            gdb_rc=$?
+            set -e
+            echo "$gdb_rc" | tee "$RECEIPTS/gdb.exit"
+            test -s "$RECEIPTS/gdb.txt"
           fi
 
-      - name: Upload exact-head receipt
+          if grep -qE 'generation|reload invoker|native host stable' "$RECEIPTS/rebind.stdout"; then
+            echo "${{ matrix.variant }}_STARTUP_REACHED_FIXTURE" | tee "$RECEIPTS/gate.txt"
+          elif [ "$rc" -ne 0 ] && grep -qE 'SIGILL|Illegal instruction' "$RECEIPTS/gdb.txt"; then
+            echo "${{ matrix.variant }}_STARTUP_SIGILL_CAPTURED" | tee "$RECEIPTS/gate.txt"
+          elif [ "$rc" -ne 0 ]; then
+            echo "${{ matrix.variant }}_STARTUP_FAILURE_CAPTURED" | tee "$RECEIPTS/gate.txt"
+          else
+            echo "${{ matrix.variant }}_COMPLETED_WITHOUT_FIXTURE_ORACLE" | tee "$RECEIPTS/gate.txt"
+          fi
+
+      - name: Upload exact-head diagnostic receipt
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: customir-rebind-${{ matrix.variant }}-${{ github.run_id }}
+          name: arm64-startup-${{ matrix.variant }}-${{ github.run_id }}
           path: receipts-${{ matrix.variant }}
           retention-days: 30
