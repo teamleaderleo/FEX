@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Regression checks for the owned fork's explicit CI scheduling boundary."""
+
+from __future__ import annotations
+
+import re
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BROAD_WORKFLOWS = (
+    "ccpp.yml",
+    "glibc_fault.yml",
+    "hostrunner.yml",
+    "instcountci.yml",
+    "mingw_build.yml",
+    "steamrt4.yml",
+    "vixl_simulator.yml",
+    "wine_dll_artifacts.yml",
+)
+
+
+class OwnedForkCIPolicyTest(unittest.TestCase):
+    def workflow(self, name: str) -> str:
+        return (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+
+    def test_inherited_broad_workflows_are_manual_only(self) -> None:
+        for name in BROAD_WORKFLOWS:
+            with self.subTest(workflow=name):
+                workflow = self.workflow(name)
+                self.assertIn("workflow_dispatch:", workflow)
+                self.assertNotIn("pull_request:", workflow)
+                self.assertNotIn("\n  push:", workflow)
+                self.assertNotIn("ci:full", workflow)
+
+    def test_upstream_commenting_formatter_is_not_registered(self) -> None:
+        self.assertFalse(
+            (REPO_ROOT / ".github" / "workflows" / "pr-code-format.yml").exists()
+        )
+
+    def test_focused_lane_is_manual_bounded_and_exact_head(self) -> None:
+        workflow = self.workflow("focused-x86-research.yml")
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("pull_request:", workflow)
+        self.assertNotIn("\n  push:", workflow)
+        self.assertIn("runs-on: [self-hosted, X64, fex-research]", workflow)
+        self.assertIn("Scripts/ResearchDevBuild.py", workflow)
+        self.assertIn("build \"${TARGET}\"", workflow)
+        self.assertIn("linux-test-build \"${TARGET}\"", workflow)
+        self.assertIn("fex-previous-receipt.json", workflow)
+        self.assertIn('receipt.get("head") != os.environ["GITHUB_SHA"]', workflow)
+
+    def test_custom_runner_label_is_declared_for_static_lint(self) -> None:
+        config = (REPO_ROOT / ".github" / "actionlint.yaml").read_text(encoding="utf-8")
+        self.assertIn("self-hosted-runner:", config)
+        self.assertIn("- fex-research", config)
+
+    def test_focused_lane_actions_are_commit_pinned(self) -> None:
+        workflow = self.workflow("focused-x86-research.yml")
+        actions = re.findall(r"^\s*uses:\s+([^\s#]+)", workflow, flags=re.MULTILINE)
+        self.assertTrue(actions)
+        for action in actions:
+            with self.subTest(action=action):
+                _, separator, revision = action.rpartition("@")
+                self.assertEqual(separator, "@")
+                self.assertRegex(revision, r"^[0-9a-f]{40}$")
+
+
+if __name__ == "__main__":
+    unittest.main()

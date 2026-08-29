@@ -17,12 +17,48 @@ Each research PR should instead report:
 
 Reuse an existing exact-head result when code, toolchain, inputs, and relevant environment have not changed.
 
-## Requesting broad CI deliberately
+## Focused self-hosted research lane
 
-There are two explicit routes:
+`.github/workflows/focused-x86-research.yml` is the default Actions escalation path for x86-host
+research. It is manual-only and accepts two bounded modes:
 
-1. Add the `ci:full` label to a pull request. The label event triggers every broad workflow once. After a later push, remove and re-add the label if the new exact head genuinely needs the same broad coverage.
-2. Dispatch one workflow manually from GitHub Actions. `workflow_dispatch` is available on each broad workflow, so a single relevant lane can be selected without labeling the PR for all matrices.
+- `build` compiles one exact CMake target with the `dev` profile;
+- `linux-test-build` builds `FEX`, `FEXServer`, and one exact 32- or 64-bit guest Linux-test binary.
+
+Both modes reuse `Scripts/ResearchDevBuild.py`, its stable external build path, CPU-bound ccache
+namespace, source-switch cleanup, lane lock, and exact-head receipt. They do not run a test suite or
+an x86 guest under FEX. Use a branch-scoped ARM64 workflow when the unresolved fact is runtime
+behavior rather than x86-host compilation.
+
+The workflow requires a repository runner carrying all three labels `self-hosted`, `X64`, and
+`fex-research`. Check runner availability before dispatch; a missing compatible runner means the job
+would only queue and is not evidence:
+
+```bash
+gh api repos/teamleaderleo/FEX/actions/runners \
+  --jq '.runners[] | {name, status, busy, labels: [.labels[].name]}'
+
+gh workflow run focused-x86-research.yml \
+  --repo teamleaderleo/FEX \
+  --ref MY_EXACT_BRANCH \
+  -f mode=build \
+  -f target=thunkgentest \
+  -f bitness=64 \
+  -f jobs=8
+```
+
+The selected `--ref` is the product source revision. The emitted artifact is a convenience copy of
+the helper's receipt, not a broad acceptance badge.
+
+## Requesting inherited broad CI deliberately
+
+The inherited broad workflows are manual-only in this fork. Dispatch one relevant workflow from
+GitHub Actions after confirming that a compatible runner exists. There is intentionally no label
+that fans every platform matrix out at once.
+
+The upstream pull-request formatter is not registered in this fork: its implementation is tied to
+upstream's runner and writes to `FEX-Emu/FEX`. Run a focused local formatter check when a changed
+source file needs it instead of creating an owned-fork job that can only skip.
 
 Do this only after stating which unresolved risk needs that coverage. A queued self-hosted job is not evidence until a compatible runner actually owns and completes it.
 
@@ -42,6 +78,6 @@ Prefer extending a reusable focused lane over creating another near-duplicate wo
 
 ## Relationship to upstream
 
-The fork workflow triggers intentionally diverge from upstream; no upstream repository state is changed. When refreshing from upstream, retain the fork's label/manual-dispatch trigger policy unless the owner deliberately changes it.
+The fork workflow triggers intentionally diverge from upstream; no upstream repository state is changed. When refreshing from upstream, retain the fork's focused/manual-dispatch policy unless the owner deliberately changes it.
 
 This policy changes scheduling, not product source. It does not turn a focused x86 generator check into ARM runtime acceptance, and it does not authorize interaction with upstream GitHub state.
