@@ -95,6 +95,10 @@ class ResearchDevBuildTest(unittest.TestCase):
         )
         args = dev_build.parser().parse_args(["submodules", "--jobs", "4"])
         self.assertEqual((args.action, args.jobs), ("submodules", 4))
+        cached = dev_build.parser().parse_args(["submodules", "--pack-cache"])
+        self.assertTrue(cached.pack_cache)
+        inventory = dev_build.parser().parse_args(["submodule-cache"])
+        self.assertEqual(inventory.action, "submodule-cache")
 
     def test_linux_test_commands_name_one_guest_build(self):
         with mock.patch.object(dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"):
@@ -208,6 +212,51 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertEqual(receipt["pinnedDigest"], "a" * 64)
         self.assertEqual(receipt["elapsedSeconds"], 2.5)
         self.assertEqual(receipt["jobs"], 4)
+
+    def test_submodule_action_attaches_pack_cache_receipt_and_rechecks_pins(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            output = __import__("io").StringIO()
+            completed = subprocess.CompletedProcess(["git", "submodule", "update"], 0)
+            with mock.patch.object(
+                dev_build,
+                "submodule_update_command",
+                return_value=["/tool/git", "submodule", "update"],
+            ):
+                with mock.patch.object(dev_build.subprocess, "run", return_value=completed):
+                    with mock.patch.object(dev_build, "require_pinned_submodules") as require:
+                        with mock.patch.object(
+                            dev_build,
+                            "pinned_submodule_identity",
+                            return_value=(18, "a" * 64),
+                        ):
+                            with mock.patch.object(
+                                dev_build.submodule_pack_cache,
+                                "compact",
+                                return_value={"format": "cache", "linkedEntries": 72},
+                            ) as compact:
+                                with mock.patch.object(
+                                    dev_build,
+                                    "source_identity",
+                                    return_value={"head": "b" * 40, "dirty": False},
+                                ):
+                                    with mock.patch("sys.stdout", output):
+                                        result = dev_build.main(
+                                            [
+                                                "--source",
+                                                str(source),
+                                                "--cache-root",
+                                                str(source / "cache"),
+                                                "submodules",
+                                                "--pack-cache",
+                                            ]
+                                        )
+
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(receipt["packCache"]["linkedEntries"], 72)
+        self.assertEqual(require.call_count, 2)
+        compact.assert_called_once_with(source.resolve(), (source / "cache").resolve(), "a" * 64, 18)
 
     def test_lane_inventory_classifies_live_dead_active_and_unsafe_state(self):
         with tempfile.TemporaryDirectory() as temporary:
