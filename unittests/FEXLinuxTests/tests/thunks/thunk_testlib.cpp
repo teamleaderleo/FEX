@@ -34,6 +34,9 @@ struct Fixture {
   GET_SYMBOL(QueryOffsetOf);
 
   GET_SYMBOL(RanCustomRepack);
+  GET_SYMBOL(RanConstCustomRepack);
+  GET_SYMBOL(ResetCustomRepackStats);
+  GET_SYMBOL(ReadCustomRepackStats);
 
   GET_SYMBOL(FunctionWithDivergentSignature);
 
@@ -84,8 +87,19 @@ TEST_CASE_METHOD(Fixture, "Automatic struct repacking") {
 }
 
 TEST_CASE_METHOD(Fixture, "Assisted struct repacking") {
-  CustomRepackedType data {};
+  CustomRepackedType data {.data = nullptr, .cleanup_cookie = nullptr, .custom_repack_invoked = 0};
+
+  ResetCustomRepackStats();
+  CHECK(RanConstCustomRepack(&data) == 1);
+  CHECK(ReadCustomRepackStats() == 0x0100'0101);
+  CHECK(data.cleanup_cookie == nullptr);
+  CHECK(data.custom_repack_invoked == 0);
+
+  ResetCustomRepackStats();
   CHECK(RanCustomRepack(&data) == 1);
+  CHECK(ReadCustomRepackStats() == 0x0001'0101);
+  CHECK(data.cleanup_cookie == nullptr);
+  CHECK(data.custom_repack_invoked == 1);
 }
 
 TEST_CASE_METHOD(Fixture, "Function signature with differing parameter sizes") {

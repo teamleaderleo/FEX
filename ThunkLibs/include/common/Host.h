@@ -354,13 +354,13 @@ struct repack_wrapper {
                     *data;
                   }) {
       if (data) {
-        // NOTE: It's assumed that the native host library didn't modify any
-        //       const-pointees, so we skip automatic exit repacking for them.
-        //       However, *custom* repacking must still be applied since it
-        //       might have unrelated side effects (such as deallocation of
-        //       memory reserved on entry)
-        if (!fex_apply_custom_repacking_exit(*orig_arg.get_pointer(), *data)) {
-          if constexpr (!std::is_const_v<std::remove_pointer_t<T>>) { // Skip exit-repacking for const pointees
+        // Native host libraries must not modify const pointees. Keep their
+        // entry-side storage cleanup separate from host-to-guest copyback so
+        // a custom exit hook cannot write through const guest input.
+        if constexpr (std::is_const_v<std::remove_pointer_t<T>>) {
+          fex_apply_custom_repacking_cleanup(*data);
+        } else {
+          if (!fex_apply_custom_repacking_exit(*orig_arg.get_pointer(), *data)) {
             if constexpr (!(has_compatible_data_layout<T> && std::is_same_v<T, GuestT>)) {
               *orig_arg.get_pointer() = to_guest(*data); // TODO: Only if annotated as out-parameter
             }

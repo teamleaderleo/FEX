@@ -59,11 +59,15 @@ uint32_t GetReorderingTypeMemberWithoutRepacking(const ReorderingType*, int inde
 // sets the first bit of "custom_repack_invoked" to 1 on entry.
 struct CustomRepackedType {
   ReorderingType* data;
+  void* cleanup_cookie;
   int custom_repack_invoked;
 };
 
 // Should return true if the custom repacker set "custom_repack_invoked" to true
 int RanCustomRepack(CustomRepackedType*);
+int RanConstCustomRepack(const CustomRepackedType*);
+void ResetCustomRepackStats();
+uint32_t ReadCustomRepackStats();
 
 /// Interface used to check that function arguments with different integer size
 /// get forwarded correctly

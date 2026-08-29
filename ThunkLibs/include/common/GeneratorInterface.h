@@ -23,6 +23,8 @@ struct callback_stub : callback_annotation_base {};
 // * fex_custom_repack_exit, called on exit but before automatic exit-repacking
 //     of the other members. Non-trivial implementations must perform host->guest
 //     repacking manually and return the boolean value true.
+// * fex_custom_repack_cleanup, called instead of fex_custom_repack_exit for const
+//     pointees. It must release entry-side host storage without writing guest data.
 //
 // If multiple members of the same struct are annotated as custom_repack,
 // they must be handled in the same fex_custom_repack_entry/exit functions.

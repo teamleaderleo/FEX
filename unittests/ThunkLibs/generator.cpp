@@ -848,6 +848,9 @@ TEST_CASE_METHOD(Fixture, "StructRepacking") {
       const auto wrapper_type = output.code.substr(wrapper_begin, wrapper_end - wrapper_begin);
       CHECK(wrapper_type.find("A") != std::string::npos);
       CHECK(wrapper_type.find("const") != std::string::npos);
+      CHECK(output.code.find("void fex_custom_repack_cleanup(const host_layout<A>& from);") != std::string::npos);
+      CHECK(output.code.find("void fex_apply_custom_repacking_cleanup(const host_layout<A>& from)") != std::string::npos);
+      CHECK(output.code.find("fex_custom_repack_cleanup(from);") != std::string::npos);
     }
   }
 

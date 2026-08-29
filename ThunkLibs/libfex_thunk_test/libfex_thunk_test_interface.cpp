@@ -49,7 +49,15 @@ struct fex_gen_param<QueryOffsetOf, 0, ReorderingType*> : fexgen::ptr_passthroug
 template<>
 struct fex_gen_config<&CustomRepackedType::data> : fexgen::custom_repack {};
 template<>
+struct fex_gen_config<&CustomRepackedType::cleanup_cookie> : fexgen::custom_repack {};
+template<>
 struct fex_gen_config<RanCustomRepack> {};
+template<>
+struct fex_gen_config<RanConstCustomRepack> {};
+template<>
+struct fex_gen_config<ResetCustomRepackStats> : fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<ReadCustomRepackStats> : fexgen::custom_host_impl {};
 
 template<>
 struct fex_gen_config<FunctionWithDivergentSignature> {};
