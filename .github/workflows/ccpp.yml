@@ -1,13 +1,10 @@
 name: Build + Test
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
-    types: [opened, synchronize, reopened, labeled]
+    types: [labeled]
   workflow_dispatch:
 
 env:
@@ -19,7 +16,7 @@ env:
 
 jobs:
   build_plus_test:
-    if: github.repository == 'FEX-Emu/FEX' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'ci:full'
     runs-on: ${{ matrix.arch }}
     strategy:
       matrix:
