@@ -55,6 +55,7 @@ def main() -> int:
     source_root = Path(sys.argv[1]).resolve()
     host_path = Path(sys.argv[2]) if len(sys.argv) == 3 else source_root / "ThunkLibs/libvulkan/Host.cpp"
     host = host_path.read_text(encoding="utf-8")
+    guest = (source_root / "ThunkLibs/libvulkan/Guest.cpp").read_text(encoding="utf-8")
     interface = (source_root / "ThunkLibs/libvulkan/libvulkan_interface.cpp").read_text(encoding="utf-8")
     expected = xml_inventory(source_root)
     copied, rejected, body = source_inventory(host)
@@ -81,11 +82,15 @@ def main() -> int:
 
     unsupported_extension_guards = (
         "VK_LUNARG_direct_driver_loading is unsupported across the FEX Vulkan ISA boundary",
+    )
+    guest_extension_guards = (
         "strcmp(property.extensionName, VK_LUNARG_DIRECT_DRIVER_LOADING_EXTENSION_NAME) == 0",
+        'a_1 == std::string_view {"vkEnumerateInstanceExtensionProperties"}',
     )
     absent_guards = [guard for guard in unsupported_extension_guards if guard not in host]
+    absent_guards.extend(guard for guard in guest_extension_guards if guard not in guest)
     custom_enumerator = (
-        "struct fex_gen_config<vkEnumerateInstanceExtensionProperties> : fexgen::custom_host_impl {};"
+        "struct fex_gen_config<vkEnumerateInstanceExtensionProperties> : fexgen::custom_guest_entrypoint {};"
     )
     if custom_enumerator not in interface:
         absent_guards.append(custom_enumerator)

@@ -257,46 +257,6 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
   return ret;
 }
 
-static VkResult FEXFN_IMPL(vkEnumerateInstanceExtensionProperties)(const char* a_0, uint32_t* a_1, VkExtensionProperties* a_2) {
-  constexpr unsigned MAX_ENUMERATION_ATTEMPTS = 4;
-  std::vector<VkExtensionProperties> properties;
-  VkResult ret = VK_INCOMPLETE;
-
-  for (unsigned attempt = 0; attempt < MAX_ENUMERATION_ATTEMPTS; ++attempt) {
-    uint32_t count = 0;
-    ret = LDR_PTR(vkEnumerateInstanceExtensionProperties)(a_0, &count, nullptr);
-    if (ret != VK_SUCCESS) {
-      return ret;
-    }
-
-    properties.resize(count);
-    ret = LDR_PTR(vkEnumerateInstanceExtensionProperties)(a_0, &count, properties.data());
-    properties.resize(count);
-    if (ret != VK_INCOMPLETE) {
-      break;
-    }
-  }
-
-  if (ret != VK_SUCCESS) {
-    return ret;
-  }
-
-  std::erase_if(properties, [](const VkExtensionProperties& property) {
-    return strcmp(property.extensionName, VK_LUNARG_DIRECT_DRIVER_LOADING_EXTENSION_NAME) == 0;
-  });
-
-  if (!a_2) {
-    *a_1 = properties.size();
-    return VK_SUCCESS;
-  }
-
-  const uint32_t capacity = *a_1;
-  const uint32_t written = std::min<uint32_t>(capacity, properties.size());
-  std::copy_n(properties.begin(), written, a_2);
-  *a_1 = written;
-  return written < properties.size() ? VK_INCOMPLETE : VK_SUCCESS;
-}
-
 static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceCreateInfo* a_1, const VkAllocationCallbacks* a_2,
                                            guest_layout<VkDevice*> a_3) {
   VkDevice out;
@@ -496,8 +456,6 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateShaderModule;
   } else if (a_1 == "vkCreateInstance"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateInstance;
-  } else if (a_1 == "vkEnumerateInstanceExtensionProperties"sv) {
-    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkEnumerateInstanceExtensionProperties;
   } else if (a_1 == "vkCreateDevice"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDevice;
   } else if (a_1 == "vkAllocateMemory"sv) {
