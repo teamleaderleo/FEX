@@ -34,10 +34,17 @@ On an x86-32 guest, a Vulkan `pNext` chain cannot be borrowed as if it had the h
 `default_fex_custom_repack_entry` allocates an aligned host node for each guest node and follows the
 chain through `next_handlers`.
 
-The matching mutable path copies the chain back and frees those host nodes. The const path walks
-only the host chain and frees it; it does not touch the guest chain. Non-default Vulkan repackers
-must additionally release their own arrays or nested structs. Three direct array wrappers use the
-same host-only cleanup rule after the native Vulkan call because their parameters are const.
+The matching mutable hook traverses the guest and host chains, invokes the current reverse handler,
+and frees those host nodes. The const path walks only the host chain and frees it; it does not touch
+the guest chain. Non-default Vulkan repackers must additionally release their own arrays or nested
+structs. Three direct array wrappers use the same host-only cleanup rule after the native Vulkan
+call because their parameters are const.
+
+The non-default Vulkan exits still return `false`, which asks `repack_wrapper` to perform the
+repository's existing automatic repacking of non-custom fields afterward. This change proves that
+the entry-side allocations have matching mutable and const owners. It does not claim that the
+historical final guest values of every custom pointer field are correct, and 32-bit Vulkan runtime
+forwarding remains disabled.
 
 At the time of this note, the source inventory finds 18 non-default Vulkan entry owners that call
 the generic `pNext` entry helper. Every one must call the chain-only mutable reverse helper from its
