@@ -1,4 +1,4 @@
-name: Current-head ARM64 startup discriminator
+name: Current-head ARM64 fixture-boundary trace
 
 on:
   push:
@@ -11,22 +11,14 @@ permissions:
   contents: read
 
 jobs:
-  startup-discriminator:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: current-base
-            source_sha: f1f1e6a36af0b7d5e194260a94a1666b899b0097
-          - variant: candidate-debug
-            source_sha: 93fe514dc2b96c76fdc55614e4ef5f24fa1851ba
+  fixture-boundary-trace:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 55
     env:
-      SOURCE_SHA: ${{ matrix.source_sha }}
+      SOURCE_SHA: f1f1e6a36af0b7d5e194260a94a1666b899b0097
       FIELDWORK_SHA: 9eca19ac8743567ce2af7b4c82f2483d97c19b09
-      ROOTFS: ${{ github.workspace }}/rootfs-amd64-${{ matrix.variant }}
-      RECEIPTS: ${{ github.workspace }}/receipts-${{ matrix.variant }}
+      ROOTFS: ${{ github.workspace }}/rootfs-amd64-current-base-trace
+      RECEIPTS: ${{ github.workspace }}/receipts-current-base-trace
       FEX_PORTABLE: 1
       DEBIAN_FRONTEND: noninteractive
 
@@ -64,6 +56,17 @@ jobs:
           echo '0582bf8832699cfb2614c1781473d07054ba01f03e3342735a45ea04735c2a01  /tmp/repro.tar.gz' | sha256sum -c -
           mkdir /tmp/repro
           tar xf /tmp/repro.tar.gz -C /tmp/repro
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("/tmp/repro/fex-full-thunk-pair/guest/main.cpp")
+          text = path.read_text(encoding="utf-8")
+          needle = "int main(int argc, char** argv) {\n"
+          replacement = needle + "  std::setvbuf(stdout, nullptr, _IONBF, 0);\n"
+          if text.count(needle) != 1:
+              raise SystemExit(f"expected one fixture main, found {text.count(needle)}")
+          path.write_text(text.replace(needle, replacement), encoding="utf-8")
+          PY
 
       - name: Build FEX and the retained thunk pair
         shell: bash
@@ -128,8 +131,12 @@ jobs:
                 -ex 'set pagination off' \
                 -ex 'set confirm off' \
                 -ex 'handle SIGILL stop print nopass' \
+                -ex 'handle SIGBUS stop print nopass' \
                 -ex 'handle SIGSEGV stop print nopass' \
                 -ex run \
+                -ex 'info registers' \
+                -ex 'info proc mappings' \
+                -ex 'x/12i $pc' \
                 -ex 'thread apply all bt full' \
                 --args "$fex" "$guest" --force-different) \
               > "$RECEIPTS/gdb.txt" 2>&1
@@ -140,19 +147,21 @@ jobs:
           fi
 
           if grep -qE 'generation|reload invoker|native host stable' "$RECEIPTS/rebind.stdout"; then
-            echo "${{ matrix.variant }}_STARTUP_REACHED_FIXTURE" | tee "$RECEIPTS/gate.txt"
-          elif [ "$rc" -ne 0 ] && grep -qE 'SIGILL|Illegal instruction' "$RECEIPTS/gdb.txt"; then
-            echo "${{ matrix.variant }}_STARTUP_SIGILL_CAPTURED" | tee "$RECEIPTS/gate.txt"
+            echo CURRENT_BASE_TRACE_REACHED_FIXTURE | tee "$RECEIPTS/gate.txt"
+          elif [ "$rc" -ne 0 ] && grep -q 'Program received signal SIGBUS' "$RECEIPTS/gdb.txt"; then
+            echo CURRENT_BASE_TRACE_SIGBUS_CAPTURED | tee "$RECEIPTS/gate.txt"
+          elif [ "$rc" -ne 0 ] && grep -q 'Program received signal SIGILL' "$RECEIPTS/gdb.txt"; then
+            echo CURRENT_BASE_TRACE_SIGILL_CAPTURED | tee "$RECEIPTS/gate.txt"
           elif [ "$rc" -ne 0 ]; then
-            echo "${{ matrix.variant }}_STARTUP_FAILURE_CAPTURED" | tee "$RECEIPTS/gate.txt"
+            echo CURRENT_BASE_TRACE_FAILURE_CAPTURED | tee "$RECEIPTS/gate.txt"
           else
-            echo "${{ matrix.variant }}_COMPLETED_WITHOUT_FIXTURE_ORACLE" | tee "$RECEIPTS/gate.txt"
+            echo CURRENT_BASE_TRACE_COMPLETED_WITHOUT_FIXTURE_ORACLE | tee "$RECEIPTS/gate.txt"
           fi
 
       - name: Upload exact-head diagnostic receipt
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: arm64-startup-${{ matrix.variant }}-${{ github.run_id }}
-          path: receipts-${{ matrix.variant }}
+          name: arm64-current-base-trace-${{ github.run_id }}
+          path: receipts-current-base-trace
           retention-days: 30
