@@ -66,6 +66,31 @@ class OwnedForkCIPolicyTest(unittest.TestCase):
                 self.assertEqual(separator, "@")
                 self.assertRegex(revision, r"^[0-9a-f]{40}$")
 
+    def test_arm64_lane_is_manual_exact_sha_and_profile_only(self) -> None:
+        workflow = self.workflow("focused-arm64-research.yml")
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("pull_request:", workflow)
+        self.assertNotIn("\n  push:", workflow)
+        self.assertIn("runs-on: ubuntu-24.04-arm", workflow)
+        self.assertIn("source_sha:", workflow)
+        self.assertIn("profile:", workflow)
+        self.assertIn("variant:", workflow)
+        self.assertNotIn("command:", workflow)
+        self.assertIn("ResearchProfileCarrier.py run", workflow)
+        self.assertIn("github.workflow_sha", workflow)
+        self.assertIn('test "${GITHUB_REF}" = "refs/heads/${DEFAULT_BRANCH}"', workflow)
+        self.assertIn("persist-credentials: false", workflow)
+
+    def test_arm64_lane_actions_are_commit_pinned(self) -> None:
+        workflow = self.workflow("focused-arm64-research.yml")
+        actions = re.findall(r"^\s*uses:\s+([^\s#]+)", workflow, flags=re.MULTILINE)
+        self.assertTrue(actions)
+        for action in actions:
+            with self.subTest(action=action):
+                _, separator, revision = action.rpartition("@")
+                self.assertEqual(separator, "@")
+                self.assertRegex(revision, r"^[0-9a-f]{40}$")
+
 
 if __name__ == "__main__":
     unittest.main()

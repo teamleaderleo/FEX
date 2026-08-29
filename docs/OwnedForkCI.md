@@ -27,17 +27,9 @@ research. It is manual-only and accepts two bounded modes:
 
 Both modes reuse `Scripts/ResearchDevBuild.py`, its stable external build path, CPU-bound ccache
 namespace, source-switch cleanup, lane lock, and exact-head receipt. They do not run a test suite or
-an x86 guest under FEX. Use a branch-scoped ARM64 workflow when the unresolved fact is runtime
-behavior rather than x86-host compilation.
+an x86 guest under FEX.
 
-An ARM64 lane must prove a small ordinary x86 control before its product-specific oracle. If the
-control traps in JIT code, a base and candidate that die at the same instruction are environment
-diagnostics, not an A/B result. A host-feature override is acceptable only when the disabled path is
-outside the claim and the receipt names the override; it does not accept the omitted host-feature
-path. Prefer moving the product oracle to Glaeda or an installed-FEX host over repeatedly compiling
-the same two sources on a hosted VM that cannot pass its control.
-
-The workflow requires a repository runner carrying all three labels `self-hosted`, `X64`, and
+The x86 workflow requires a repository runner carrying all three labels `self-hosted`, `X64`, and
 `fex-research`. Check runner availability before dispatch; a missing compatible runner means the job
 would only queue and is not evidence:
 
@@ -57,6 +49,73 @@ gh workflow run focused-x86-research.yml \
 The selected `--ref` is the product source revision. The emitted artifact is a convenience copy of
 the helper's receipt, not a broad acceptance badge.
 
+An ARM64 profile must prove a small ordinary x86 control before its product-specific oracle. If the
+control traps in JIT code, a base and candidate that die at the same instruction are environment
+diagnostics, not an A/B result. A host-feature override is acceptable only when the disabled path is
+outside the claim and the receipt names the override; it does not accept the omitted host-feature
+path. Prefer moving the product oracle to Glaeda or an installed-FEX host over repeatedly compiling
+the same two sources on a hosted VM that cannot pass its control.
+
+## Focused hosted ARM64 research carrier
+
+Use `.github/workflows/focused-arm64-research.yml` when the unresolved fact genuinely requires an
+ARM64 host. The manual workflow is registered once on the default branch. A dispatch supplies only:
+
+- one full immutable FEX source SHA;
+- one safe ID under `Scripts/ResearchProfiles`;
+- one variant declared by that profile; and
+- bounded parallelism from 1 through 16 workers.
+
+It does not accept a command, script body, branch name, package list or arbitrary JSON input. The
+default-branch carrier is checked out separately from the requested product tree. It verifies the
+product's exact HEAD, clean tracked state and complete pinned recursive submodule inventory both
+before and after the profile. The product checkout uses the measured bounded parallel submodule
+bootstrap and publishes that separate receipt. Both profile files must exist byte-for-byte in the
+requested source commit; an untracked local profile is refused. The profile must emit
+`profile-outcome.json`; a zero process exit without that bounded pass document is a failure. The
+always-uploaded carrier receipt binds both
+commits, both checked-in profile-file digests, variant, jobs, timeout, source state, duration and
+result.
+
+Add or refine a profile in the product branch instead of adding a workflow file. A profile is:
+
+```text
+Scripts/ResearchProfiles/<safe-id>/profile.json
+Scripts/ResearchProfiles/<safe-id>/run.sh
+```
+
+The manifest declares the exact ID, fixed `ubuntu-24.04-arm` platform, timeout of at most 55
+minutes, and sorted allowed variants. `run.sh` owns setup, controls, oracle and profile-specific
+evidence. It receives fixed `FEX_RESEARCH_*` paths/identities and must write this file inside the
+private receipt directory on success:
+
+```json
+{"schemaVersion": 1, "status": "pass", "summary": "bounded factual result"}
+```
+
+Inspect a profile locally before dispatch:
+
+```bash
+python3 Scripts/ResearchProfileCarrier.py inspect \
+  --profile arm64-environment-smoke --variant default
+```
+
+Then dispatch the workflow from default-branch `main`, while selecting the immutable product SHA
+separately:
+
+```bash
+gh workflow run focused-arm64-research.yml \
+  --repo teamleaderleo/FEX \
+  --ref main \
+  -f source_sha="$(git rev-parse HEAD)" \
+  -f profile=arm64-environment-smoke \
+  -f variant=default \
+  -f jobs=8
+```
+
+The retained smoke profile validates carrier checkout/identity/receipt mechanics only. Reuse its
+accepted result until the carrier or runner image changes; it is not FEX product acceptance.
+
 ## Requesting inherited broad CI deliberately
 
 The inherited broad workflows are manual-only in this fork. Dispatch one relevant workflow from
@@ -71,7 +130,11 @@ Do this only after stating which unresolved risk needs that coverage. A queued s
 
 ## Disposable workflow lifecycle
 
-One-off experiment workflows remain registered in the Actions UI even when their branch is no longer active. Record the result receipt first, then retire the registration. The registry helper is dry-run by default and protects workflow paths present on the default branch or any open pull-request head:
+One-off experiment workflows remain registered in the Actions UI even when their branch is no
+longer active. Prefer a checked-in ARM64 profile so no new workflow registration is created. If the
+single carrier genuinely cannot express the required platform or permission boundary, record the
+one-off result receipt first, then retire its registration. The registry helper is dry-run by
+default and protects workflow paths present on the default branch or any open pull-request head:
 
 ```bash
 python3 Scripts/ForkWorkflowRegistry.py \
