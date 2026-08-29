@@ -125,6 +125,20 @@ def configure_command(source_view: Path, build: Path) -> list[str]:
     ]
 
 
+def reconfigure_command(source_view: Path, build: Path) -> list[str]:
+    """Refresh CMake's graph without throwing away a warm build tree."""
+    return [
+        required_tool("cmake"),
+        "-S",
+        str(source_view),
+        "-B",
+        str(build),
+        "-G",
+        "Ninja",
+        *CONFIGURE_OPTIONS,
+    ]
+
+
 def build_command(build: Path, target: str, jobs: int) -> list[str]:
     if not target or target.startswith("-"):
         raise ValueError("target must be an explicit CMake target name")
@@ -285,6 +299,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"configured lane={lane} source={source} build={build}")
                 return 0
             if args.action == "editor":
+                if not needs_configure:
+                    subprocess.run(
+                        reconfigure_command(source_view, build), check=True, env=env
+                    )
                 destination = source / "compile_commands.json"
                 count = write_editor_compile_commands(
                     source_view, source, build, destination

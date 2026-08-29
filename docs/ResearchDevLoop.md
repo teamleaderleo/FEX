@@ -58,8 +58,10 @@ Command-line users get the same setup with:
 ./Scripts/ResearchDevBuild.py --lane editor build vulkan-host-64
 ```
 
-Re-run `editor` after changing CMake structure, switching the lane to another worktree or changing
-the build profile. Ordinary source edits do not require regenerating the database.
+Re-run `editor` after pulling or switching commits, changing CMake structure, switching the lane to
+another worktree or changing the build profile. On an existing lane it performs an incremental CMake
+regeneration before exporting the database; it does not throw away the warm object tree. Ordinary
+edits inside already-known source files do not require regenerating the database.
 
 ## Measured big-red checkpoint
 

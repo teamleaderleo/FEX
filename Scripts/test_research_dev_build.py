@@ -28,6 +28,21 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertIn("-DBUILD_THUNKS=True", command)
         self.assertIn("-DUSE_LINKER=lld", command)
 
+    def test_editor_reconfigure_keeps_warm_build_tree(self):
+        with mock.patch.object(dev_build, "required_tool", return_value="/tool/cmake"):
+            command = dev_build.reconfigure_command(Path("/view/src"), Path("/view/build"))
+
+        self.assertNotIn("--fresh", command)
+        self.assertEqual(command[:6], [
+            "/tool/cmake",
+            "-S",
+            "/view/src",
+            "-B",
+            "/view/build",
+            "-G",
+        ])
+        self.assertIn("-DBUILD_TESTING=True", command)
+
     def test_build_requires_one_explicit_target(self):
         with mock.patch.object(dev_build, "required_tool", return_value="/tool/cmake"):
             command = dev_build.build_command(Path("/view/build"), "vulkan-host-64", 8)
