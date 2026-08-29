@@ -7,6 +7,8 @@ on:
   pull_request:
     branches:
       - main
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
 
 env:
   # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
@@ -17,6 +19,7 @@ env:
 
 jobs:
   vixl_simulator:
+    if: github.repository == 'FEX-Emu/FEX' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     runs-on: ${{ matrix.arch }}
     strategy:
       matrix:

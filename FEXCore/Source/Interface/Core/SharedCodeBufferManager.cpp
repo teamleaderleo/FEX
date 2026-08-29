@@ -34,6 +34,9 @@ CodeBuffer::CodeBuffer(size_t Size)
   FEXCore::Allocator::VirtualTHPControl(Ptr, Size, FEXCore::Allocator::THPControl::Enable);
 
   LookupCache = fextl::make_unique<GuestToHostMap>();
+
+  CodeBufferEnd = Ptr + UsableSize();
+  CodeBufferOffset = Ptr;
 }
 
 CodeBuffer::~CodeBuffer() {
@@ -66,7 +69,6 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) 
   auto Buffer = fextl::make_shared<CodeBuffer>(Size);
 
   Latest = Buffer;
-  LatestOffset = 0;
 
   OnCodeBufferAllocated(Buffer);
 
@@ -86,7 +88,7 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartLargerCodeBuffer() {
     return GetLatest();
   }
 
-  auto NewCodeBufferSize = GetLatest()->AllocatedSize;
+  auto NewCodeBufferSize = GetLatest()->TotalAllocationSize();
   NewCodeBufferSize = std::min<size_t>(NewCodeBufferSize * 2, MAX_CODE_SIZE);
   return AllocateNew(NewCodeBufferSize);
 }

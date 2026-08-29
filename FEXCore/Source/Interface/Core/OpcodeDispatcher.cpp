@@ -1526,7 +1526,7 @@ void OpDispatchBuilder::SHLDImmediateOp(OpcodeArgs) {
       Res = _Extr(OpSizeFromSrc(Op), Dest, Src, Size - Shift);
     }
 
-    CalculateFlags_ShiftLeftImmediate(OpSizeFromSrc(Op), Res, Dest, Shift);
+    CalculateFlags_ShiftLeftImmediate(OpSizeFromSrc(Op), Res, Dest, Shift, true);
     CalculateDeferredFlags();
     StoreResultGPR(Op, Res);
   } else if (Shift == 0 && Size == 32) {
@@ -1774,7 +1774,7 @@ void OpDispatchBuilder::BLSMSKBMIOp(OpcodeArgs) {
   InvalidatePF_AF();
 
   // CF set according to the Src
-  auto CFInv = To01(OpSize::i64Bit, Src);
+  auto CFInv = To01(Size, Src);
 
   // The output of BLSMSK is always nonzero, so TST will clear Z (along with C
   // and O) while setting S.
@@ -1792,7 +1792,7 @@ void OpDispatchBuilder::BLSRBMIOp(OpcodeArgs) {
 
   StoreResultGPR(Op, Result);
 
-  auto CFInv = To01(OpSize::i64Bit, Src);
+  auto CFInv = To01(Size, Src);
 
   SetNZ_ZeroCV(Size, Result);
   SetCFInverted(CFInv);
@@ -4617,7 +4617,7 @@ void OpDispatchBuilder::StoreResult(RegClass Class, X86Tables::DecodedOp Op, Ref
 }
 
 OpDispatchBuilder::OpDispatchBuilder(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::InternalThreadState* Thread)
-  : IREmitter {ctx->OpDispatcherAllocator, ctx->HostFeatures.SupportsTSOImm9}
+  : IREmitter {ctx->OpDispatcherAllocator, ctx->HostFeatures.SupportsTSOImm9 != 0}
   , CTX {ctx}
   , Thread {Thread} {
   if (CTX->HostFeatures.SupportsAVX && CTX->HostFeatures.SupportsSVE256) {
