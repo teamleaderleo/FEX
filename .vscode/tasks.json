@@ -1,0 +1,38 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "FEX: prepare editor lane",
+      "type": "process",
+      "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
+      "args": ["--lane", "editor", "editor"],
+      "problemMatcher": []
+    },
+    {
+      "label": "FEX: build one target",
+      "type": "process",
+      "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
+      "args": ["--lane", "editor", "build", "${input:fexTarget}"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "FEX: show editor lane receipt",
+      "type": "process",
+      "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
+      "args": ["--lane", "editor", "status"],
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "fexTarget",
+      "type": "promptString",
+      "description": "Exact CMake target to build (not 'everything')",
+      "default": "vulkan-host-64"
+    }
+  ]
+}
