@@ -2369,7 +2369,7 @@ struct fex_gen_param<vkCreateDevice, 3, VkDevice*> : fexgen::ptr_passthrough {};
 template<>
 struct fex_gen_config<vkDestroyDevice> {};
 template<>
-struct fex_gen_config<vkEnumerateInstanceExtensionProperties> {};
+struct fex_gen_config<vkEnumerateInstanceExtensionProperties> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<vkEnumerateDeviceExtensionProperties> {};
 template<>

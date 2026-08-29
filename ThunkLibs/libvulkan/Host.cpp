@@ -14,6 +14,7 @@ $end_info$
 
 #include "common/Host.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <mutex>
@@ -150,8 +151,8 @@ struct VkExportMetalObjectCreateInfoEXTCompat {
 };
 
 using InstanceCreatePNextCopy = std::variant<VkDebugReportCallbackCreateInfoEXT, VkDebugUtilsMessengerCreateInfoEXT,
-                                             VkDirectDriverLoadingListLUNARG, VkExportMetalObjectCreateInfoEXTCompat,
-                                             VkLayerSettingsCreateInfoEXT, VkValidationFeaturesEXT, VkValidationFlagsEXT>;
+                                             VkExportMetalObjectCreateInfoEXTCompat, VkLayerSettingsCreateInfoEXT,
+                                             VkValidationFeaturesEXT, VkValidationFlagsEXT>;
 
 static VkBaseInStructure* InstanceCreatePNextBase(InstanceCreatePNextCopy& copy) {
   return std::visit([](auto& value) { return reinterpret_cast<VkBaseInStructure*>(&value); }, copy);
@@ -172,9 +173,6 @@ static bool CopyInstanceCreatePNextChain(const VkBaseInStructure* source, std::v
       copies.emplace_back(copy);
       break;
     }
-    case VK_STRUCTURE_TYPE_DIRECT_DRIVER_LOADING_LIST_LUNARG:
-      copies.emplace_back(*reinterpret_cast<const VkDirectDriverLoadingListLUNARG*>(current));
-      break;
     case VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT:
       copies.emplace_back(*reinterpret_cast<const VkExportMetalObjectCreateInfoEXTCompat*>(current));
       break;
@@ -201,6 +199,17 @@ static bool CopyInstanceCreatePNextChain(const VkBaseInStructure* source, std::v
 #endif
 
 static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, const VkAllocationCallbacks* a_1, guest_layout<VkInstance*> a_2) {
+  for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(a_0->pNext); vk_struct;
+       vk_struct = vk_struct->pNext) {
+    // A direct-loaded driver is guest x86 code. Its GIPA callback and every
+    // function pointer returned by that callback are not callable by the
+    // native host loader. Do not pass this extension across the ISA boundary.
+    if (vk_struct->sType == VK_STRUCTURE_TYPE_DIRECT_DRIVER_LOADING_LIST_LUNARG) {
+      fprintf(stderr, "ERROR: VK_LUNARG_direct_driver_loading is unsupported across the FEX Vulkan ISA boundary\n");
+      return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
+  }
+
 #ifdef IS_32BIT_THUNK
   const VkInstanceCreateInfo* vk_struct_base = a_0;
   for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(vk_struct_base); vk_struct->pNext;
@@ -246,6 +255,46 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
   auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
   *a_2.get_pointer() = to_guest(to_host_layout(out));
   return ret;
+}
+
+static VkResult FEXFN_IMPL(vkEnumerateInstanceExtensionProperties)(const char* a_0, uint32_t* a_1, VkExtensionProperties* a_2) {
+  constexpr unsigned MAX_ENUMERATION_ATTEMPTS = 4;
+  std::vector<VkExtensionProperties> properties;
+  VkResult ret = VK_INCOMPLETE;
+
+  for (unsigned attempt = 0; attempt < MAX_ENUMERATION_ATTEMPTS; ++attempt) {
+    uint32_t count = 0;
+    ret = LDR_PTR(vkEnumerateInstanceExtensionProperties)(a_0, &count, nullptr);
+    if (ret != VK_SUCCESS) {
+      return ret;
+    }
+
+    properties.resize(count);
+    ret = LDR_PTR(vkEnumerateInstanceExtensionProperties)(a_0, &count, properties.data());
+    properties.resize(count);
+    if (ret != VK_INCOMPLETE) {
+      break;
+    }
+  }
+
+  if (ret != VK_SUCCESS) {
+    return ret;
+  }
+
+  std::erase_if(properties, [](const VkExtensionProperties& property) {
+    return strcmp(property.extensionName, VK_LUNARG_DIRECT_DRIVER_LOADING_EXTENSION_NAME) == 0;
+  });
+
+  if (!a_2) {
+    *a_1 = properties.size();
+    return VK_SUCCESS;
+  }
+
+  const uint32_t capacity = *a_1;
+  const uint32_t written = std::min<uint32_t>(capacity, properties.size());
+  std::copy_n(properties.begin(), written, a_2);
+  *a_1 = written;
+  return written < properties.size() ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 static VkResult FEXFN_IMPL(vkCreateDevice)(VkPhysicalDevice a_0, const VkDeviceCreateInfo* a_1, const VkAllocationCallbacks* a_2,
@@ -447,6 +496,8 @@ static PFN_vkVoidFunction LookupCustomVulkanFunction(const char* a_1) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateShaderModule;
   } else if (a_1 == "vkCreateInstance"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateInstance;
+  } else if (a_1 == "vkEnumerateInstanceExtensionProperties"sv) {
+    return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkEnumerateInstanceExtensionProperties;
   } else if (a_1 == "vkCreateDevice"sv) {
     return (PFN_vkVoidFunction)fexfn_impl_libvulkan_vkCreateDevice;
   } else if (a_1 == "vkAllocateMemory"sv) {
