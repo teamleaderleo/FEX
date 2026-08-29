@@ -22,6 +22,13 @@ exports that setting explicitly because the CMake 4.2/Ninja launcher observed on
 timestamp, as intended by that repository policy. A target build does not claim a full build or
 full-test pass.
 
+The receipt observes `HEAD` and the dirty bit immediately before target execution; it does not
+snapshot or lock a worktree that an editor can still change. That is appropriate for fast local
+feedback, but it is not immutable experiment identity. For a result that will be reused as exact
+evidence, point the lane at a dedicated clean worktree, make no concurrent edits, and recheck the
+worktree identity after the command before publishing the receipt. A dirty receipt is developer
+feedback, not an exact-head acceptance record.
+
 When the question needs an x86 guest Linux test binary, select the bounded profile explicitly:
 
 ```sh
