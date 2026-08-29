@@ -11,6 +11,7 @@ $end_info$
 #include <FEXCore/Core/SignalDelegator.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
+#include <FEXCore/Core/DiskCacheFileMapper.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Config/Config.h>
@@ -36,6 +37,7 @@ $end_info$
 #include "Common/Exception.h"
 #include "Common/ImageTracker.h"
 #include "Common/InvalidationTracker.h"
+#include "Common/Threads.h"
 #include "Common/OvercommitTracker.h"
 #include "Common/TSOHandlerConfig.h"
 #include "Common/CPUFeatures.h"
@@ -581,6 +583,7 @@ NTSTATUS ProcessInit() {
   InitSyscalls();
 
   FEX::Windows::InitCRTProcess();
+  FEX::Windows::SetupThreadHandlers();
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
   const auto ExecutableName = FEX::Windows::BaseName(ExecutablePath);
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
@@ -604,6 +607,9 @@ NTSTATUS ProcessInit() {
 
   FEX::Windows::Allocator::SetupHooks(NtDll);
   FEX::Windows::UnixLib::Init(NtDll);
+  if (FEX::Windows::UnixLib::Available()) {
+    FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
+  }
 
   {
     auto HostFeatures = FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Arm64ec);
@@ -920,7 +926,7 @@ NTSTATUS ThreadInit() {
   CPUArea.EmulatorStackLimit() = EmulatorStack;
   CPUArea.EmulatorStackBase() = EmulatorStack + EmulatorStackSize;
 
-  auto* Thread = CTX->CreateThread(0, 0);
+  auto* Thread = CTX->CreateThread();
 
   // Default segment setup.
   auto Frame = Thread->CurrentFrame;

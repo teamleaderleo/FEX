@@ -7,12 +7,15 @@ on:
   pull_request:
     branches:
       - main
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
 
 env:
   BUILD_TYPE: Debug
 
 jobs:
   mingw_build:
+    if: github.repository == 'FEX-Emu/FEX' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     runs-on: ${{ matrix.arch }}
     strategy:
       matrix:

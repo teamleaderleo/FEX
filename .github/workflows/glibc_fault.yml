@@ -14,6 +14,8 @@ on:
   pull_request:
     branches:
       - main
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
 
 env:
   # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
@@ -24,6 +26,7 @@ env:
 
 jobs:
   glibc_fault_test:
+    if: github.repository == 'FEX-Emu/FEX' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     runs-on: ${{ matrix.arch }}
     strategy:
       matrix:
@@ -121,4 +124,3 @@ jobs:
         name: Results-${{ env.runner_name }}-${{ env.runner_label }}
         path: results/*.log
         retention-days: 3
-

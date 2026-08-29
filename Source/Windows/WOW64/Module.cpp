@@ -13,6 +13,7 @@ $end_info$
 #include <FEXCore/Core/SignalDelegator.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
+#include <FEXCore/Core/DiskCacheFileMapper.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Config/Config.h>
@@ -38,6 +39,7 @@ $end_info$
 #include "Common/TSOHandlerConfig.h"
 #include "Common/ImageTracker.h"
 #include "Common/InvalidationTracker.h"
+#include "Common/Threads.h"
 #include "Common/OvercommitTracker.h"
 #include "Common/CPUFeatures.h"
 #include "Common/Logging.h"
@@ -447,26 +449,26 @@ public:
         ULONG32 Args;
       }* StackArgs = reinterpret_cast<StackLayout*>(ReturnRSP);
 
-      ReturnRSP += sizeof(StackLayout);
+      Frame->State.gregs[FEXCore::X86State::REG_RSP] = ReturnRSP + sizeof(StackLayout);
+      Frame->State.rip = ReturnRIP;
 
       const auto TLS = GetTLS();
       Context::UnlockJITContext(TLS);
       ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, ULongToPtr(StackArgs->Args)));
       Context::LockJITContext(TLS);
+      Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
     } else if (Frame->State.rip == (uint64_t)BridgeInstrs::Syscall) {
       const uint64_t EntryRAX = Frame->State.gregs[FEXCore::X86State::REG_RAX];
+
+      Frame->State.gregs[FEXCore::X86State::REG_RSP] = ReturnRSP;
+      Frame->State.rip = ReturnRIP;
 
       const auto TLS = GetTLS();
       Context::UnlockJITContext(TLS);
       Wow64ProcessPendingCrossProcessItems();
       ReturnRAX = static_cast<uint64_t>(Wow64SystemServiceEx(static_cast<UINT>(EntryRAX), reinterpret_cast<UINT*>(ReturnRSP + 4)));
       Context::LockJITContext(TLS);
-    }
-    // If a new context has been set, use it directly and don't return to the syscall caller
-    if (Frame->State.rip == (uint64_t)BridgeInstrs::Syscall || Frame->State.rip == (uint64_t)BridgeInstrs::UnixCall) {
       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
-      Frame->State.gregs[FEXCore::X86State::REG_RSP] = ReturnRSP;
-      Frame->State.rip = ReturnRIP;
     }
 
     // NORETURNEDRESULT causes this result to be ignored since we restore all registers back from memory after a syscall anyway
@@ -515,6 +517,7 @@ public:
 
 void BTCpuProcessInit() {
   FEX::Windows::InitCRTProcess();
+  FEX::Windows::SetupThreadHandlers();
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
   const auto ExecutableName = FEX::Windows::BaseName(ExecutablePath);
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
@@ -536,6 +539,9 @@ void BTCpuProcessInit() {
 
   FEX::Windows::Allocator::SetupHooks(NtDll);
   FEX::Windows::UnixLib::Init(NtDll);
+  if (FEX::Windows::UnixLib::Available()) {
+    FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
+  }
 
   {
     auto HostFeatures = FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Wow64);
@@ -596,7 +602,7 @@ void BTCpuThreadInit() {
   static constexpr size_t DefaultWow64CS {4};
   std::scoped_lock Lock(ThreadCreationMutex);
   FEX::Windows::InitCRTThread();
-  auto* Thread = CTX->CreateThread(0, 0);
+  auto* Thread = CTX->CreateThread();
 
   // Default segment setup.
   auto Frame = Thread->CurrentFrame;

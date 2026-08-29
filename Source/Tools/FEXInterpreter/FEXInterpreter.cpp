@@ -28,6 +28,7 @@ $end_info$
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
+#include <FEXCore/Core/DiskCacheFileMapper.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/FileLoading.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -81,7 +82,9 @@ void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
   const auto Style = DisableOutputColors ? fmt::text_style {} : LogMan::DebugLevelStyle(Level);
   const auto Output = fextl::fmt::format("{} {}\n", fmt::styled(LogMan::DebugLevelStr(Level), Style), Message);
   write(OutputFD, Output.c_str(), Output.size());
-  fsync(OutputFD);
+  if (Level == LogMan::DebugLevels::ASSERT) {
+    fsync(OutputFD);
+  }
 }
 
 void AssertHandler(const char* Message) {
@@ -189,6 +192,16 @@ void Shutdown(fextl::vector<FEXCore::Allocator::MemoryRegion>&& MemoryRegions) {
   FEXCore::Allocator::ReclaimMemoryRegion(MemoryRegions);
 }
 } // namespace FEX::Allocator
+
+static void* DiskCacheFilemapper(FEXCore::File::File::FileHandleType Handle, uint64_t MapSize) {
+  int mapFD = dup(Handle);
+  void* Result = FEXCore::Allocator::mmap(nullptr, MapSize, PROT_READ, MAP_SHARED | MAP_NORESERVE, mapFD, 0);
+  close(mapFD);
+  if (Result == (void*)-1) {
+    return nullptr;
+  }
+  return Result;
+}
 
 bool InterpreterHandler(fextl::string* Filename, const fextl::string& RootFS, fextl::vector<fextl::string>* args) {
   int FD {-1};
@@ -519,6 +532,8 @@ int main(int argc, char** argv, char** const envp) {
   // Setup Thread handlers, so FEXCore can create threads.
   auto StackTracker = FEX::LinuxEmulation::Threads::SetupThreadHandlers();
 
+  FEXCore::DiskCache::SetFileMapper(DiskCacheFilemapper);
+
   auto MemoryRegions = FEX::Allocator::InitMemoryRegions(Loader.Is64BitMode());
   auto Allocator = FEX::Allocator::InitAllocator(Loader.Is64BitMode());
 
@@ -571,7 +586,7 @@ int main(int argc, char** argv, char** const envp) {
   }
 
   // Create a thread without a RIP or stack pointer setup initially.
-  auto ParentThread = SyscallHandler->TM.CreateThread(0, 0);
+  auto ParentThread = SyscallHandler->TM.CreateThread();
   SyscallHandler->TM.TrackThread(ParentThread);
   SignalDelegation->RegisterTLSState(ParentThread);
   ThunkHandler->RegisterTLSState(ParentThread);

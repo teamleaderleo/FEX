@@ -36,6 +36,7 @@ namespace Handler {
 enum ConfigOption {
 #define OPT_BASE(type, group, enum, json, default) CONFIG_##enum,
 #include <FEXCore/Config/ConfigValues.inl>
+  CONFIG_MAX,
 };
 
 #define ENUMDEFINES
@@ -116,11 +117,13 @@ namespace detail {
 FEX_DEFAULT_VISIBILITY void SetDataDirectory(std::string_view Path, bool Global);
 FEX_DEFAULT_VISIBILITY void SetConfigDirectory(const std::string_view Path, bool Global);
 FEX_DEFAULT_VISIBILITY void SetConfigFileLocation(std::string_view Path, bool Global);
+FEX_DEFAULT_VISIBILITY void SetCacheDirectory(const std::string_view Path);
 
 FEX_DEFAULT_VISIBILITY const fextl::string& GetDataDirectory(bool Global = false);
 FEX_DEFAULT_VISIBILITY const fextl::string& GetConfigDirectory(bool Global);
 FEX_DEFAULT_VISIBILITY const fextl::string& GetConfigFileLocation(bool Global = false);
 FEX_DEFAULT_VISIBILITY fextl::string GetApplicationConfig(const std::string_view Program, bool Global);
+FEX_DEFAULT_VISIBILITY const fextl::string& GetCacheDirectory();
 
 using LayerValue = std::variant< fextl::string, StringArrayType, uint8_t, int8_t, uint16_t, int16_t, uint32_t, int32_t, uint64_t, int64_t, bool >;
 
@@ -228,6 +231,8 @@ FEX_DEFAULT_VISIBILITY std::optional<T> GetConv(ConfigOption Option);
 FEX_DEFAULT_VISIBILITY std::optional<fextl::string*> Get(ConfigOption Option);
 FEX_DEFAULT_VISIBILITY void Set(ConfigOption Option, std::string_view Data);
 FEX_DEFAULT_VISIBILITY void Erase(ConfigOption Option);
+FEX_DEFAULT_VISIBILITY fextl::string SerializeForCache();
+FEX_DEFAULT_VISIBILITY bool CheckConfigMatches(std::string_view Config);
 
 template<typename T>
 class FEX_DEFAULT_VISIBILITY Value {

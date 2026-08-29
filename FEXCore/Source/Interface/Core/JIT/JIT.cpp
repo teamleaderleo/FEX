@@ -616,11 +616,11 @@ void Arm64JITCore::Op_NoOp(const IR::IROp_Header* IROp, IR::Ref Node) {}
 Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::InternalThreadState* Thread)
   : CPUBackend(*ctx, Thread)
   , Arm64Emitter(ctx)
-  , HostSupportsSVE128 {ctx->HostFeatures.SupportsSVE128}
-  , HostSupportsSVE256 {ctx->HostFeatures.SupportsSVE256}
+  , HostSupportsSVE128 {ctx->HostFeatures.SupportsSVE128 != 0}
+  , HostSupportsSVE256 {ctx->HostFeatures.SupportsSVE256 != 0}
   , HostSupportsAVX256 {ctx->HostFeatures.SupportsAVX && ctx->HostFeatures.SupportsSVE256}
-  , HostSupportsRPRES {ctx->HostFeatures.SupportsRPRES}
-  , HostSupportsAFP {ctx->HostFeatures.SupportsAFP}
+  , HostSupportsRPRES {ctx->HostFeatures.SupportsRPRES != 0}
+  , HostSupportsAFP {ctx->HostFeatures.SupportsAFP != 0}
   , CTX {ctx}
   , TempCodeBufferAllocator(ctx->CPUBackendAllocator, 0) {
 
@@ -675,10 +675,8 @@ void Arm64JITCore::ClearCache() {
   auto PrevCodeBuffer = CurrentCodeBuffer;
   auto lk = PrevCodeBuffer->LookupCache->AcquireWriteLock();
 
-  auto CodeBuffer = GetEmptySharedCodeBuffer();
-  SetBuffer(CodeBuffer->Ptr, CodeBuffer->AllocatedSize);
-
-  ThreadState->LookupCache->ChangeGuestToHostMapping(*PrevCodeBuffer, *CurrentCodeBuffer->LookupCache, lk);
+  auto CodeBuffer = AcquireNewSharedCodeBuffer();
+  ThreadState->LookupCache->ChangeGuestToHostMapping(*PrevCodeBuffer, *CodeBuffer->LookupCache, lk);
 }
 
 Arm64JITCore::~Arm64JITCore() {}
@@ -815,6 +813,33 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
   EmitSuspendInterruptCheck();
 }
 
+
+CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(size_t Size) {
+  CodeBuffer::CodeBufferAllocation AllocatedInfo {};
+  LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared, "INVARIANT VIOLATED: SharedLookupCache "
+                                                                                               "doesn't match up!\n");
+  // Bring CodeBuffer up to date
+  if (auto Prev = CheckCodeBufferUpdate()) {
+    Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    auto lk = ThreadState->LookupCache->AcquireWriteLock();
+    ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
+  }
+
+  // Attempt to allocate a buffer from the SharedCodeBuffers.
+  while (AllocatedInfo.BufferAllocationOffset == nullptr) {
+    AllocatedInfo = CurrentCodeBuffer->AtomicAllocateBuffer(Size);
+
+    if (AllocatedInfo.BufferAllocationOffset == nullptr) {
+      // If it didn't fit then clear the buffer and try again.
+      // This has the possibility of migrating the SharedCodeBuffer. See above in `Arm64JITCore::ClearCache()`
+      CTX->ClearCodeCache(ThreadState);
+      continue;
+    }
+  }
+
+  return AllocatedInfo;
+}
+
 CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
   FEXCORE_PROFILE_SCOPED("Arm64::CompileCode");
@@ -867,6 +892,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   ThreadState->JITGuardOverflowArgument = FEXCore::ToUnderlying(RestartOptions::Control::NeedsLargerJITSpace);
 
   CodeData.BlockBegin = GetCursorAddress<uint8_t*>();
+  LOGMAN_THROW_A_FMT(GetCursorOffset() == 0, "Needs to be zero");
 
   // Put the code header at the start of the data block.
   ARMEmitter::BackwardLabel JITCodeHeaderLabel {};
@@ -1055,66 +1081,44 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   }
 
   SetCursorOffset(JITRIPEntriesLocation - CodeData.BlockBegin);
-  Align();
+  // Make sure code is 16B aligned on the tail.
+  // Can't use Align16B here as vl64pair can cause non-4byte alignment.
+  Align(16);
 
-  CodeData.Size = GetCursorAddress<uint8_t*>() - CodeData.BlockBegin;
+  // Beginning of emission is guaranteed to be offset zero. So the code data size is just the current cursor offset.
+  CodeData.Size = GetCursorOffset();
 
   // Finalize and write block tail data
   JITBlockTail.Size = CodeData.Size;
   {
-    auto PrevCur = GetCursorOffset();
     memcpy(JITBlockTailLocation, &JITBlockTail, sizeof(JITBlockTail));
     SetCursorOffset(JITBlockTailLocation - CodeData.BlockBegin + offsetof(JITCodeTail, RIP));
     PlaceNamedSymbolLiteral(InsertGuestRIPLiteral(JITBlockTail.RIP));
-    SetCursorOffset(PrevCur);
+
+    // Emitter buffer is no longer used, guard against misuse by setting to nullptr.
+    SetBuffer(nullptr, 0);
   }
 
   // Migrate the compile output from temporary storage to the actual CodeBuffer.
-  // This can block progress in other compiling threads, so the duration of the lock should be as small as possible.
   {
-    auto CodeBufferLock = std::unique_lock {SharedCodeBuffers.CodeBufferWriteMutex};
+    LOGMAN_THROW_A_FMT(CodeData.Size % 16 == 0, "Needs to be 16B aligned!");
 
-    // Query size of generated code
-    const auto TempSize = GetCursorOffset();
-
-    // Bring CodeBuffer up to date
-    {
-      LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared, "INVARIANT VIOLATED: SharedLookupCache "
-                                                                                                   "doesn't match up!\n");
-      if (auto Prev = CheckCodeBufferUpdate()) {
-        Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
-        auto lk = ThreadState->LookupCache->AcquireWriteLock();
-        ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
-      }
-
-      // NOTE: 16-byte alignment of the new cursor offset must be preserved for block linking records
-      SetBuffer(CurrentCodeBuffer->Ptr, CurrentCodeBuffer->AllocatedSize);
-      SetCursorOffset(SharedCodeBuffers.LatestOffset);
-      Align16B();
-      if ((GetCursorOffset() + TempSize) > CurrentCodeBuffer->UsableSize()) {
-        CTX->ClearCodeCache(ThreadState);
-      }
-
-      SharedCodeBuffers.LatestOffset = GetCursorOffset();
-    }
+    auto AllocatedInfo = AllocateCodeBufferInSharedCache(CodeData.Size);
+    // NOTE: 16-byte alignment of the new cursor offset must be preserved for block linking records
+    LOGMAN_THROW_A_FMT((reinterpret_cast<uintptr_t>(AllocatedInfo.BufferAllocationOffset) % 16) == 0, "Allocated buffer wasn't 16B "
+                                                                                                      "aligned?");
 
     // Adjust host addresses
-    const auto Delta = GetCursorAddress<uint8_t*>() - CodeData.BlockBegin;
+    const auto Delta = AllocatedInfo.BufferAllocationOffset - CodeData.BlockBegin;
     CodeData.BlockBegin += Delta;
     for (auto& EntryPoint : CodeData.EntryPoints) {
       EntryPoint.second += Delta;
     }
     CodeBegin += Delta;
-
-    for (std::size_t Idx = PrevNumAllocations; Idx != Relocations.size(); ++Idx) {
-      Relocations[Idx].Header.Offset += SharedCodeBuffers.LatestOffset;
-    }
+    CodeData.HostCodeOffset = CodeData.BlockBegin - CurrentCodeBuffer->GetBufferBase();
 
     // Copy over CodeBuffer contents
-    memcpy(GetCursorAddress<uint8_t*>(), TempCodeBuffer, TempSize);
-    SetCursorOffset(SharedCodeBuffers.LatestOffset + TempSize);
-
-    SharedCodeBuffers.LatestOffset = GetCursorOffset();
+    memcpy(AllocatedInfo.BufferAllocationOffset, TempCodeBuffer, CodeData.Size);
   }
 
   TempCodeBufferAllocator.DelayedDisownBuffer();
@@ -1151,6 +1155,25 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   this->IR = nullptr;
 
   return std::move(CodeData);
+}
+
+CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> HostBytes, std::span<const DiskCache::BlobEntryPoint> EntryPoints) {
+  // we stored it aligned, better still be?
+  LOGMAN_THROW_A_FMT(HostBytes.size() % 16 == 0, "Needs to be 16B aligned!");
+  auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size());
+
+  uint8_t* Dest = AllocatedInfo.BufferAllocationOffset;
+  memcpy(Dest, HostBytes.data(), HostBytes.size());
+  ClearICache(Dest, HostBytes.size());
+
+  CPUBackend::CompiledCode Result;
+  Result.BlockBegin = Dest;
+  Result.Size = HostBytes.size();
+  Result.HostCodeOffset = Dest - CurrentCodeBuffer->GetBufferBase();
+  for (const auto& Ep : EntryPoints) {
+    Result.EntryPoints[Ep.GuestRIP] = Dest + Ep.HostOffset;
+  }
+  return Result;
 }
 
 void Arm64JITCore::ResetStack() {
