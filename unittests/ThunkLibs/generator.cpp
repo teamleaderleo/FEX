@@ -423,6 +423,24 @@ TEST_CASE_METHOD(Fixture, "Trivial") {
                              )));
 }
 
+TEST_CASE_METHOD(Fixture, "LayoutWrapperOrderIsDeterministic") {
+  const std::string prelude_a = "struct Zebra { int value; };\n"
+                                "struct Apple { int value; };\n"
+                                "struct Member { int value; };\n"
+                                "struct Container { Member member; };\n";
+  const std::string prelude_b = "struct Member { int value; };\n"
+                                "struct Container { Member member; };\n"
+                                "struct Apple { int value; };\n"
+                                "struct Zebra { int value; };\n";
+  const std::string code = "void function(Zebra*, Container*, Apple*, Member*);\n"
+                           "template<auto> struct fex_gen_config {};\n"
+                           "template<> struct fex_gen_config<function> {};\n";
+
+  const auto output_a = run_thunkgen_host(prelude_a, code).code;
+  const auto output_b = run_thunkgen_host(prelude_b, code).code;
+  CHECK(output_a.substr(prelude_a.size()) == output_b.substr(prelude_b.size()));
+}
+
 // Unknown annotations trigger an error
 TEST_CASE_METHOD(Fixture, "UnknownAnnotation") {
   REQUIRE_THROWS(run_thunkgen("void func();\n",
