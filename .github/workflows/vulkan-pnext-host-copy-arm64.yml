@@ -1,0 +1,145 @@
+name: Vulkan instance pNext host-copy ARM64
+
+on:
+  push:
+    branches: [ci/vulkan-pnext-host-copy-arm64-20260829]
+    paths:
+      - .github/workflows/vulkan-pnext-host-copy-arm64.yml
+      - .github/probes/vulkan_instance_pnext_readonly.c
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: b0588b581c0245ad52329aaff08345821b1a542d
+  BASE_SHA: 5dfbda3b8eb7a3460ace66fedb6bdb54389304d3
+  ROOTFS: ${{ github.workspace }}/rootfs-amd64
+  HOST: ${{ github.workspace }}/host-thunks
+  R: ${{ github.workspace }}/receipts
+  FEX_PORTABLE: 1
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  readonly-chain:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Exact identity and dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$R" "$HOST"
+          test "$(git merge-base "$BASE_SHA" "$CANDIDATE_SHA")" = "$BASE_SHA"
+          test "$(git rev-parse "$CANDIDATE_SHA")" = "$CANDIDATE_SHA"
+          git diff --name-only "$CANDIDATE_SHA" HEAD -- ThunkLibs FEXCore Source unittests | tee "$R/carrier-product-diff.txt"
+          test ! -s "$R/carrier-product-diff.txt"
+          {
+            echo "carrier=$(git rev-parse HEAD)"
+            echo "candidate=$CANDIDATE_SHA"
+            echo "base=$BASE_SHA"
+            git diff --name-only "$BASE_SHA" "$CANDIDATE_SHA"
+            uname -a
+          } | tee "$R/identity.txt"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libcap-dev \
+            libgl-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev \
+            mesa-vulkan-drivers vulkan-validationlayers debootstrap
+          LVP_ICD="$(find /usr/share/vulkan/icd.d -maxdepth 1 -type f -name 'lvp_icd*.json' | head -1)"
+          test -n "$LVP_ICD"
+          echo "$LVP_ICD" > "$R/lvp-icd.txt"
+
+      - name: Build native and x86 probes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PROBE=.github/probes/vulkan_instance_pnext_readonly.c
+          INC=-IExternal/Vulkan-Headers/include
+          cc -O2 -g -std=gnu11 -Wall -Wextra -Werror $INC "$PROBE" -ldl -o "$R/probe-arm64"
+          x86_64-linux-gnu-gcc -O2 -g -std=gnu11 -Wall -Wextra -Werror $INC "$PROBE" -ldl -o "$R/probe-x86_64"
+          file "$R/probe-arm64" "$R/probe-x86_64" | tee "$R/probes.file.txt"
+
+      - name: Run read-only native positive control
+        shell: bash
+        run: |
+          set -euxo pipefail
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          timeout 60s env VK_DRIVER_FILES="$LVP_ICD" "$R/probe-arm64" >"$R/native.out" 2>"$R/native.err"
+          cat "$R/native.err"
+          grep -Eq '^PROBE_AFTER_CREATE result=0 instance=0x[0-9a-f]+ callbacks=([1-9][0-9]*)/([1-9][0-9]*) unchanged=1$' "$R/native.err"
+          grep -Eq '^PROBE_RETURN callbacks=([1-9][0-9]*)/([1-9][0-9]*) unchanged=1$' "$R/native.err"
+
+      - name: Build focused candidate Vulkan thunk pair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse "$CANDIDATE_SHA")" = "$CANDIDATE_SHA"
+          CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja \
+            -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
+            -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
+            -DBUILD_THUNKS=ON -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
+            -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ >"$R/cmake-host.log" 2>&1
+          cmake --build build --target FEX FEXServer vulkan-host-64 -- -j"$(nproc)" -v >"$R/build-host.log" 2>&1
+          cp build/HostLibs_64/libvulkan-host.so "$HOST/libvulkan-host.so"
+          cmake -S ThunkLibs/GuestLibs -B guest-build -G Ninja \
+            -DBITNESS=64 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/Data/CMake/toolchain_x86_64.cmake" \
+            -DFEX_PROJECT_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DGENERATOR_EXE="$GITHUB_WORKSPACE/build/Bin/thunkgen" \
+            -DX86_DEV_ROOTFS=/ >"$R/cmake-guest.log" 2>&1
+          cmake --build guest-build --target vulkan-guest -- -j"$(nproc)" -v >"$R/build-guest.log" 2>&1
+          file build/Bin/FEX build/Bin/FEXServer "$HOST/libvulkan-host.so" guest-build/libvulkan-guest.so \
+            >"$R/build-products.file.txt"
+
+      - name: Build minimal amd64 rootfs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo debootstrap --arch=amd64 --foreign --variant=minbase --components=main,universe \
+            --include=libvulkan1,libx11-6 noble "$ROOTFS" http://archive.ubuntu.com/ubuntu >"$R/debootstrap.log" 2>&1
+          sudo find "$ROOTFS" -type f -name '*.deb' -print | sort > "$R/rootfs-debs.txt"
+          sed -n 's/^I: Extracting \([^ ]*\)\.\.\.$/\1/p' "$R/debootstrap.log" | sort -u > "$R/rootfs-already-extracted.txt"
+          while IFS= read -r deb; do
+            pkg="$(dpkg-deb -f "$deb" Package)"
+            grep -Fxq "$pkg" "$R/rootfs-already-extracted.txt" && continue
+            sudo dpkg-deb -x "$deb" "$ROOTFS"
+          done < "$R/rootfs-debs.txt"
+          sudo cp guest-build/libvulkan-guest.so "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so.1"
+          sudo ln -sf libvulkan.so.1 "$ROOTFS/usr/lib/x86_64-linux-gnu/libvulkan.so"
+          sudo install -Dm755 "$R/probe-x86_64" "$ROOTFS/usr/local/bin/pnext-readonly-probe"
+
+      - name: Run candidate through FEX
+        shell: bash
+        run: |
+          set -euxo pipefail
+          LVP_ICD="$(cat "$R/lvp-icd.txt")"
+          timeout 90s env VK_DRIVER_FILES="$LVP_ICD" FEX_ROOTFS="$ROOTFS" FEX_THUNKHOSTLIBS="$HOST" \
+            "$GITHUB_WORKSPACE/build/Bin/FEX" /usr/local/bin/pnext-readonly-probe \
+            >"$R/fex.out" 2>"$R/fex.err"
+          cat "$R/fex.err"
+          grep -Eq '^PROBE_AFTER_CREATE result=0 instance=0x[0-9a-f]+ callbacks=0/0 unchanged=1$' "$R/fex.err"
+          grep -q '^PROBE_RETURN callbacks=0/0 unchanged=1$' "$R/fex.err"
+          {
+            echo "candidate=$CANDIDATE_SHA"
+            echo "native_callbacks=positive/positive"
+            echo "fex_guest_callbacks=0/0"
+            echo "readonly_chain_unchanged=1"
+            echo "result=pass"
+          } | tee "$R/final-summary.txt"
+
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-pnext-host-copy-${{ github.run_id }}
+          path: receipts
+          retention-days: 30
