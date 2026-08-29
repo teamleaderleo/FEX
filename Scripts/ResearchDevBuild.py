@@ -655,7 +655,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.action == "submodules":
             started = time.monotonic()
-            subprocess.run(submodule_update_command(source, args.jobs), check=True)
+            subprocess.run(
+                submodule_update_command(source, args.jobs),
+                check=True,
+                stdout=sys.stderr,
+            )
             require_pinned_submodules(source)
             repositories, digest = pinned_submodule_identity(source)
             identity = source_identity(source)

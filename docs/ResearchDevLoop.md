@@ -25,7 +25,8 @@ It runs the repository's shallow recursive update with up to 16 parallel clone/f
 fails unless every recursive repository is at the superproject's exact pinned commit. Its compact
 receipt includes the superproject head, dirty bit, worker count, repository count, elapsed time and
 a content-addressed digest of the complete pinned commit/path inventory. Use `--jobs N` to choose a
-smaller explicit bound.
+smaller explicit bound. Git checkout progress goes to stderr; stdout is one parseable JSON receipt,
+so a carrier can redirect it without mixing progress lines into the evidence file.
 
 The helper checks every recursive submodule before it configures anything. It fails immediately when
 a submodule is uninitialized, conflicted, or not at the superproject's pinned commit, and prints the

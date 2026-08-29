@@ -164,6 +164,7 @@ class ResearchDevBuildTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary)
             output = __import__("io").StringIO()
+            progress = __import__("io").StringIO()
             completed = subprocess.CompletedProcess(["git", "submodule", "update"], 0)
             with mock.patch.object(
                 dev_build,
@@ -186,13 +187,22 @@ class ResearchDevBuildTest(unittest.TestCase):
                                     dev_build.time, "monotonic", side_effect=(10.0, 12.5)
                                 ):
                                     with mock.patch("sys.stdout", output):
-                                        result = dev_build.main(
-                                            ["--source", str(source), "submodules", "--jobs", "4"]
-                                        )
+                                        with mock.patch("sys.stderr", progress):
+                                            result = dev_build.main(
+                                                [
+                                                    "--source",
+                                                    str(source),
+                                                    "submodules",
+                                                    "--jobs",
+                                                    "4",
+                                                ]
+                                            )
 
         receipt = __import__("json").loads(output.getvalue())
         self.assertEqual(result, 0)
-        run.assert_called_once_with(["/tool/git", "submodule", "update"], check=True)
+        run.assert_called_once_with(
+            ["/tool/git", "submodule", "update"], check=True, stdout=progress
+        )
         require.assert_called_once_with(source.resolve())
         self.assertEqual(receipt["repositories"], 18)
         self.assertEqual(receipt["pinnedDigest"], "a" * 64)
