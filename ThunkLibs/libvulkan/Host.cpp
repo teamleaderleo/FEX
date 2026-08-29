@@ -20,6 +20,7 @@ $end_info$
 #include <span>
 #include <string_view>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #ifdef IS_32BIT_THUNK
@@ -135,7 +136,72 @@ DummyVkDebugReportCallback(VkDebugReportFlagsEXT, VkDebugReportObjectTypeEXT, ui
   return VK_FALSE;
 }
 
+extern "C" VkBool32 DummyVkDebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
+                                                       const VkDebugUtilsMessengerCallbackDataEXT*, void*);
+
+#ifndef IS_32BIT_THUNK
+// vulkan_metal.h is platform-gated, but this structure is still a legal
+// VkInstanceCreateInfo extension. Its ABI is the common pNext header plus one
+// 32-bit enum, so keep a platform-neutral copy representation here.
+struct VkExportMetalObjectCreateInfoEXTCompat {
+  VkStructureType sType;
+  const void* pNext;
+  uint32_t exportObjectType;
+};
+
+using InstanceCreatePNextCopy = std::variant<VkDebugReportCallbackCreateInfoEXT, VkDebugUtilsMessengerCreateInfoEXT,
+                                             VkDirectDriverLoadingListLUNARG, VkExportMetalObjectCreateInfoEXTCompat,
+                                             VkLayerSettingsCreateInfoEXT, VkValidationFeaturesEXT, VkValidationFlagsEXT>;
+
+static VkBaseInStructure* InstanceCreatePNextBase(InstanceCreatePNextCopy& copy) {
+  return std::visit([](auto& value) { return reinterpret_cast<VkBaseInStructure*>(&value); }, copy);
+}
+
+static bool CopyInstanceCreatePNextChain(const VkBaseInStructure* source, std::vector<InstanceCreatePNextCopy>& copies) {
+  for (auto* current = source; current; current = current->pNext) {
+    switch (current->sType) {
+    case VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT: {
+      auto copy = *reinterpret_cast<const VkDebugReportCallbackCreateInfoEXT*>(current);
+      copy.pfnCallback = DummyVkDebugReportCallback;
+      copies.emplace_back(copy);
+      break;
+    }
+    case VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT: {
+      auto copy = *reinterpret_cast<const VkDebugUtilsMessengerCreateInfoEXT*>(current);
+      copy.pfnUserCallback = DummyVkDebugUtilsMessengerCallback;
+      copies.emplace_back(copy);
+      break;
+    }
+    case VK_STRUCTURE_TYPE_DIRECT_DRIVER_LOADING_LIST_LUNARG:
+      copies.emplace_back(*reinterpret_cast<const VkDirectDriverLoadingListLUNARG*>(current));
+      break;
+    case VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT:
+      copies.emplace_back(*reinterpret_cast<const VkExportMetalObjectCreateInfoEXTCompat*>(current));
+      break;
+    case VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT:
+      copies.emplace_back(*reinterpret_cast<const VkLayerSettingsCreateInfoEXT*>(current));
+      break;
+    case VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT:
+      copies.emplace_back(*reinterpret_cast<const VkValidationFeaturesEXT*>(current));
+      break;
+    case VK_STRUCTURE_TYPE_VALIDATION_FLAGS_EXT:
+      copies.emplace_back(*reinterpret_cast<const VkValidationFlagsEXT*>(current));
+      break;
+    default:
+      return false;
+    }
+  }
+
+  for (size_t i = 0; i < copies.size(); ++i) {
+    auto* next = i + 1 < copies.size() ? InstanceCreatePNextBase(copies[i + 1]) : nullptr;
+    InstanceCreatePNextBase(copies[i])->pNext = next;
+  }
+  return true;
+}
+#endif
+
 static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, const VkAllocationCallbacks* a_1, guest_layout<VkInstance*> a_2) {
+#ifdef IS_32BIT_THUNK
   const VkInstanceCreateInfo* vk_struct_base = a_0;
   for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(vk_struct_base); vk_struct->pNext;
        vk_struct = vk_struct->pNext) {
@@ -150,6 +216,31 @@ static VkResult FEXFN_IMPL(vkCreateInstance)(const VkInstanceCreateInfo* a_0, co
       }
     }
   }
+#else
+  bool has_debug_callback = false;
+  for (const VkBaseInStructure* vk_struct = reinterpret_cast<const VkBaseInStructure*>(a_0->pNext); vk_struct;
+       vk_struct = vk_struct->pNext) {
+    if (vk_struct->sType == VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT ||
+        vk_struct->sType == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT) {
+      has_debug_callback = true;
+      break;
+    }
+  }
+
+  VkInstanceCreateInfo create_info_copy;
+  std::vector<InstanceCreatePNextCopy> pnext_copies;
+  const VkInstanceCreateInfo* vk_struct_base = a_0;
+  if (has_debug_callback) {
+    if (!CopyInstanceCreatePNextChain(reinterpret_cast<const VkBaseInStructure*>(a_0->pNext), pnext_copies)) {
+      fprintf(stderr, "ERROR: Unrecognized VkStructureType in VkInstanceCreateInfo pNext callback chain\n");
+      return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    create_info_copy = *a_0;
+    create_info_copy.pNext = pnext_copies.empty() ? nullptr : InstanceCreatePNextBase(pnext_copies.front());
+    vk_struct_base = &create_info_copy;
+  }
+#endif
 
   VkInstance out;
   auto ret = LDR_PTR(vkCreateInstance)(vk_struct_base, nullptr, &out);
