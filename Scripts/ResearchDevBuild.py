@@ -233,6 +233,26 @@ def source_identity(source: Path) -> dict[str, object]:
     }
 
 
+def require_pinned_submodules(source: Path) -> None:
+    completed = subprocess.run(
+        [required_tool("git"), "-C", str(source), "submodule", "status", "--recursive"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    invalid = [
+        line
+        for line in completed.stdout.splitlines()
+        if line[:1] in {"-", "+", "U"}
+    ]
+    if not invalid:
+        return
+
+    paths = [line[1:].strip().split(maxsplit=1)[1].split(" ", 1)[0] for line in invalid]
+    command = f"git -C {source} submodule update --init --recursive"
+    raise RuntimeError(f"submodules are uninitialized or not pinned: {', '.join(paths)}; run: {command}")
+
+
 def atomic_source_view(source_view: Path, source: Path) -> None:
     temporary = source_view.with_name(f".{source_view.name}.{os.getpid()}.new")
     os.symlink(source, temporary, target_is_directory=True)
@@ -373,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(receipt_path.read_text(encoding="utf-8"), end="")
             return 0
 
+        require_pinned_submodules(source)
         for tool in ("ninja", "ccache", "ld.lld", "nasm", "pkg-config"):
             required_tool(tool)
         lane_root.mkdir(parents=True, exist_ok=True)

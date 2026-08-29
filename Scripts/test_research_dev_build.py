@@ -96,6 +96,28 @@ class ResearchDevBuildTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 dev_build.validate_lane(invalid)
 
+    def test_missing_or_mismatched_submodules_fail_before_cmake(self):
+        status = """-aaaaaaaa External/missing
++bbbbbbbb External/wrong (heads/main)
+ cccccccc External/ready (heads/main)
+"""
+        completed = subprocess.CompletedProcess([], 0, stdout=status)
+        with mock.patch.object(dev_build, "required_tool", return_value="/tool/git"):
+            with mock.patch.object(dev_build.subprocess, "run", return_value=completed):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"External/missing, External/wrong.*submodule update --init --recursive",
+                ):
+                    dev_build.require_pinned_submodules(Path("/worktree"))
+
+    def test_pinned_submodules_pass_preflight(self):
+        completed = subprocess.CompletedProcess(
+            [], 0, stdout=" aaaaaaaa External/ready (heads/main)\n"
+        )
+        with mock.patch.object(dev_build, "required_tool", return_value="/tool/git"):
+            with mock.patch.object(dev_build.subprocess, "run", return_value=completed):
+                dev_build.require_pinned_submodules(Path("/worktree"))
+
     def test_profile_marker_must_match_exactly(self):
         expected = dev_build.expected_profile("cache-namespace")
         with tempfile.TemporaryDirectory() as temporary:
