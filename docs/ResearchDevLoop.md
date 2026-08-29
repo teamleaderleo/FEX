@@ -11,17 +11,25 @@ its allocation-balance oracle, see [Custom thunk repacking](ThunkRepacking.md).
 
 ## One target, not everything
 
-Initialize the pinned submodules once, then build only the target that owns the current question:
+Explicitly initialize the pinned submodules once, then build only the target that owns the current
+question:
 
 ```sh
-git submodule update --init --recursive --depth 1
+./Scripts/ResearchDevBuild.py submodules
 ./Scripts/ResearchDevBuild.py --lane vulkan build vulkan-host-64
 ./Scripts/ResearchDevBuild.py --lane vulkan status
 ```
 
+The `submodules` action is the one setup command that intentionally mutates the selected worktree.
+It runs the repository's shallow recursive update with up to 16 parallel clone/fetch workers, then
+fails unless every recursive repository is at the superproject's exact pinned commit. Its compact
+receipt includes the superproject head, dirty bit, worker count, repository count, elapsed time and
+a content-addressed digest of the complete pinned commit/path inventory. Use `--jobs N` to choose a
+smaller explicit bound.
+
 The helper checks every recursive submodule before it configures anything. It fails immediately when
 a submodule is uninitialized, conflicted, or not at the superproject's pinned commit, and prints the
-exact recovery command above. This keeps missing third-party sources from turning into a long wall of
+exact bounded Git recovery command. This keeps missing third-party sources from turning into a long wall of
 unrelated CMake errors. It does not update submodules automatically because doing so mutates the
 worktree and can erase the provenance distinction between the requested source and the environment
 that happened to be present.
@@ -109,6 +117,15 @@ regeneration before exporting the database; it does not throw away the warm obje
 edits inside already-known source files do not require regenerating the database.
 
 ## Measured big-red checkpoint
+
+At exact fork head `1ab30cadba1e3202c949f7813ca669e01823fcf7`, Git 2.53.0 and 16 logical
+CPUs, three serial and three `--jobs 16` shallow recursive initializations ran in balanced order in
+fresh exact-head worktrees. Serial walls were 100.58/99.49/105.83 seconds (median 100.58); parallel
+walls were 69.97/66.57/69.79 seconds (median 69.79), 30.61% lower. Every sample produced the same 18
+repositories, zero invalid pins and the same complete commit/path digest. Median module-store
+allocation changed from 173,592,576 to 173,608,960 bytes (0.009% higher). This supports bounded
+parallel initialization, not a claim that the per-worktree submodule repository storage is shared
+or deduplicated.
 
 At exact fork head `8fe2f3d1e2fd29d78b1927616daf0e973df54816`, Clang 21.1.8, CMake 4.2.3,
 Ninja 1.13.2 and ccache 4.12.3:
