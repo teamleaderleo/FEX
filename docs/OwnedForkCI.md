@@ -30,6 +30,13 @@ namespace, source-switch cleanup, lane lock, and exact-head receipt. They do not
 an x86 guest under FEX. Use a branch-scoped ARM64 workflow when the unresolved fact is runtime
 behavior rather than x86-host compilation.
 
+An ARM64 lane must prove a small ordinary x86 control before its product-specific oracle. If the
+control traps in JIT code, a base and candidate that die at the same instruction are environment
+diagnostics, not an A/B result. A host-feature override is acceptable only when the disabled path is
+outside the claim and the receipt names the override; it does not accept the omitted host-feature
+path. Prefer moving the product oracle to Glaeda or an installed-FEX host over repeatedly compiling
+the same two sources on a hosted VM that cannot pass its control.
+
 The workflow requires a repository runner carrying all three labels `self-hosted`, `X64`, and
 `fex-research`. Check runner availability before dispatch; a missing compatible runner means the job
 would only queue and is not evidence:

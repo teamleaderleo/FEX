@@ -73,27 +73,54 @@ register and exits to G.
 This is not ordinary decoded guest code. During compilation, ordinary blocks contribute their guest
 code pages to the lookup cache. A synthetic CustomIR block can have an empty `CodePages` list.
 
-### Removal gap
+### Current-base re-registration gap
 
-`RemoveCustomIREntrypoint` erases the handler and calls `InvalidateGuestCodeRange(H, 1)`. The lookup
-cache's range invalidation discovers compiled blocks through its page-to-entrypoint reverse indexes in
-[`LookupCache.h`](../FEXCore/Source/Interface/Core/LookupCache.h). If H's synthetic block was stored
-without a code page, range invalidation has no reverse-index entry with which to find it.
+Current base does not remove or retire an existing route when the same H is registered with a new G.
+`AddThunkTrampolineIRHandler` logs that the CustomIR entry already exists and leaves both the handler
+and any compiled lookup result unchanged. The unused private `RemoveCustomIREntrypoint` method is not
+called by the Linux thunk lifetime path. It would not have been sufficient on its own: lookup-cache
+range invalidation discovers compiled blocks through page-to-entrypoint reverse indexes in
+[`LookupCache.h`](../FEXCore/Source/Interface/Core/LookupCache.h), while a synthetic CustomIR block can
+have an empty `CodePages` list.
 
-The result can be a stale compiled/cached H → old-G redirect even though the CustomIR handler is gone.
+The result is a stale H → old-G redirect after H is re-registered for a different guest generation.
 This is a **future dispatch** problem: a later lookup may reuse the old route.
 
-### Candidate repairs demonstrated by fieldwork
+### Chosen candidate: exact-identity replacement and retirement
 
-Two bounded repair shapes remain plausible:
+The retained ARM64 fieldwork fixture demonstrated both directions on the older investigated source:
 
-1. retire the exact shared/local lookup entry for H as part of removing its handler;
-2. when a synthetic block has no decoded code pages, index its entrypoint page so the existing range
-   invalidation path can find it.
+- registry replacement without exact cache retirement kept the old route and crashed;
+- registry replacement plus exact shared/local retirement reached the new guest generation and exited
+  successfully.
 
-The second is the smaller architectural repair because it restores the invariant expected by the
-existing reverse index. It still needs an exact ARM64 test proving that register → compile → remove →
-call cannot reach the retired guest invoker, including cached and concurrent variants.
+Those receipts came from run `31817790502` at source `1e8b042e`: the registry-only child received
+`SIGSEGV`, while the exact-retirement child returned `1001035` and exited zero. They demonstrate the
+cache mechanism, but they are not a current-head acceptance result.
+
+The owned-fork candidate therefore treats re-registration as one transaction. Under the existing
+thread-creation boundary it takes the exclusive code-invalidation lock, replaces only an identical
+thunk handler's H → G mapping, erases the exact shared H entry while delinking inbound direct-block
+links, and clears every live thread's exact L1/L2 entry and call/return shadow cache. First
+registration and identical re-registration remain no-ops for invalidation. The lock order is
+`ThreadCreationMutex` → `CodeInvalidationMutex` → `CustomIRMutex`.
+
+An entrypoint-page reverse-index repair also made the retained fixture pass, but it broadens eviction
+to host pages and can add duplicate reverse-index membership for synthetic entries. Exact identity is
+the narrower match for “this H changed owner.” A focused unit test constructs the otherwise-invisible
+empty-`CodePages` case: range invalidation cannot find it, while exact invalidation removes it.
+
+This does not revoke a block another thread already selected before the transaction. Concurrent
+in-flight execution and already-escaped host trampolines remain separate lifetime questions.
+
+At current base `f1f1e6a` and candidate `93fe514dc`, hosted `ubuntu-24.04-arm` runs `33274263989` and
+`33274784324` both failed before the first linked host call completed. The line-buffered trace reached
+generation 1, then GDB stopped at the same FEX JIT sequence and inputs in both treatments: default
+codegen trapped on unaligned `LDAPUR`, and disabling LRCPC/LRCPC2 selected `LDAR` but still trapped.
+This is an execution-environment/unaligned-TSO boundary, not a rebind comparison. It must not be
+relabeled as a candidate failure or success. Current-head ARM64 acceptance remains for a Glaeda or
+installed-FEX lane that first proves its ordinary x86 runtime control; x86-host compilation and the
+lookup-cache unit test are necessary but not that acceptance proof.
 
 ## Failure C: a host trampoline already escaped into native state
 
