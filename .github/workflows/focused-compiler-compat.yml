@@ -27,7 +27,6 @@ jobs:
     timeout-minutes: 25
     env:
       SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      FEX_CACHE_ROOT: ${{ runner.temp }}/fex-dev
 
     steps:
       - name: Check out the exact same-repository source revision
@@ -77,11 +76,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 Scripts/ResearchDevBuild.py \
-            --cache-root "${FEX_CACHE_ROOT}" --lane clang21-compat \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane clang21-compat \
             check thunkgentest CharPointerHostToGuestConversionPreservesAddress.ThunkGen \
             --jobs 4
           python3 Scripts/ResearchDevBuild.py \
-            --cache-root "${FEX_CACHE_ROOT}" --lane clang21-compat \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane clang21-compat \
             check thunkgentest CharPointerReturnsUseConvertibleGuestLayout.ThunkGen \
             --jobs 4
 
@@ -90,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 Scripts/ResearchDevBuild.py \
-            --cache-root "${FEX_CACHE_ROOT}" --lane clang21-compat \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane clang21-compat \
             build GL-host-64 --jobs 4
 
       - name: Prove final source identity
