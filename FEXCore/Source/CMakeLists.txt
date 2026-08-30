@@ -23,6 +23,7 @@ set(SRCS
   Interface/Core/DiskCacheFile.cpp
   Interface/Core/DiskCacheIndexFile.cpp
   Interface/Core/CodeCache.cpp
+  Interface/Core/CodeCacheConfig.cpp
   Interface/Core/CodeCacheFile.cpp
   Interface/Core/Core.cpp
   Interface/Core/CPUBackend.cpp

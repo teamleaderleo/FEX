@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include <FEXCore/Config/Config.h>
-#include <FEXCore/Core/CodeCache.h>
+#include <FEXCore/Core/CodeCacheConfig.h>
 #include <FEXCore/Core/HostFeatures.h>
 
 #include <catch2/catch_test_macros.hpp>

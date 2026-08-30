@@ -34,6 +34,12 @@ string-enum and is intentionally represented by its effective result rather than
 override spelling. Runtime-only settings marked as not affecting code generation do not fragment
 the namespace.
 
+The public identity API lives in the lightweight `CodeCacheConfig.h` header and its implementation
+lives in `CodeCacheConfig.cpp`. The focused `FEXCore_Tests_CodeCacheConfig` executable compiles that
+production implementation directly with the configuration base and allocator hooks. It therefore
+exercises the real identity and snapshot owner without linking the runtime/JIT `FEXCore` archive.
+`CodeCache.h` includes the lightweight header for source compatibility with existing consumers.
+
 This 64-bit ID is a disposable cache namespace, not source or evidence authority. Cache loading
 still requires the exact FEX Git identity, the expected format, a matching ID inside the file
 header and structurally usable contents.

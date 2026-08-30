@@ -568,6 +568,18 @@ versus 5.83 seconds). All four real-file recovery cases passed, and a separate `
 build proved the new product-library ownership. These measurements justify the smaller edit/test
 owner; they do not claim faster CMake setup or broad product acceptance.
 
+The whole-file identity/configuration owner was separated next at exact parent
+`4fc875be9f4d0736fe6f40bcc2de399f8639302c`. In fresh external lanes with the same warm compiler
+cache, `FEXCore_Tests_CodeCacheConfig` fell from 364 to 223 Ninja steps (38.7%), and its target build
+fell from 8.466 to 0.393 seconds (95.4%). A real comment edit to the production identity owner fell
+from compiling the large `CodeCache.cpp`, archiving `libFEXCore.a` and relinking the test in 8.439
+seconds to compiling the lightweight owner and relinking in 2.037 seconds (75.9%); the subsequent
+lightweight public-header split preserved that two-edge edit graph. One fresh end-to-end wrapper
+sample fell from 13.93 to 6.08 seconds, while sampled setup/configuration time did not improve (5.38
+versus 5.60 seconds). All seven exact identity/snapshot cases passed, and a separate `FEXCore`
+target build proved product-library ownership. These are single warm-cache samples for this exact
+parent and dirty candidate, not a claim about broad builds, runtime performance or setup cost.
+
 ## Ubuntu development packages used on big-red
 
 The successful thunk-enabled x86 configure required the compiler/build tools plus Clang/LLVM

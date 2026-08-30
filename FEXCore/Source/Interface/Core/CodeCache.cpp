@@ -35,30 +35,6 @@
 
 namespace FEXCore {
 
-uint64_t CodeCacheConfig::ComputeId(std::string_view SerializedConfig, uint64_t HostFeaturesHash, bool Is64BitMode) {
-  struct FEX_PACKED IdentityHeader {
-    std::array<char, 8> Domain = {'F', 'X', 'C', 'C', 'I', 'D', '\0', '\0'};
-    uint8_t Version = 1;
-    uint8_t Is64BitMode;
-    std::array<uint8_t, 6> Reserved {};
-    uint64_t HostFeaturesHash;
-  };
-  static_assert(sizeof(IdentityHeader) == 24);
-
-  const IdentityHeader Header {
-    .Is64BitMode = Is64BitMode,
-    .HostFeaturesHash = HostFeaturesHash,
-  };
-  fextl::vector<uint8_t> Bytes(sizeof(Header) + SerializedConfig.size());
-  memcpy(Bytes.data(), &Header, sizeof(Header));
-  memcpy(Bytes.data() + sizeof(Header), SerializedConfig.data(), SerializedConfig.size());
-  return XXH3_64bits(Bytes.data(), Bytes.size());
-}
-
-uint64_t CodeCacheConfig::ComputeId(const HostFeatures& HostFeatures, bool Is64BitMode) {
-  return ComputeId(Config::SerializeForCache(), HostFeatures.HashForCaching(), Is64BitMode);
-}
-
 #if __clang_major__ < 16
 ExecutableFileInfo::ExecutableFileInfo(fextl::unique_ptr<HLE::SourcecodeMap> Map, uint64_t FileId, fextl::string Filename)
   : SourcecodeMap(std::move(Map))

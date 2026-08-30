@@ -35,10 +35,17 @@ foreach(TEST ${TESTS})
     target_link_libraries(FEXCore_Tests_${TEST_NAME} PRIVATE
       fmt::fmt Catch2::Catch2WithMain unordered_dense::unordered_dense xxHash::xxhash)
     target_include_directories(FEXCore_Tests_${TEST_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+  elseif (TEST_NAME STREQUAL "CodeCacheConfig")
+    # Compile the production code-cache identity owner without pulling in the
+    # runtime/JIT object graph.
+    target_sources(FEXCore_Tests_${TEST_NAME} PRIVATE
+      "../../Source/Interface/Core/CodeCacheConfig.cpp"
+      "../../Source/Utils/AllocatorHooks.cpp")
+    target_link_libraries(FEXCore_Tests_${TEST_NAME} PRIVATE FEXCore_Base Catch2::Catch2WithMain)
   else()
     target_link_libraries(FEXCore_Tests_${TEST_NAME} PRIVATE ${LIBS})
   endif()
-  if (TEST_NAME STREQUAL "LookupCache" OR TEST_NAME STREQUAL "CodeCacheConfig")
+  if (TEST_NAME STREQUAL "LookupCache")
     target_link_libraries(FEXCore_Tests_${TEST_NAME} PRIVATE FEXCore)
   endif()
   target_include_directories(FEXCore_Tests_${TEST_NAME} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../Source/")

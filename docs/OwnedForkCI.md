@@ -12,15 +12,17 @@ Two narrow exceptions cover product boundaries that benefit from a same-reposito
   helpers, GL thunk sources, their focused tests and the lane itself. It runs two exact char-pointer
   return tests and builds only `GL-host-64` on GitHub's `ubuntu-26.04` preview image with Clang 21.
 - `.github/workflows/focused-code-cache.yml` watches the format-3 whole-file parser, the block-blob
-  layout parser, the Fossilize index parser and their focused registration/integration paths. It
-  compiles the three pure parser targets plus the one real `DiskCacheIndexRecovery` file-I/O owner,
-  then runs only their discovered `*.CodeCacheFile.FEXCore_Tests`, `*.DiskCacheFile.FEXCore_Tests`,
-  `*.DiskCacheIndexFile.FEXCore_Tests` and `*.DiskCacheIndexRecovery.FEXCore_Tests` cases with the
-  complete LLVM/Clang 18 development package on `ubuntu-24.04`. The recovery owner compiles the
-  production `DiskCacheStorage.cpp` and its file/index primitives directly, without the runtime/JIT
-  FEXCore graph. A storage edit therefore still exercises real files, locks and recovery behavior
-  without rebuilding unrelated translation machinery. It does not run a guest, another FEXCore
-  test executable or a broad inherited matrix.
+  layout parser, the Fossilize index parser, whole-file identity/configuration inputs and their
+  focused registration/integration paths. It compiles the lightweight production identity owner,
+  three pure parser targets and the real `DiskCacheIndexRecovery` file-I/O owner, then runs only
+  their discovered `*.CodeCacheConfig.FEXCore_Tests`, `*.CodeCacheFile.FEXCore_Tests`,
+  `*.DiskCacheFile.FEXCore_Tests`, `*.DiskCacheIndexFile.FEXCore_Tests` and
+  `*.DiskCacheIndexRecovery.FEXCore_Tests` cases with the complete LLVM/Clang 18 development package
+  on `ubuntu-24.04`. The identity test compiles `CodeCacheConfig.cpp` directly with its configuration
+  base; the recovery owner compiles `DiskCacheStorage.cpp` and its file/index primitives directly.
+  Neither pulls in the runtime/JIT FEXCore graph. Relevant edits therefore exercise real production
+  owners without rebuilding unrelated translation machinery. The lane does not run a guest,
+  another FEXCore test executable or a broad inherited matrix.
 
 Both refuse external pull-request branches and may be dispatched manually. Neither runs a guest, a
 test family or an inherited matrix. The Clang 21 preview image changes weekly and carries no GA SLA,
