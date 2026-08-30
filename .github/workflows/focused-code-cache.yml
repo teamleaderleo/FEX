@@ -6,8 +6,6 @@ on:
     paths:
       - .github/workflows/focused-code-cache.yml
       - FEXCore/include/FEXCore/Core/CodeCacheFile.h
-      - FEXCore/Source/CMakeLists.txt
-      - FEXCore/Source/Interface/Core/CodeCache.cpp
       - FEXCore/Source/Interface/Core/CodeCacheFile.cpp
       - FEXCore/unittests/APITests/CMakeLists.txt
       - FEXCore/unittests/APITests/CodeCacheFile.cpp
