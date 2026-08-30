@@ -44,7 +44,6 @@ jobs:
       PROFILE: ${{ inputs.profile }}
       VARIANT: ${{ inputs.variant }}
       JOBS: ${{ inputs.jobs }}
-      CCACHE_DIR: ${{ runner.temp }}/fex-arm64-ccache
       CCACHE_BASEDIR: ${{ github.workspace }}/product
       CCACHE_COMPILERCHECK: content
       CCACHE_COMPRESS: "true"
@@ -63,6 +62,13 @@ jobs:
           [[ "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
           [[ "${PROFILE}" =~ ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$ ]]
           [[ "${VARIANT}" =~ ^[a-z0-9]([a-z0-9._-]{0,62}[a-z0-9])?$ ]]
+
+      - name: Bind the compiler cache to this runner's private temporary root
+        if: ${{ inputs.profile == 'arm64-disk-cache-shapes-v1' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'CCACHE_DIR=%s\n' "${RUNNER_TEMP}/fex-arm64-ccache" >> "${GITHUB_ENV}"
 
       - name: Check out the default-branch carrier
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -85,7 +91,7 @@ jobs:
         id: arm64-ccache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.CCACHE_DIR }}
+          path: ${{ runner.temp }}/fex-arm64-ccache
           key: fex-arm64-ccache-v1-${{ runner.os }}-${{ runner.arch }}-clang18-${{ inputs.source_sha }}-${{ inputs.profile }}-${{ inputs.variant }}
           restore-keys: |
             fex-arm64-ccache-v1-${{ runner.os }}-${{ runner.arch }}-clang18-${{ inputs.source_sha }}-
@@ -149,7 +155,7 @@ jobs:
         if: ${{ success() && inputs.profile == 'arm64-disk-cache-shapes-v1' && steps.arm64-ccache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.CCACHE_DIR }}
+          path: ${{ runner.temp }}/fex-arm64-ccache
           key: ${{ steps.arm64-ccache.outputs.cache-primary-key }}
 
       - name: Publish the exact-source profile receipt
