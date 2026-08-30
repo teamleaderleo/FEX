@@ -445,7 +445,15 @@ class ResearchDevBuildTest(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(stats_log.stat().st_mode), 0o600)
                 return completed
 
-            with mock.patch.object(dev_build, "require_pinned_submodules"):
+            with mock.patch.object(
+                dev_build,
+                "source_preflight",
+                return_value={
+                    "head": "a" * 40,
+                    "dirty": True,
+                    "submoduleValidation": {},
+                },
+            ):
                 with mock.patch.object(
                     dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"
                 ):
@@ -853,7 +861,15 @@ class ResearchDevBuildTest(unittest.TestCase):
                     stderr="ninja explain: object.o is dirty\n",
                 )
 
-            with mock.patch.object(dev_build, "require_pinned_submodules"):
+            with mock.patch.object(
+                dev_build,
+                "source_preflight",
+                return_value={
+                    "head": "a" * 40,
+                    "dirty": True,
+                    "submoduleValidation": {},
+                },
+            ):
                 with mock.patch.object(
                     dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"
                 ):
@@ -1057,6 +1073,168 @@ class ResearchDevBuildTest(unittest.TestCase):
 
         self.assertEqual(count, 2)
         self.assertEqual(digest, expected)
+
+    def test_porcelain_v2_status_selects_only_submodule_sensitive_fallbacks(self):
+        head = "a" * 40
+        clean = f"# branch.oid {head}\0# branch.head main\0".encode()
+        ordinary = clean + (
+            "1 .M N... 100644 100644 100644 "
+            f"{'b' * 40} {'c' * 40} Source/unit.cpp\0"
+        ).encode()
+        submodule = clean + (
+            "1 .M S.M. 160000 160000 160000 "
+            f"{'b' * 40} {'c' * 40} External/fmt\0"
+        ).encode()
+        gitmodules = clean + (
+            "1 .M N... 100644 100644 100644 "
+            f"{'b' * 40} {'c' * 40} .gitmodules\0"
+        ).encode()
+
+        self.assertEqual(
+            dev_build.parse_source_status(clean),
+            {"head": head, "dirty": False, "submoduleFallback": False},
+        )
+        self.assertEqual(
+            dev_build.parse_source_status(ordinary),
+            {"head": head, "dirty": True, "submoduleFallback": False},
+        )
+        self.assertTrue(dev_build.parse_source_status(submodule)["submoduleFallback"])
+        self.assertTrue(dev_build.parse_source_status(gitmodules)["submoduleFallback"])
+        with self.assertRaisesRegex(RuntimeError, "omitted its origin"):
+            dev_build.parse_source_status(
+                clean
+                + (
+                    "2 R. N... 100644 100644 100644 "
+                    f"{'b' * 40} {'c' * 40} R100 renamed.cpp\0"
+                ).encode()
+            )
+
+    def test_index_gitlinks_are_exact_stage_zero_safe_paths(self):
+        payload = (
+            f"100644 {'a' * 40} 0\tREADME.md\0"
+            f"160000 {'b' * 40} 0\tExternal/zeta\0"
+            f"160000 {'c' * 40} 0\tExternal/alpha\0"
+        ).encode()
+        self.assertEqual(
+            dev_build.parse_index_gitlinks(payload),
+            [("External/alpha", "c" * 40), ("External/zeta", "b" * 40)],
+        )
+        with self.assertRaisesRegex(RuntimeError, "unresolved stages"):
+            dev_build.parse_index_gitlinks(
+                f"100644 {'a' * 40} 2\tordinary.cpp\0".encode()
+            )
+        with self.assertRaisesRegex(RuntimeError, "unsafe submodule path"):
+            dev_build.parse_index_gitlinks(
+                f"160000 {'a' * 40} 0\t../escaped\0".encode()
+            )
+
+    def test_authoritative_identity_visits_only_checked_in_recursive_maps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            child = source / "child"
+            grand = child / "grand"
+            grand.mkdir(parents=True)
+            (source / ".gitmodules").write_text("root\n", encoding="utf-8")
+            (child / ".gitmodules").write_text("child\n", encoding="utf-8")
+            module_root = root / "git" / "modules"
+            module_root.mkdir(parents=True)
+            child_pin = "a" * 40
+            grand_pin = "b" * 40
+            indexes = {
+                source: ([("child", child_pin)], "c" * 40),
+                child.resolve(): ([("grand", grand_pin)], "d" * 40),
+            }
+            configured = {
+                source: ["child"],
+                child.resolve(): ["grand"],
+            }
+
+            def heads(selected, _module_root):
+                if selected == child.resolve():
+                    return child_pin, module_root / "child"
+                return grand_pin, module_root / "grand"
+
+            with mock.patch.object(
+                dev_build, "repository_git_dir", return_value=root / "git"
+            ):
+                with mock.patch.object(
+                    dev_build, "index_submodules", side_effect=lambda path: indexes[path]
+                ) as inspect_index:
+                    with mock.patch.object(
+                        dev_build,
+                        "gitmodule_paths",
+                        side_effect=lambda path, _blob: configured[path],
+                    ):
+                        with mock.patch.object(
+                            dev_build, "detached_submodule_head", side_effect=heads
+                        ):
+                            count, digest = dev_build.authoritative_submodule_identity(source)
+
+        expected = __import__("hashlib").sha256(
+            f"{child_pin} child\n{grand_pin} child/grand\n".encode()
+        ).hexdigest()
+        self.assertEqual((count, digest), (2, expected))
+        self.assertEqual(inspect_index.call_count, 2)
+
+    def test_source_preflight_uses_authoritative_gitlinks_when_supported(self):
+        with mock.patch.object(
+            dev_build,
+            "authoritative_submodule_identity",
+            return_value=(18, "b" * 64),
+        ):
+            with mock.patch.object(dev_build, "require_pinned_submodules") as require:
+                with mock.patch.object(dev_build, "git_output", return_value="a" * 40):
+                    receipt = dev_build.source_preflight(Path("/worktree"))
+
+        require.assert_not_called()
+        self.assertEqual(receipt["head"], "a" * 40)
+        self.assertEqual(receipt["submoduleValidation"]["mode"], "authoritative_gitlinks")
+
+    def test_source_preflight_does_not_accept_fast_path_safety_errors(self):
+        with mock.patch.object(
+            dev_build,
+            "authoritative_submodule_identity",
+            side_effect=RuntimeError("unsafe Gitdir"),
+        ):
+            with mock.patch.object(dev_build, "require_pinned_submodules") as require:
+                with mock.patch.object(dev_build, "git_output", return_value="a" * 40):
+                    with self.assertRaisesRegex(RuntimeError, "unsafe Gitdir"):
+                        dev_build.source_preflight(Path("/worktree"))
+
+        require.assert_called_once_with(Path("/worktree"))
+
+    def test_source_preflight_uses_recursive_compatibility_for_supported_layout(self):
+        with mock.patch.object(
+            dev_build,
+            "authoritative_submodule_identity",
+            side_effect=dev_build.UnsupportedSubmoduleLayout("symbolic HEAD"),
+        ):
+            with mock.patch.object(dev_build, "require_pinned_submodules"):
+                with mock.patch.object(
+                    dev_build,
+                    "pinned_submodule_identity",
+                    return_value=(18, "b" * 64),
+                ):
+                    with mock.patch.object(dev_build, "git_output", return_value="a" * 40):
+                        receipt = dev_build.source_preflight(Path("/worktree"))
+
+        self.assertEqual(
+            receipt["submoduleValidation"]["mode"],
+            "recursive_porcelain_fallback",
+        )
+
+    def test_source_preflight_refuses_a_head_change_during_observation(self):
+        with mock.patch.object(
+            dev_build,
+            "authoritative_submodule_identity",
+            return_value=(18, "b" * 64),
+        ):
+            with mock.patch.object(
+                dev_build, "git_output", side_effect=("a" * 40, "c" * 40)
+            ):
+                with self.assertRaisesRegex(RuntimeError, "HEAD changed"):
+                    dev_build.source_preflight(Path("/worktree"))
 
     def test_submodule_action_verifies_and_emits_receipt_without_build_tools(self):
         with tempfile.TemporaryDirectory() as temporary:

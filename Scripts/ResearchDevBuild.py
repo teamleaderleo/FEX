@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import SubmodulePackCache as submodule_pack_cache
 import SubmoduleOriginCache as submodule_origin_cache
@@ -36,6 +36,12 @@ DISCOVERY_MAX_RESULTS = 64
 DISCOVERY_REGISTRY_LIMIT = 32 * 1024 * 1024
 CCACHE_STATS_OUTPUT_LIMIT = 64 * 1024
 CCACHE_STATS_LOG_LIMIT = 1024 * 1024
+GIT_INSPECTION_OUTPUT_LIMIT = 32 * 1024 * 1024
+GITMODULES_LIMIT = 1024 * 1024
+SUBMODULE_GITFILE_LIMIT = 4096
+SUBMODULE_HEAD_LIMIT = 256
+MAX_SUBMODULE_REPOSITORIES = 128
+SHA1_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 CCACHE_CORE_COUNTERS = (
     "cache_miss",
     "compile_failed",
@@ -91,6 +97,10 @@ CONFIGURE_PROFILES = {
         "options": [*CONFIGURE_OPTIONS, "-DBUILD_FEX_LINUX_TESTS=True"],
     },
 }
+
+
+class UnsupportedSubmoduleLayout(RuntimeError):
+    """A safe layout that requires Git's recursive porcelain compatibility path."""
 
 
 def parser() -> argparse.ArgumentParser:
@@ -762,6 +772,106 @@ def git_output(source: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
+def git_bytes_output(source: Path, *arguments: str) -> bytes:
+    completed = subprocess.run(
+        [required_tool("git"), "-C", str(source), *arguments],
+        check=True,
+        capture_output=True,
+    )
+    if (
+        len(completed.stdout) > GIT_INSPECTION_OUTPUT_LIMIT
+        or len(completed.stderr) > GIT_INSPECTION_OUTPUT_LIMIT
+    ):
+        raise RuntimeError("Git inspection output exceeded the bounded size limit")
+    return completed.stdout
+
+
+def parse_source_status(payload: bytes) -> dict[str, object]:
+    """Reduce porcelain v2 to exact HEAD/dirty state and a safe-fast-path decision."""
+    records = [record for record in payload.split(b"\0") if record]
+    head = None
+    dirty = False
+    submodule_fallback = False
+    skip_rename_origin = False
+    for raw in records:
+        if skip_rename_origin:
+            skip_rename_origin = False
+            continue
+        try:
+            record = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise RuntimeError("Git status contains a non-UTF-8 path") from error
+        if record.startswith("# branch.oid "):
+            if head is not None:
+                raise RuntimeError("Git status contains duplicate branch identities")
+            candidate = record.removeprefix("# branch.oid ")
+            if not SHA1_PATTERN.fullmatch(candidate):
+                raise RuntimeError("Git status does not identify one exact SHA-1 HEAD")
+            head = candidate
+            continue
+        if record.startswith("# "):
+            continue
+
+        dirty = True
+        if record.startswith("1 "):
+            fields = record.split(" ", 8)
+            if len(fields) != 9 or (
+                fields[2] != "N..."
+                and re.fullmatch(r"S[.C][.M][.U]", fields[2]) is None
+            ):
+                raise RuntimeError("cannot parse ordinary porcelain v2 status record")
+            submodule, path = fields[2], fields[8]
+            if submodule.startswith("S") or path == ".gitmodules":
+                submodule_fallback = True
+        elif record.startswith("2 "):
+            fields = record.split(" ", 9)
+            if len(fields) != 10 or (
+                fields[2] != "N..."
+                and re.fullmatch(r"S[.C][.M][.U]", fields[2]) is None
+            ):
+                raise RuntimeError("cannot parse renamed porcelain v2 status record")
+            submodule_fallback = True
+            skip_rename_origin = True
+        elif record.startswith("u "):
+            fields = record.split(" ", 10)
+            if len(fields) != 11 or (
+                fields[2] != "N..."
+                and re.fullmatch(r"S[.C][.M][.U]", fields[2]) is None
+            ):
+                raise RuntimeError("cannot parse unmerged porcelain v2 status record")
+            submodule_fallback = True
+        elif record.startswith(("? ", "! ")):
+            if not record[2:]:
+                raise RuntimeError("porcelain v2 status path is empty")
+            if record[2:] == ".gitmodules":
+                submodule_fallback = True
+        else:
+            raise RuntimeError("cannot parse porcelain v2 status record")
+    if skip_rename_origin:
+        raise RuntimeError("porcelain v2 rename record omitted its origin path")
+    if head is None:
+        raise RuntimeError("Git status omitted the exact branch identity")
+    return {
+        "head": head,
+        "dirty": dirty,
+        "submoduleFallback": submodule_fallback,
+    }
+
+
+def source_status_observation(source: Path) -> dict[str, object]:
+    return parse_source_status(
+        git_bytes_output(
+            source,
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        )
+    )
+
+
 def submodule_update_command(source: Path, jobs: int) -> list[str]:
     return [
         required_tool("git"),
@@ -779,10 +889,8 @@ def submodule_update_command(source: Path, jobs: int) -> list[str]:
 
 
 def source_identity(source: Path) -> dict[str, object]:
-    return {
-        "head": git_output(source, "rev-parse", "HEAD"),
-        "dirty": bool(git_output(source, "status", "--porcelain")),
-    }
+    observation = source_status_observation(source)
+    return {"head": observation["head"], "dirty": observation["dirty"]}
 
 
 def configured_git_hash(build: Path) -> str | None:
@@ -1072,6 +1180,290 @@ def pinned_submodule_identity(source: Path) -> tuple[int, str]:
         raise RuntimeError("recursive submodule status is empty")
     payload = "\n".join(sorted(normalized)) + "\n"
     return len(normalized), hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def safe_submodule_path(raw: str) -> str:
+    path = PurePosixPath(raw)
+    if (
+        not raw
+        or not raw.isprintable()
+        or path.is_absolute()
+        or path.as_posix() != raw
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise RuntimeError("unsafe submodule path")
+    return raw
+
+
+def parse_index_submodules(
+    payload: bytes,
+) -> tuple[list[tuple[str, str]], str | None]:
+    links = []
+    gitmodules_blob = None
+    for raw in payload.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            metadata, raw_path = raw.decode("utf-8").split("\t", 1)
+            mode, object_name, stage = metadata.split(" ")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise RuntimeError("cannot parse Git index entry") from error
+        if stage != "0":
+            raise RuntimeError("Git index contains unresolved stages")
+        if raw_path == ".gitmodules":
+            if mode not in {"100644", "100755"} or not SHA1_PATTERN.fullmatch(
+                object_name
+            ):
+                raise RuntimeError("index contains an unsafe .gitmodules entry")
+            if gitmodules_blob is not None:
+                raise RuntimeError("index contains duplicate .gitmodules entries")
+            gitmodules_blob = object_name
+        if mode != "160000":
+            continue
+        if not SHA1_PATTERN.fullmatch(object_name):
+            raise RuntimeError("submodule gitlink is not one exact SHA-1")
+        links.append((safe_submodule_path(raw_path), object_name))
+    links.sort()
+    if len({path for path, _ in links}) != len(links):
+        raise RuntimeError("Git index contains duplicate submodule paths")
+    return links, gitmodules_blob
+
+
+def parse_index_gitlinks(payload: bytes) -> list[tuple[str, str]]:
+    return parse_index_submodules(payload)[0]
+
+
+def index_submodules(source: Path) -> tuple[list[tuple[str, str]], str | None]:
+    return parse_index_submodules(
+        git_bytes_output(source, "ls-files", "--stage", "-z")
+    )
+
+
+def read_owned_regular_bytes(path: Path, limit: int, label: str) -> bytes:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise RuntimeError(f"cannot safely open {label}: {path}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size > limit
+        ):
+            raise RuntimeError(f"unsafe {label}: {path}")
+        chunks = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if len(payload) != metadata.st_size or len(payload) > limit:
+        raise RuntimeError(f"cannot read complete bounded {label}: {path}")
+    return payload
+
+
+def owned_directory(path: Path, label: str) -> Path:
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise RuntimeError(f"cannot inspect {label}: {path}") from error
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise RuntimeError(f"unsafe {label}: {path}")
+    return path.resolve(strict=True)
+
+
+def owned_descendant_directory(root: Path, relative: str, label: str) -> Path:
+    current = root
+    for part in PurePosixPath(safe_submodule_path(relative)).parts:
+        current = owned_directory(current / part, label)
+    return current
+
+
+def repository_git_dir(source: Path) -> Path:
+    try:
+        raw = git_bytes_output(source, "rev-parse", "--absolute-git-dir").decode(
+            "utf-8"
+        ).strip()
+    except UnicodeDecodeError as error:
+        raise RuntimeError("root Gitdir is not UTF-8") from error
+    if not raw or "\n" in raw or not Path(raw).is_absolute():
+        raise RuntimeError("root Gitdir is malformed")
+    return owned_directory(Path(raw), "root Gitdir")
+
+
+def require_within_module_store(path: Path, module_root: Path) -> None:
+    try:
+        relative = path.relative_to(module_root)
+    except ValueError as error:
+        raise RuntimeError("submodule Gitdir escapes the root module store") from error
+    current = module_root
+    for part in relative.parts:
+        current = owned_directory(current / part, "submodule Gitdir component")
+
+
+def detached_submodule_head(child: Path, module_root: Path) -> tuple[str, Path]:
+    gitfile = child / ".git"
+    try:
+        gitfile_metadata = gitfile.stat(follow_symlinks=False)
+    except OSError as error:
+        raise RuntimeError(f"cannot inspect submodule gitfile: {gitfile}") from error
+    if stat.S_ISDIR(gitfile_metadata.st_mode) and gitfile_metadata.st_uid == os.getuid():
+        raise UnsupportedSubmoduleLayout("submodule uses an old-form Git directory")
+    payload = read_owned_regular_bytes(
+        gitfile, SUBMODULE_GITFILE_LIMIT, "submodule gitfile"
+    )
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("submodule gitfile is not UTF-8") from error
+    match = re.fullmatch(r"gitdir: ([^\r\n\0]+)\n?", text)
+    if match is None:
+        raise RuntimeError("submodule gitfile is malformed")
+    raw_gitdir = Path(match.group(1))
+    gitdir = raw_gitdir if raw_gitdir.is_absolute() else child / raw_gitdir
+    gitdir = owned_directory(gitdir, "submodule Gitdir")
+    require_within_module_store(gitdir, module_root)
+
+    try:
+        head = read_owned_regular_bytes(
+            gitdir / "HEAD", SUBMODULE_HEAD_LIMIT, "submodule HEAD"
+        ).decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        raise RuntimeError("submodule HEAD is not ASCII") from error
+    if head.startswith("ref: "):
+        raise UnsupportedSubmoduleLayout("submodule HEAD is symbolic")
+    if not SHA1_PATTERN.fullmatch(head):
+        raise RuntimeError("submodule HEAD is not detached at one SHA-1")
+    return head, gitdir
+
+
+def gitmodule_paths(source: Path, blob: str) -> list[str]:
+    if not SHA1_PATTERN.fullmatch(blob):
+        raise RuntimeError(".gitmodules blob is not one exact SHA-1")
+    completed = subprocess.run(
+        [
+            required_tool("git"),
+            "-C",
+            str(source),
+            "config",
+            "--null",
+            "--blob",
+            blob,
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    if (
+        completed.returncode not in {0, 1}
+        or completed.stderr
+        or len(completed.stdout) > GITMODULES_LIMIT
+    ):
+        raise RuntimeError("cannot parse bounded .gitmodules paths")
+    paths = []
+    for raw in completed.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            _, value = raw.decode("utf-8").split("\n", 1)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise RuntimeError("cannot parse .gitmodules path record") from error
+        paths.append(safe_submodule_path(value))
+    paths.sort()
+    if len(set(paths)) != len(paths):
+        raise RuntimeError(".gitmodules contains duplicate submodule paths")
+    return paths
+
+
+def has_owned_gitmodules(source: Path) -> bool:
+    path = source / ".gitmodules"
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise RuntimeError(f"cannot inspect .gitmodules: {path}") from error
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise RuntimeError(f"unsafe .gitmodules: {path}")
+    return True
+
+
+def authoritative_submodule_identity(source: Path) -> tuple[int, str]:
+    """Validate recursive detached HEADs from authoritative index gitlinks, without a cache."""
+    module_root_path = repository_git_dir(source) / "modules"
+    try:
+        module_root_path.stat(follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise UnsupportedSubmoduleLayout("root has no linked submodule store") from error
+    except OSError as error:
+        raise RuntimeError("cannot inspect root submodule store") from error
+    module_root = owned_directory(module_root_path, "root submodule store")
+    rows: list[tuple[str, str]] = []
+    seen_gitdirs: set[Path] = set()
+
+    def visit(repository: Path, prefix: str) -> None:
+        links, gitmodules_blob = index_submodules(repository)
+        configured_paths = (
+            gitmodule_paths(repository, gitmodules_blob)
+            if gitmodules_blob is not None
+            else []
+        )
+        if configured_paths != [path for path, _ in links]:
+            raise RuntimeError("authoritative gitlinks and .gitmodules paths disagree")
+
+        for relative, expected in links:
+            full_relative = f"{prefix}/{relative}" if prefix else relative
+            child = owned_descendant_directory(repository, relative, "submodule worktree")
+            actual, gitdir = detached_submodule_head(child, module_root)
+            if gitdir in seen_gitdirs:
+                raise RuntimeError("recursive submodules reuse one Gitdir")
+            seen_gitdirs.add(gitdir)
+            if actual != expected:
+                raise RuntimeError("submodule HEAD differs from authoritative gitlink")
+            rows.append((full_relative, expected))
+            if len(rows) > MAX_SUBMODULE_REPOSITORIES:
+                raise RuntimeError("recursive submodule inventory exceeded its repository limit")
+            if has_owned_gitmodules(child):
+                visit(child, full_relative)
+
+    visit(source, "")
+    if not rows:
+        raise RuntimeError("recursive submodule inventory is empty")
+    payload = "\n".join(sorted(f"{pin} {path}" for path, pin in rows)) + "\n"
+    return len(rows), hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def source_preflight(source: Path) -> dict[str, object]:
+    head = git_output(source, "rev-parse", "HEAD")
+    mode = "authoritative_gitlinks"
+    try:
+        repositories, digest = authoritative_submodule_identity(source)
+    except UnsupportedSubmoduleLayout:
+        mode = "recursive_porcelain_fallback"
+        require_pinned_submodules(source)
+        repositories, digest = pinned_submodule_identity(source)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        require_pinned_submodules(source)
+        raise RuntimeError(
+            f"authoritative recursive submodule validation failed: {error}"
+        ) from error
+    if git_output(source, "rev-parse", "HEAD") != head:
+        raise RuntimeError("source HEAD changed during recursive submodule validation")
+    return {
+        "head": head,
+        "submoduleValidation": {
+            "mode": mode,
+            "repositories": repositories,
+            "pinnedDigest": digest,
+        },
+    }
 
 
 def atomic_source_view(source_view: Path, source: Path) -> None:
@@ -1787,7 +2179,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(receipt, sort_keys=True))
             return 0
 
-        require_pinned_submodules(source)
+        preflight = source_preflight(source)
         for tool in ("ninja", "ccache", "ld.lld", "nasm", "pkg-config"):
             required_tool(tool)
         if args.action not in {"plan", "discover"}:
@@ -1859,6 +2251,7 @@ def main(argv: list[str] | None = None) -> int:
                     "lane": lane,
                     "head": identity["head"],
                     "dirty": identity["dirty"],
+                    "submoduleValidation": preflight["submoduleValidation"],
                     "query": query,
                     "limit": limit,
                     "targets": literal_matches(targets["targets"], query, limit),
@@ -1950,6 +2343,7 @@ def main(argv: list[str] | None = None) -> int:
                     "target": args.target,
                     "head": identity["head"],
                     "dirty": identity["dirty"],
+                    "submoduleValidation": preflight["submoduleValidation"],
                     "configurationMode": "reuse",
                     "globCheckElapsedSeconds": round(glob_elapsed, 6),
                     "planElapsedSeconds": round(plan_elapsed, 6),
@@ -1971,7 +2365,7 @@ def main(argv: list[str] | None = None) -> int:
                     focused_linux_test_build(build, 64),
                 ),
             )
-            source_head = git_output(source, "rev-parse", "HEAD")
+            source_head = str(preflight["head"])
             configure_mode = configuration_mode(
                 args.action,
                 switched,
@@ -1997,6 +2391,8 @@ def main(argv: list[str] | None = None) -> int:
                     "configured git_version.h does not match the source HEAD after configuration"
                 )
             if args.action == "configure":
+                if source_identity(source)["head"] != source_head:
+                    raise RuntimeError("source HEAD changed while configuring the build lane")
                 print(f"configured lane={lane} source={source} build={build}")
                 return 0
             if args.action == "editor":
@@ -2004,6 +2400,8 @@ def main(argv: list[str] | None = None) -> int:
                 count, prerequisites_elapsed = prepare_editor_database(
                     source_view, source, build, destination, env
                 )
+                if source_identity(source)["head"] != source_head:
+                    raise RuntimeError("source HEAD changed while preparing editor state")
                 print(
                     f"editor lane={lane} entries={count} "
                     f"configuration={configure_mode} "
@@ -2014,9 +2412,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             setup_elapsed = time.monotonic() - setup_started
-            identity = source_identity(source)
-            if identity["head"] != source_head:
-                raise RuntimeError("source HEAD changed while preparing the build lane")
             if args.action == "linux-test-build":
                 if args.profile != "linux-tests":
                     raise ValueError("linux-test-build action requires --profile linux-tests")
@@ -2031,8 +2426,8 @@ def main(argv: list[str] | None = None) -> int:
                 ]
                 print(
                     f"scope=FOCUSED_LINUX_TEST profile={args.profile} lane={lane} "
-                    f"test={test} bitness={args.bitness} head={identity['head']} "
-                    f"dirty={str(identity['dirty']).lower()}"
+                    f"test={test} bitness={args.bitness} head={source_head} "
+                    "dirty=checked_after"
                 )
                 print("runtime execution and other Linux tests are not implied")
                 sys.stdout.flush()
@@ -2042,6 +2437,9 @@ def main(argv: list[str] | None = None) -> int:
                     completed = subprocess.run(command, env=env)
                     if completed.returncode != 0:
                         break
+                identity = source_identity(source)
+                if identity["head"] != source_head:
+                    raise RuntimeError("source HEAD changed during the focused build")
                 receipt = {
                     "format": "teamleaderleo-fex-x86-host-linux-test-build-receipt-v1",
                     "profile": profile_id,
@@ -2051,6 +2449,7 @@ def main(argv: list[str] | None = None) -> int:
                     "bitness": args.bitness,
                     "head": identity["head"],
                     "dirty": identity["dirty"],
+                    "submoduleValidation": preflight["submoduleValidation"],
                     "sourceSwitched": switched,
                     "configurationMode": configure_mode,
                     "setupElapsedSeconds": round(setup_elapsed, 6),
@@ -2072,7 +2471,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     f"scope=FOCUSED_COMPILE profile={args.profile} lane={lane} "
                     f"file={unit['sourceFile']} object={unit['objectTarget']} "
-                    f"head={identity['head']} dirty={str(identity['dirty']).lower()}"
+                    f"head={source_head} dirty=checked_after"
                 )
                 print("one configured object is selected; linking and tests are not implied")
                 sys.stdout.flush()
@@ -2080,6 +2479,9 @@ def main(argv: list[str] | None = None) -> int:
                 completed, cache_observation = run_compile_with_cache_observation(
                     command, env, lane_root, subprocess.run
                 )
+                identity = source_identity(source)
+                if identity["head"] != source_head:
+                    raise RuntimeError("source HEAD changed during the focused compile")
                 receipt = {
                     "format": "teamleaderleo-fex-x86-host-compile-receipt-v1",
                     "profile": profile_id,
@@ -2092,6 +2494,7 @@ def main(argv: list[str] | None = None) -> int:
                     "compilationDatabaseSha256": unit["databaseSha256"],
                     "head": identity["head"],
                     "dirty": identity["dirty"],
+                    "submoduleValidation": preflight["submoduleValidation"],
                     "sourceSwitched": switched,
                     "configurationMode": configure_mode,
                     "setupElapsedSeconds": round(setup_elapsed, 6),
@@ -2111,8 +2514,8 @@ def main(argv: list[str] | None = None) -> int:
                 test = validate_ctest_name(args.test)
                 print(
                     f"scope=FOCUSED_CTEST profile={args.profile} lane={lane} "
-                    f"target={args.target} test={test} head={identity['head']} "
-                    f"dirty={str(identity['dirty']).lower()}"
+                    f"target={args.target} test={test} head={source_head} "
+                    "dirty=checked_after"
                 )
                 print("one exact CTest is selected; other targets and tests are not implied")
                 sys.stdout.flush()
@@ -2152,6 +2555,9 @@ def main(argv: list[str] | None = None) -> int:
                                 ctest_command(build, names), env=env
                             )
                             test_elapsed = time.monotonic() - test_started
+                identity = source_identity(source)
+                if identity["head"] != source_head:
+                    raise RuntimeError("source HEAD changed during the focused check")
                 receipt = {
                     "format": "teamleaderleo-fex-x86-host-check-receipt-v1",
                     "profile": profile_id,
@@ -2163,6 +2569,7 @@ def main(argv: list[str] | None = None) -> int:
                     "testRegistry": registry_receipt,
                     "head": identity["head"],
                     "dirty": identity["dirty"],
+                    "submoduleValidation": preflight["submoduleValidation"],
                     "sourceSwitched": switched,
                     "configurationMode": configure_mode,
                     "setupElapsedSeconds": round(setup_elapsed, 6),
@@ -2180,13 +2587,15 @@ def main(argv: list[str] | None = None) -> int:
                 return completed.returncode
             print(
                 f"scope=FOCUSED_TARGET profile={args.profile} lane={lane} "
-                f"target={args.target} head={identity['head']} "
-                f"dirty={str(identity['dirty']).lower()}"
+                f"target={args.target} head={source_head} dirty=checked_after"
             )
             print("full build and full tests are not implied")
             sys.stdout.flush()
             started = time.monotonic()
             completed = subprocess.run(command, env=env)
+            identity = source_identity(source)
+            if identity["head"] != source_head:
+                raise RuntimeError("source HEAD changed during the focused build")
             receipt = {
                 "format": "teamleaderleo-fex-x86-host-dev-receipt-v1",
                 "profile": profile_id,
@@ -2195,6 +2604,7 @@ def main(argv: list[str] | None = None) -> int:
                 "target": args.target,
                 "head": identity["head"],
                 "dirty": identity["dirty"],
+                "submoduleValidation": preflight["submoduleValidation"],
                 "sourceSwitched": switched,
                 "configurationMode": configure_mode,
                 "setupElapsedSeconds": round(setup_elapsed, 6),
