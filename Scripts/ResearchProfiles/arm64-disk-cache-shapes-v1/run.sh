@@ -188,21 +188,17 @@ sha256sum "${cache_root}/RWCacheDB.foz" "${cache_root}/RWCacheDB_idx.foz" \
 cmp "${receipts}/cache-before-warm.sizes" "${receipts}/cache-after-warm.sizes"
 cmp "${receipts}/cache-before-warm.sha256" "${receipts}/cache-after-warm.sha256"
 
-python3 - "${receipts}/cache-shapes.json" "${receipts}/profile-outcome.json" <<'PY'
+python3 - "${receipts}/profile-outcome.json" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-shapes = json.load(open(sys.argv[1], encoding="utf-8"))
-Path(sys.argv[2]).write_text(
+Path(sys.argv[1]).write_text(
     json.dumps(
         {
             "schemaVersion": 1,
             "status": "pass",
             "summary": "cache-disabled control, positive cold JIT/misses, strict minimal-blob parsing, positive fresh-process warm hits, and immutable warm cache passed",
-            "ordinaryRecordCount": shapes["ordinaryRecordCount"],
-            "storedBlobBytes": shapes["totals"]["storedBlobBytes"],
-            "guestBytes": shapes["totals"]["guestBytes"],
         },
         indent=2,
         sort_keys=True,
