@@ -7,7 +7,7 @@ test "$(git -C "${FEX_RESEARCH_SOURCE}" rev-parse HEAD)" = "${FEX_RESEARCH_SOURC
 
 source_root="${FEX_RESEARCH_SOURCE}"
 profile_root="${source_root}/Scripts/ResearchProfiles/gl-resident-companion-v1"
-work_root="${FEX_RESEARCH_WORK}/gl-resident-companion-v1"
+work_root="${RUNNER_TEMP}/fex-gl-resident-companion-v1-work"
 build_root="${work_root}/build"
 guest_root="${work_root}/guest"
 rootfs="${work_root}/rootfs"
