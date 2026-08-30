@@ -62,13 +62,22 @@ python3 unittests/ThunkLibs/vulkan_repack_cleanup_inventory.py "$PWD"
 The negative control removes the `VkInstanceCreateInfo` cleanup call in memory and requires the
 checker to identify exactly that missing owner. It does not modify the worktree.
 
-Run the four focused generator/inventory checks in an already configured development lane:
+Run the four focused generator/inventory checks through the same development lane:
 
 ```sh
-ctest --test-dir PATH_TO_CONFIGURED_BUILD \
-  --output-on-failure \
-  -R '^(StructRepacking|VulkanCustomRouteInventory|VulkanInstancePNextCopyInventory|VulkanRepackCleanupInventory)\.ThunkGen$'
+./Scripts/ResearchDevBuild.py --lane repack check \
+  thunkgentest StructRepacking.ThunkGen
+./Scripts/ResearchDevBuild.py --lane repack check \
+  thunkgentest VulkanCustomRouteInventory.ThunkGen
+./Scripts/ResearchDevBuild.py --lane repack check \
+  thunkgentest VulkanInstancePNextCopyInventory.ThunkGen
+./Scripts/ResearchDevBuild.py --lane repack check \
+  thunkgentest VulkanRepackCleanupInventory.ThunkGen
 ```
+
+Each command names one literal test and emits its own receipt. Run only the checks needed by the
+changed ownership surface; the four-command example is the complete focused repacking set, not a
+default requirement for every edit.
 
 Compile only the affected composition surfaces locally:
 

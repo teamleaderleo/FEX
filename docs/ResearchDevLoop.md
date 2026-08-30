@@ -96,6 +96,36 @@ exports that setting explicitly because the CMake 4.2/Ninja launcher observed on
 timestamp, as intended by that repository policy. A target build does not claim a full build or
 full-test pass.
 
+### Build one owner and run one exact CTest
+
+When the smallest useful check is already registered with CTest, keep the target build and test
+selection in the same lane and receipt:
+
+```sh
+./Scripts/ResearchDevBuild.py --lane vulkan check \
+  thunkgentest VulkanCustomRouteInventory.ThunkGen
+```
+
+`check` first builds only the named owning target, then passes the test name through CTest's exact
+`--tests-from-file` selector. The test argument is a literal name, not a regular expression:
+`VulkanCustomRouteInventory.*` therefore selects nothing and fails instead of widening to a family.
+An unknown name also fails through `--no-tests=error`. The helper writes the exact request to a
+private temporary file, scans CMake's generated test registry for exactly one literal definition,
+then runs CTest with the same exact-name file while the lane lock holds the build graph. Generated
+registry parsing fails closed on unsupported names or unsafe files. The temporary file disappears
+before the command returns.
+
+The registry receipt counts conservative generated definitions, not necessarily active CTest rows:
+Catch discovery files can retain an inactive `NOT_BUILT` fallback beside the active discovered
+tests. That can create a safe false rejection if two definitions share the requested name; it
+cannot widen the selected test.
+
+The receipt separates setup, target-build, exact-selection and test durations and records the exact
+head, dirty bit, profile, lane, target, test, selected-test list, workers, cache namespace and exit
+code. It means only that one target built and one host-side CTest ran. It is not a broad suite
+result or ARM runtime evidence. As with `build`, a dirty receipt is fast developer feedback rather
+than reusable exact-head acceptance.
+
 The receipt observes `HEAD` and the dirty bit immediately before target execution; it does not
 snapshot or lock a worktree that an editor can still change. That is appropriate for fast local
 feedback, but it is not immutable experiment identity. For a result that will be reused as exact
@@ -160,6 +190,7 @@ After preparation:
 
 - use `F12` for definition, `Shift+F12` for references and `Ctrl+P`, then `#`, for symbols;
 - press `Ctrl+Shift+B` for **FEX: build one target** and enter the exact CMake target;
+- run **FEX: build target and run one exact CTest** when a focused host-side test owns the oracle;
 - run **FEX: show editor lane receipt** before reporting what was built;
 - use the Run and Debug pane with GDB or LLDB only after identifying a runnable x86-host test or
   tool. The main FEX runtime still requires an ARM64 execution environment.
