@@ -168,6 +168,19 @@ gh workflow run focused-arm64-research.yml \
 The retained smoke profile validates carrier checkout/identity/receipt mechanics only. Reuse its
 accepted result until the carrier or runner image changes; it is not FEX product acceptance.
 
+The current `arm64-disk-cache-shapes-v1` profile is the only retained ARM profile that compiles FEX
+on the hosted runner. Its carrier restores a compiler cache under `RUNNER_TEMP`; it never restores
+an opaque CMake or Ninja build tree. The cache key binds runner OS/architecture, the Clang family,
+exact source SHA, profile and variant. Ccache independently binds compiler content and compile
+arguments, uses the same `time_macros` policy as the repository's local research loop, and caps the
+local cache at 1 GiB. The uploaded receipt distinguishes the Actions restore key from the profile's
+cacheable compiler calls, direct/preprocessed hits, misses, cache size, and configure/build wall
+times. A restored archive is only a performance input: the profile still configures a fresh build
+tree, builds its exact targets, runs its ordinary control and product oracle, and rechecks the exact
+source afterward. Do not add another profile to this cache merely because it compiles; first show
+that its toolchain and cache namespace are compatible and that reuse saves more time than archive
+transfer.
+
 ## Requesting inherited broad CI deliberately
 
 The inherited broad workflows are manual-only in this fork. Dispatch one relevant workflow from

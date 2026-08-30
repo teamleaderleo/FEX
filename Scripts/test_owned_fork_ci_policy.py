@@ -159,6 +159,19 @@ class OwnedForkCIPolicyTest(unittest.TestCase):
                 self.assertEqual(separator, "@")
                 self.assertRegex(revision, r"^[0-9a-f]{40}$")
 
+    def test_arm64_compiler_cache_is_bounded_and_profile_scoped(self) -> None:
+        workflow = self.workflow("focused-arm64-research.yml")
+        self.assertIn("actions/cache/restore@", workflow)
+        self.assertIn("actions/cache/save@", workflow)
+        self.assertIn("CCACHE_MAXSIZE: 1Gi", workflow)
+        self.assertIn("CCACHE_COMPILERCHECK: content", workflow)
+        self.assertIn("path: ${{ env.CCACHE_DIR }}", workflow)
+        self.assertIn(
+            "if: ${{ inputs.profile == 'arm64-disk-cache-shapes-v1' }}",
+            workflow,
+        )
+        self.assertNotIn("/build\n", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
