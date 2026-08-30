@@ -81,6 +81,12 @@ control, it proves:
 The profile goes through the reusable ARM carrier in `docs/OwnedForkCI.md`. A local x86 compile is
 not a substitute for that runtime receipt.
 
+Accepted run [`33293845677`](https://github.com/teamleaderleo/FEX/actions/runs/33293845677) binds
+clean exact source `310c40c81b8ab73b4e309b36c8459823d8ad377d` and all 18 pinned submodules. It
+measured the companion at five mappings and 96 KiB PSS after wrapper close. The forced reload moved
+the wrapper entrypoint from `0x7ffff7eaeed0` to `0x7ffff7470ed0`, while the retained native function
+identity stayed equal and both old/new calls completed.
+
 ## Boundaries and non-goals
 
 This integration owns executable adapters that the native thunk side may retain. It does not

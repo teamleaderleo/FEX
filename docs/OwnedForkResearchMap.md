@@ -1,7 +1,7 @@
 # Owned-fork FEX research map
 
-Reviewed against owned-fork parent
-[`b8f331f1a`](https://github.com/teamleaderleo/FEX/commit/b8f331f1acd40f66fc42acaa32a499714ba4f3b9)
+Reviewed against accepted Vulkan companion source
+[`310c40c81`](https://github.com/teamleaderleo/FEX/commit/310c40c81b8ab73b4e309b36c8459823d8ad377d)
 on 2026-08-30. This is a reading and experiment router for `teamleaderleo/FEX`, not an upstream
 submission plan and not a claim that every thunk or Vulkan lifetime problem is solved.
 
@@ -15,7 +15,7 @@ boundaries. Identify that boundary before changing code or choosing an oracle.
 | Direct Vulkan call works, but GIPA/GDPA returns an unsafe or inconsistent function | native availability and custom-wrapper selection | merged routing plus exhaustive name inventory | [Vulkan proc-address routing](VulkanProcAddressRouting.md) |
 | A guest/host struct has different layout, or `const` input is copied back | generated repacking and allocation/copyback ownership | merged const preservation, host-only cleanup and bounded Vulkan `pNext` copying | [Custom thunk repacking](ThunkRepacking.md) |
 | The same native address H is registered for a newer guest invoker, but later dispatch reaches the old one | synthetic CustomIR registry plus exact shared/thread cache retirement | merged exact-identity rebind transaction | [Callback lifetime map](LinuxFieldworkLifetimeMap.md) |
-| A native library retained a guest executable address after its ordinary wrapper unloaded | already-escaped executable ownership | optional generator primitive merged; measured GL companion merged; other libraries not adopted | [Resident thunk bridges](ResidentThunkBridge.md) and [GL companion](GLResidentCompanion.md) |
+| A native library retained a guest executable address after its ordinary wrapper unloaded | already-escaped executable ownership | measured GL and Vulkan companions; other libraries not adopted | [Resident thunk bridges](ResidentThunkBridge.md), [GL companion](GLResidentCompanion.md), and [Vulkan companion](VulkanResidentCompanion.md) |
 | `MREMAP_FIXED` replaced code at D, but execution at D used the old translation | guest virtual-memory mutation versus translated-code cache | merged destination invalidation for the focused fixed-remap sequence | [Fixed-remap destination cache](MremapFixedDestinationCache.md) |
 | GLX string-return thunks fail to compile under Clang 21 | fixed-width guest layout versus signed host character pointer conversion | merged shared host-layout conversion and two focused generator guards | [PR #25](https://github.com/teamleaderleo/FEX/pull/25) |
 | A new chat needs to configure, build or test something | environment, exact source and smallest owner | `doctor`, stable external lanes, one target and one literal CTest are merged | [Owned-fork development loop](ResearchDevLoop.md) |
@@ -86,17 +86,23 @@ The merged result retires shared code-buffer entries, each live thread's exact l
 call/return shadow cache. It does not stop a thread already executing or already holding an escaped
 wrapper address.
 
-### Resident generation and the one measured library adoption
+### Resident generation and the measured GL/Vulkan adoptions
 
 [PR #23](https://github.com/teamleaderleo/FEX/pull/23), merge `6442dc5af6`, lets one thunk-generator
 analysis optionally emit ordinary guest output plus resident invoker definitions and typed
 accessors. The primitive is library-neutral and opt-in.
 
-[PR #24](https://github.com/teamleaderleo/FEX/pull/24), merge `acb9b7f66b`, is the only current
-product-library adoption: GL builds `libfex-GL-bridge.so`, applies `DF_1_NODELETE` to that companion
-rather than the ordinary wrapper, and moves the published GL/X11/malloc executable targets under
-its lifetime. The indexed dispatcher keeps the ordinary GL wrapper at 39 dynamic relocations rather
-than the rejected 774-relocation per-signature design.
+[PR #24](https://github.com/teamleaderleo/FEX/pull/24), merge `acb9b7f66b`, makes GL build
+`libfex-GL-bridge.so`, applies `DF_1_NODELETE` to that companion rather than the ordinary wrapper,
+and moves the published GL/X11/malloc executable targets under its lifetime. The indexed dispatcher
+keeps the ordinary GL wrapper at 39 dynamic relocations rather than the rejected 774-relocation
+per-signature design.
+
+[PR #31](https://github.com/teamleaderleo/FEX/pull/31) adopts the same per-library architecture for
+Vulkan's 476 generated runtime signatures and three custom X11 publications. Focused ARM64 run
+[`33293845677`](https://github.com/teamleaderleo/FEX/actions/runs/33293845677) proves physical wrapper
+unload, retained ordinary and X11-sensitive calls, and a forced moved reload without a GPU or real
+Vulkan driver. Read [Vulkan resident companion](VulkanResidentCompanion.md) for the exact boundary.
 
 Read [`analysis.cpp`](../ThunkLibs/Generator/analysis.cpp),
 [`gen.cpp`](../ThunkLibs/Generator/gen.cpp), and
@@ -115,13 +121,14 @@ for a reason to widen a thunk/cache experiment.
 
 ## What remains a hypothesis or explicit non-goal
 
-- Vulkan does not use the GL resident companion. Its callback mediation, executable ownership and
-  library-specific runtime oracle remain separate work.
+- Vulkan's own companion owns native-retained proc-address invokers and three X11 target/unpacker
+  pairs. Real application callback mediation and guest-retained exported wrapper entrypoints remain
+  separate work.
 - The existing debug-report/debug-utils wrappers preserve the fork's current suppression/dummy
   policy; routing them safely is not the same as forwarding a real guest callback.
 - Exact CustomIR retirement does not revoke an entry another thread already selected or entered.
-- The GL companion is process-resident. Reclaiming it would require real accumulation evidence plus
-  owner generations, execution leases/hazards and a grace period.
+- The GL and Vulkan companions are process-resident. Reclaiming either would require real
+  accumulation evidence plus owner generations, execution leases/hazards and a grace period.
 - Per-library bridge identity remains deliberate. Equal-looking C++ signatures are not proof that
   ABI annotations and lifetime policy can be globally deduplicated.
 - Source inventories and x86-host builds do not establish 32-bit Vulkan runtime behavior.
@@ -139,6 +146,7 @@ for a reason to widen a thunk/cache experiment.
 | exact synthetic cache retirement | focused `FEXCore_Tests_LookupCache`; ARM rebind only when runtime behavior changed |
 | resident generator output | `ResidentBridgeGeneration.ThunkGen` |
 | GL unload/reload lifetime | checked-in `gl-resident-companion-v1` ARM profile |
+| Vulkan unload/reload lifetime | checked-in `vulkan-resident-companion-v1` ARM profile |
 | fixed-remap destination semantics | exact `smc-2.64` ARM case |
 
 Use the command forms and evidence boundaries in [ResearchDevLoop.md](ResearchDevLoop.md). Reuse an
