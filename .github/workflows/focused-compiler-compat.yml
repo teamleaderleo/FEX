@@ -1,0 +1,102 @@
+name: Focused compiler compatibility
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/focused-compiler-compat.yml
+      - CMakeLists.txt
+      - Scripts/ResearchDevBuild.py
+      - ThunkLibs/Generator/**
+      - ThunkLibs/HostLibs/CMakeLists.txt
+      - ThunkLibs/include/common/**
+      - ThunkLibs/libGL/**
+      - unittests/ThunkLibs/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: focused-compiler-compat-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clang21-thunk-returns:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      FEX_CACHE_ROOT: ${{ runner.temp }}/fex-dev
+
+    steps:
+      - name: Check out the exact same-repository source revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install the bounded Clang 21 build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ccache clang-21 lld-21 llvm-21-dev libclang-21-dev \
+            nasm mold libssl-dev pkg-config libgl-dev libx11-dev \
+            libffi-dev libedit-dev libcurl4-openssl-dev libxml2-dev \
+            libzstd-dev zlib1g-dev
+
+          tool_bin="${RUNNER_TEMP}/clang21-bin"
+          mkdir -p "${tool_bin}"
+          ln -s "$(command -v clang-21)" "${tool_bin}/clang"
+          ln -s "$(command -v clang++-21)" "${tool_bin}/clang++"
+          ln -s "$(command -v ld.lld-21)" "${tool_bin}/ld.lld"
+          echo "${tool_bin}" >> "${GITHUB_PATH}"
+
+      - name: Verify exact source and toolchain identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          test -z "$(git status --porcelain)"
+          [[ "$(clang -dumpversion)" == 21.* ]]
+          clang --version | sed -n '1p'
+          cmake --version | sed -n '1p'
+          ninja --version
+
+      - name: Initialize only the exact pinned submodule graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 Scripts/ResearchDevBuild.py submodules --jobs 8
+
+      - name: Compile and run the two char-pointer return guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 Scripts/ResearchDevBuild.py \
+            --cache-root "${FEX_CACHE_ROOT}" --lane clang21-compat \
+            check thunkgentest CharPointerHostToGuestConversionPreservesAddress.ThunkGen \
+            --jobs 4
+          python3 Scripts/ResearchDevBuild.py \
+            --cache-root "${FEX_CACHE_ROOT}" --lane clang21-compat \
+            check thunkgentest CharPointerReturnsUseConvertibleGuestLayout.ThunkGen \
+            --jobs 4
+
+      - name: Compile the affected GL host thunk only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 Scripts/ResearchDevBuild.py \
+            --cache-root "${FEX_CACHE_ROOT}" --lane clang21-compat \
+            build GL-host-64 --jobs 4
+
+      - name: Prove final source identity
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          test -z "$(git status --porcelain)"
