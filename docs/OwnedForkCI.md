@@ -12,10 +12,11 @@ Two narrow exceptions cover product boundaries that benefit from a same-reposito
   helpers, GL thunk sources, their focused tests and the lane itself. It runs two exact char-pointer
   return tests and builds only `GL-host-64` on GitHub's `ubuntu-26.04` preview image with Clang 21.
 - `.github/workflows/focused-code-cache.yml` watches the format-3 whole-file cache parser, its direct
-  consumer/producer, its test and their CMake registration. It builds only
-  `FEXCore_Tests_CodeCacheFile` and `FEXOfflineCompiler`, then runs only the discovered
-  `*.CodeCacheFile.FEXCore_Tests` cases with the complete LLVM/Clang 18 development package on
-  `ubuntu-24.04`.
+  consumer, its test and their CMake registration. It compiles the pure parser directly into
+  `FEXCore_Tests_CodeCacheFile` rather than linking the full JIT library, then runs only the
+  discovered `*.CodeCacheFile.FEXCore_Tests` cases with the complete LLVM/Clang 18 development
+  package on `ubuntu-24.04`. A producer change still gets an explicit affected-target build in its
+  research receipt; it does not make every parser-only PR compile the Linux emulation stack.
 
 Both refuse external pull-request branches and may be dispatched manually. Neither runs a guest, a
 test family or an inherited matrix. The Clang 21 preview image changes weekly and carries no GA SLA,
