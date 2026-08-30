@@ -333,19 +333,28 @@ and test registries compose the set instead of hand-writing a regular expression
 ./Scripts/ResearchDevBuild.py --lane code-cache check-set FEXCore_Tests_CodeCacheFile
 ```
 
-`check-set` builds that one target, asks Ninja to resolve its phony target alias to exactly one
-concrete executable inside the lane, then selects every CTest whose configured command's first
-argument is exactly that artifact path. It sorts the unique literal names, requires each once in
-the generated CMake test registry, writes them to a private temporary file, and uses CTest's
-`--tests-from-file` selector. It refuses an empty set, aliases with zero or multiple concrete
-artifacts, libraries and other non-executables, symlinked or out-of-build artifacts, wrappers,
-duplicate/malformed registry rows, and sets larger than 256 tests. Those refusals are intentional:
-the command does not guess ownership from filenames, source dependencies, labels or test names.
+`check-set` builds that one target and asks Ninja to resolve its phony alias to exactly one concrete
+executable inside the lane. It then finds the executable's one producer edge in `build.ninja` and
+reads only the bounded regular co-outputs declared on that same edge. Catch2's post-build discovery
+file is such a co-output: CMake declares it as a `BYPRODUCT`, so Ninja regenerates it with the
+executable. The helper accepts only literal one-line `add_test`, `set_tests_properties` and `set`
+commands in a registration co-output, and selects a test only when its `add_test` command head is
+exactly the executable path. This uses the configured producer graph as the ownership index; it
+does not infer a registration filename or interpret arbitrary CMake control flow.
 
-The receipt records both registry digests, the concrete artifact, sorted selected names/count,
-fixed selection limit, exact head/dirty state and separate build, selection and test timings. This
-is still evidence for only that executable's configured host-side CTests, never a suite-level or
-ARM-runtime claim.
+The helper sorts the unique literal names, scans generated CMake files for duplicate occurrences of
+only those selected names, writes them to a private temporary file, and uses CTest's
+`--tests-from-file` selector. It refuses an empty set, aliases with zero or multiple concrete
+artifacts, producer edges without a bounded registration co-output, libraries and other
+non-executables, symlinked or out-of-build artifacts, wrappers, conditionals or unknown registration
+grammar, duplicates, and sets larger than 256 tests. Those refusals are intentional: the command
+does not guess ownership from filenames, source dependencies, labels or test names, and it no
+longer enumerates thousands of unrelated CTests before running the exact set.
+
+The receipt records the build-manifest and target-registration digests, concrete artifact, sorted
+selected names/count, selected-name cross-check file/byte counts, fixed selection limit, exact
+head/dirty state and separate build, selection and test timings. This is still evidence for only
+that executable's configured host-side CTests, never a suite-level or ARM-runtime claim.
 
 When the question needs an x86 guest Linux test binary, select the bounded profile explicitly:
 

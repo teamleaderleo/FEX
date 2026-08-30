@@ -620,31 +620,6 @@ def configured_test_registry(payload: str) -> dict[str, object]:
     }
 
 
-def configured_ctest_set(
-    payload: str, artifact: Path, limit: int = EXACT_CTEST_SET_LIMIT
-) -> dict[str, object]:
-    registry = configured_test_registry(payload)
-    document = json.loads(payload)
-    selected = []
-    artifact_text = str(artifact)
-    for test in document["tests"]:
-        command = test.get("command")
-        if command is not None and command[0] == artifact_text:
-            selected.append(test["name"])
-    selected.sort(key=lambda name: (name.casefold(), name))
-    if not selected:
-        raise RuntimeError("target artifact owns no exact configured CTests")
-    if len(selected) > limit:
-        raise RuntimeError(
-            f"target owns {len(selected)} CTests, exceeding the bounded limit of {limit}"
-        )
-    return {
-        "digest": registry["digest"],
-        "registeredTests": len(registry["tests"]),
-        "selectedTests": selected,
-    }
-
-
 def literal_matches(
     records: list[dict[str, object]], query: str, limit: int
 ) -> dict[str, object]:
@@ -747,29 +722,174 @@ def ctest_command(build: Path, names: Path) -> list[str]:
     ]
 
 
-def generated_ctest_name(line: str) -> str | None:
-    command = re.match(r"\s*add_test\s*\(\s*", line, flags=re.IGNORECASE)
-    if command is None:
-        return None
-    rest = line[command.end():]
+def generated_cmake_literal(raw: str, label: str) -> tuple[str, str]:
+    rest = raw.lstrip()
     if rest.startswith("["):
         bracket = re.match(r"\[(=*)\[(.*?)\]\1\]", rest)
         if bracket is None:
-            raise RuntimeError("unsupported generated CTest bracket name")
-        name = bracket.group(2)
-    elif rest.startswith('"'):
+            raise RuntimeError(f"unsupported generated CTest bracket {label}")
+        return bracket.group(2), rest[bracket.end():]
+    if rest.startswith('"'):
         quoted = re.match(r'"([^"\\]*)"', rest)
         if quoted is None:
-            raise RuntimeError("unsupported escaped generated CTest name")
-        name = quoted.group(1)
-    else:
-        bare = re.match(r"([^\s)]+)", rest)
-        if bare is None:
-            raise RuntimeError("missing generated CTest name")
-        name = bare.group(1)
+            raise RuntimeError(f"unsupported escaped generated CTest {label}")
+        return quoted.group(1), rest[quoted.end():]
+    bare = re.match(r"([^\s)]+)", rest)
+    if bare is None:
+        raise RuntimeError(f"missing generated CTest {label}")
+    return bare.group(1), rest[bare.end():]
+
+
+def generated_ctest_definition(line: str) -> dict[str, str] | None:
+    command = re.match(r"\s*add_test\s*\(\s*", line, flags=re.IGNORECASE)
+    if command is None:
+        return None
+    name, rest = generated_cmake_literal(line[command.end():], "name")
     if not name or name == "NAME" or "$" in name:
         raise RuntimeError(f"unsupported generated CTest name: {name!r}")
-    return name
+    command_head, _ = generated_cmake_literal(rest, "command head")
+    if (
+        not command_head
+        or "$" in command_head
+        or not command_head.isprintable()
+    ):
+        raise RuntimeError(
+            f"unsupported generated CTest command head: {command_head!r}"
+        )
+    return {"name": name, "commandHead": command_head}
+
+
+def generated_ctest_name(line: str) -> str | None:
+    definition = generated_ctest_definition(line)
+    return None if definition is None else definition["name"]
+
+
+def configured_target_cooutputs(
+    manifest: Path, build: Path, artifact: Path
+) -> dict[str, object]:
+    payload = read_bounded_regular_bytes(
+        manifest, 64 * 1024 * 1024, "Ninja build manifest"
+    )
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RuntimeError("invalid Ninja build manifest encoding") from error
+    build_root = build.resolve(strict=True)
+    try:
+        artifact_relative = artifact.relative_to(build_root).as_posix()
+    except ValueError as error:
+        raise RuntimeError("target artifact is outside the configured build") from error
+    matching_outputs: list[list[str]] = []
+    for line in lines:
+        if not line.startswith("build ") or ":" not in line:
+            continue
+        output_field = line[len("build "):].split(":", 1)[0]
+        explicit_field = output_field.split(" | ", 1)[0]
+        if artifact_relative not in explicit_field.split():
+            continue
+        if "$" in explicit_field:
+            raise RuntimeError("unsupported escaped Ninja target outputs")
+        outputs = explicit_field.split()
+        if artifact_relative not in outputs:
+            continue
+        matching_outputs.append(outputs)
+    if len(matching_outputs) != 1:
+        raise RuntimeError("target artifact must have one exact Ninja producer edge")
+    cooutputs = [output for output in matching_outputs[0] if output != artifact_relative]
+    if not cooutputs or len(cooutputs) > 16:
+        raise RuntimeError("target artifact lacks a bounded registration co-output set")
+    resolved_outputs = []
+    for output in cooutputs:
+        relative = PurePosixPath(output)
+        if relative.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            raise RuntimeError(f"unsafe Ninja target co-output: {output}")
+        candidate = build_root.joinpath(*relative.parts)
+        try:
+            metadata = candidate.lstat()
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(build_root)
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"target co-output is unavailable: {output}") from error
+        if (
+            candidate != resolved
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size > 16 * 1024 * 1024
+        ):
+            raise RuntimeError(f"target co-output is unsafe: {output}")
+        resolved_outputs.append(resolved)
+    return {
+        "artifactOutput": artifact_relative,
+        "buildManifestDigest": hashlib.sha256(payload).hexdigest(),
+        "cooutputs": resolved_outputs,
+    }
+
+
+def generated_target_ctest_set(
+    manifest: Path,
+    build: Path,
+    artifact: Path,
+    limit: int = EXACT_CTEST_SET_LIMIT,
+) -> dict[str, object]:
+    producer = configured_target_cooutputs(manifest, build, artifact)
+    build_root = build.resolve(strict=True)
+    selected: list[str] = []
+    registration_files = 0
+    registration_bytes = 0
+    digest = hashlib.sha256()
+    allowed_commands = {"add_test", "set_tests_properties", "set"}
+    for path in producer.pop("cooutputs"):
+        payload = read_bounded_regular_bytes(
+            path, 16 * 1024 * 1024, "target registration co-output"
+        )
+        registration_bytes += len(payload)
+        if registration_bytes > DISCOVERY_REGISTRY_LIMIT:
+            raise RuntimeError(
+                "target registration co-outputs exceeded the bounded aggregate limit"
+            )
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise RuntimeError("target registration co-output is not UTF-8") from error
+        definitions = []
+        for line in text.splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            cmake_command = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
+            if cmake_command is None or cmake_command.group(1).lower() not in allowed_commands:
+                raise RuntimeError("unsupported target registration co-output grammar")
+            definition = generated_ctest_definition(line)
+            if definition is not None:
+                definitions.append(definition)
+        matches = [
+            definition["name"]
+            for definition in definitions
+            if definition["commandHead"] == str(artifact)
+        ]
+        if matches:
+            relative = path.relative_to(build_root).as_posix()
+            digest.update(relative.encode("utf-8") + b"\0")
+            digest.update(hashlib.sha256(payload).digest())
+            registration_files += 1
+            selected.extend(matches)
+    if not selected:
+        raise RuntimeError("target artifact owns no exact generated CTests")
+    selected.sort(key=lambda name: (name.casefold(), name))
+    if len(selected) != len(set(selected)):
+        raise RuntimeError("target registration co-outputs contain duplicate CTest names")
+    if len(selected) > limit:
+        raise RuntimeError(
+            f"target owns {len(selected)} CTests, exceeding the bounded limit of {limit}"
+        )
+    return {
+        **producer,
+        "digest": digest.hexdigest(),
+        "registrationFiles": registration_files,
+        "registrationBytes": registration_bytes,
+        "selectedTests": selected,
+    }
 
 
 def generated_ctest_registry(build: Path, file_limit: int = 16 * 1024 * 1024) -> dict[str, object]:
@@ -827,6 +947,71 @@ def generated_ctest_registry(build: Path, file_limit: int = 16 * 1024 * 1024) ->
         "definitions": len(names),
         "digest": digest.hexdigest(),
         "names": names,
+    }
+
+
+def selected_generated_ctest_crosscheck(
+    build: Path, selected: list[str], file_limit: int = 16 * 1024 * 1024
+) -> dict[str, object]:
+    if not selected or len(selected) != len(set(selected)):
+        raise RuntimeError("selected CTest cross-check requires unique names")
+    encoded_names = {name: name.encode("utf-8") for name in selected}
+    counts = dict.fromkeys(selected, 0)
+    scanned_files = 0
+    scanned_bytes = 0
+    matching_files = 0
+    matching_definitions = 0
+    digest = hashlib.sha256()
+    for root, directories, filenames in os.walk(build, followlinks=False):
+        directories.sort()
+        filenames.sort()
+        for filename in filenames:
+            if not filename.endswith(".cmake"):
+                continue
+            path = Path(root) / filename
+            payload = read_bounded_regular_bytes(
+                path, file_limit, "generated CTest cross-check file"
+            )
+            scanned_files += 1
+            scanned_bytes += len(payload)
+            if scanned_files > 4096 or scanned_bytes > DISCOVERY_REGISTRY_LIMIT:
+                raise RuntimeError(
+                    "generated CTest cross-check exceeded the bounded aggregate limit"
+                )
+            if not any(needle in payload for needle in encoded_names.values()):
+                continue
+            try:
+                text = payload.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise RuntimeError(
+                    f"invalid generated CTest cross-check encoding: {path}"
+                ) from error
+            file_matches = 0
+            for line in text.splitlines():
+                if not any(name in line for name in selected):
+                    continue
+                definition = generated_ctest_definition(line)
+                if definition is None or definition["name"] not in counts:
+                    continue
+                counts[definition["name"]] += 1
+                file_matches += 1
+            if file_matches:
+                relative = path.relative_to(build).as_posix()
+                digest.update(relative.encode("utf-8") + b"\0")
+                digest.update(hashlib.sha256(payload).digest())
+                matching_files += 1
+                matching_definitions += file_matches
+    mismatches = {name: count for name, count in counts.items() if count != 1}
+    if mismatches:
+        raise RuntimeError(
+            f"exact target CTest generated-registry mismatch: {mismatches}"
+        )
+    return {
+        "digest": digest.hexdigest(),
+        "scannedFiles": scanned_files,
+        "scannedBytes": scanned_bytes,
+        "matchingFiles": matching_files,
+        "matchingDefinitions": matching_definitions,
     }
 
 
@@ -2702,8 +2887,8 @@ def main(argv: list[str] | None = None) -> int:
                 test_elapsed = 0.0
                 selected_tests: list[str] = []
                 artifact: Path | None = None
-                configured_receipt: dict[str, object] | None = None
-                generated_receipt: dict[str, object] | None = None
+                target_registry_receipt: dict[str, object] | None = None
+                crosscheck_receipt: dict[str, object] | None = None
                 if completed.returncode == 0:
                     selection_started = time.monotonic()
                     query = subprocess.run(
@@ -2722,36 +2907,14 @@ def main(argv: list[str] | None = None) -> int:
                     if query.returncode != 0 or query.stderr:
                         raise RuntimeError("Ninja exact target artifact query failed")
                     artifact = configured_target_artifact(build, target, query.stdout)
-                    ctest = subprocess.run(
-                        ctest_show_only_command(build),
-                        env=env,
-                        capture_output=True,
-                        text=True,
+                    target_registry = generated_target_ctest_set(
+                        build / "build.ninja", build, artifact
                     )
-                    if ctest.returncode != 0:
-                        raise RuntimeError("CTest exact target registry enumeration failed")
-                    output_bytes = len(ctest.stdout.encode("utf-8")) + len(
-                        ctest.stderr.encode("utf-8")
+                    selected_tests = target_registry.pop("selectedTests")
+                    target_registry_receipt = target_registry
+                    crosscheck_receipt = selected_generated_ctest_crosscheck(
+                        build, selected_tests
                     )
-                    if output_bytes > DISCOVERY_REGISTRY_LIMIT:
-                        raise RuntimeError(
-                            "CTest exact target registry exceeded the bounded output limit"
-                        )
-                    configured = configured_ctest_set(ctest.stdout, artifact)
-                    selected_tests = configured.pop("selectedTests")
-                    configured_receipt = configured
-                    generated = generated_ctest_registry(build)
-                    generated_names = generated.pop("names")
-                    generated_receipt = generated
-                    mismatches = {
-                        name: generated_names.count(name)
-                        for name in selected_tests
-                        if generated_names.count(name) != 1
-                    }
-                    if mismatches:
-                        raise RuntimeError(
-                            f"exact target CTest generated-registry mismatch: {mismatches}"
-                        )
                     selection_elapsed = time.monotonic() - selection_started
                     with tempfile.TemporaryDirectory(
                         prefix=".focused-ctest-set-", dir=lane_root
@@ -2768,7 +2931,7 @@ def main(argv: list[str] | None = None) -> int:
                 if identity["head"] != source_head:
                     raise RuntimeError("source HEAD changed during the focused CTest set")
                 receipt = {
-                    "format": "teamleaderleo-fex-x86-host-check-set-receipt-v1",
+                    "format": "teamleaderleo-fex-x86-host-check-set-receipt-v2",
                     "profile": profile_id,
                     "requestedProfile": args.profile,
                     "lane": lane,
@@ -2776,8 +2939,8 @@ def main(argv: list[str] | None = None) -> int:
                     "targetArtifact": str(artifact) if artifact is not None else None,
                     "selectedTests": selected_tests,
                     "selectedTestCount": len(selected_tests),
-                    "configuredTestRegistry": configured_receipt,
-                    "generatedTestRegistry": generated_receipt,
+                    "targetTestRegistry": target_registry_receipt,
+                    "selectedTestCrosscheck": crosscheck_receipt,
                     "selectionLimit": EXACT_CTEST_SET_LIMIT,
                     "head": identity["head"],
                     "dirty": identity["dirty"],

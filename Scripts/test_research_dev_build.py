@@ -1017,26 +1017,75 @@ class ResearchDevBuildTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not a private executable"):
                 dev_build.configured_target_artifact(build, "thunkgentest", payload)
 
-    def test_ctest_set_selects_only_exact_command_head_and_is_bounded(self):
-        artifact = Path("/lane/build/Bin/thunkgentest")
-        payload = json.dumps(
-            {
-                "tests": [
-                    {"name": "B.Test", "command": [str(artifact), "B.Test"]},
-                    {"name": "A.Test", "command": [str(artifact), "A.Test"]},
-                    {"name": "Wrapped.Test", "command": ["/wrapper", str(artifact)]},
-                    {"name": "Other.Test", "command": ["/lane/build/Bin/other"]},
-                ]
-            }
-        )
-        selected = dev_build.configured_ctest_set(payload, artifact)
-        self.assertEqual(selected["selectedTests"], ["A.Test", "B.Test"])
-        self.assertEqual(selected["registeredTests"], 4)
-        self.assertRegex(selected["digest"], r"^[0-9a-f]{64}$")
-        with self.assertRaisesRegex(RuntimeError, "bounded limit"):
-            dev_build.configured_ctest_set(payload, artifact, limit=1)
-        with self.assertRaisesRegex(RuntimeError, "owns no exact"):
-            dev_build.configured_ctest_set(payload, Path("/other"))
+    def test_ninja_cooutput_selects_only_exact_generated_target_ctests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary).resolve()
+            artifact = build / "Bin" / "thunkgentest"
+            artifact.parent.mkdir()
+            artifact.write_bytes(b"binary")
+            artifact.chmod(0o700)
+            generated = build / "generated" / "target-tests.cmake"
+            generated.parent.mkdir()
+            generated.write_text(
+                f"add_test( [==[B.Test]==] {artifact} [==[B.Test]==] )\n"
+                "set_tests_properties( [==[B.Test]==] PROPERTIES SKIP_RETURN_CODE 4)\n"
+                f"add_test( [==[A.Test]==] {artifact} [==[A.Test]==] )\n"
+                "set_tests_properties( [==[A.Test]==] PROPERTIES SKIP_RETURN_CODE 4)\n"
+                "set( thunkgentest_TESTS [==[B.Test]==] [==[A.Test]==] )\n",
+                encoding="utf-8",
+            )
+            manifest = build / "build.ninja"
+            manifest.write_text(
+                "build Bin/thunkgentest generated/target-tests.cmake | "
+                "${cmake_ninja_workdir}generated/target-tests.cmake: LINK object.o\n",
+                encoding="utf-8",
+            )
+            selected = dev_build.generated_target_ctest_set(
+                manifest, build, artifact
+            )
+
+            self.assertEqual(selected["selectedTests"], ["A.Test", "B.Test"])
+            self.assertEqual(selected["artifactOutput"], "Bin/thunkgentest")
+            self.assertEqual(selected["registrationFiles"], 1)
+            self.assertRegex(selected["digest"], r"^[0-9a-f]{64}$")
+            self.assertRegex(selected["buildManifestDigest"], r"^[0-9a-f]{64}$")
+            with self.assertRaisesRegex(RuntimeError, "bounded limit"):
+                dev_build.generated_target_ctest_set(
+                    manifest, build, artifact, limit=1
+                )
+
+            generated.write_text(
+                f"add_test(Wrapped.Test /wrapper {artifact})\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "owns no exact"):
+                dev_build.generated_target_ctest_set(manifest, build, artifact)
+
+    def test_target_ctest_cooutput_fails_closed_on_graph_and_grammar_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary).resolve()
+            artifact = build / "Bin" / "test"
+            artifact.parent.mkdir()
+            artifact.write_bytes(b"binary")
+            artifact.chmod(0o700)
+            generated = build / "tests.cmake"
+            generated.write_text(
+                f"if(FALSE)\nadd_test(Hidden.Test {artifact})\nendif()\n",
+                encoding="utf-8",
+            )
+            manifest = build / "build.ninja"
+            manifest.write_text(
+                "build Bin/test tests.cmake: LINK object.o\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "grammar"):
+                dev_build.generated_target_ctest_set(manifest, build, artifact)
+
+            manifest.write_text(
+                "build Bin/test tests.cmake: LINK one.o\n"
+                "build Bin/test other.cmake: LINK two.o\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "one exact Ninja producer"):
+                dev_build.configured_target_cooutputs(manifest, build, artifact)
 
     def test_ctest_command_uses_exact_name_file_and_no_tests_error(self):
         with mock.patch.object(dev_build, "required_tool", return_value="/tool/ctest"):
@@ -1062,6 +1111,12 @@ class ResearchDevBuildTest(unittest.TestCase):
             "name with spaces.*",
         )
         self.assertIsNone(dev_build.generated_ctest_name("set(value add_test(fake))"))
+        self.assertEqual(
+            dev_build.generated_ctest_definition(
+                "add_test( [==[one test]==] /lane/Bin/test [==[one test]==] )"
+            ),
+            {"name": "one test", "commandHead": "/lane/Bin/test"},
+        )
         for invalid in ('add_test("escaped\\nname" /bin/true)', "add_test(NAME x)"):
             with self.assertRaises(RuntimeError):
                 dev_build.generated_ctest_name(invalid)
@@ -1087,6 +1142,32 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertEqual(registry["names"].count("Unique.Test"), 1)
         self.assertEqual(registry["names"].count("Duplicate.Test"), 2)
         self.assertRegex(registry["digest"], r"^[0-9a-f]{64}$")
+
+    def test_selected_ctest_crosscheck_counts_only_exact_add_test_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            (build / "target.cmake").write_text(
+                "add_test( [=[A.Test]=] /bin/target [=[A.Test]=] )\n"
+                "set_tests_properties( [=[A.Test]=] PROPERTIES SKIP_RETURN_CODE 4)\n"
+                "set(target_TESTS [=[A.Test]=])\n",
+                encoding="utf-8",
+            )
+            (build / "unrelated.cmake").write_text(
+                "add_test(Unrelated.Test /bin/other)\n", encoding="utf-8"
+            )
+            receipt = dev_build.selected_generated_ctest_crosscheck(
+                build, ["A.Test"]
+            )
+            self.assertEqual(receipt["scannedFiles"], 2)
+            self.assertEqual(receipt["matchingFiles"], 1)
+            self.assertEqual(receipt["matchingDefinitions"], 1)
+            self.assertRegex(receipt["digest"], r"^[0-9a-f]{64}$")
+
+            (build / "duplicate.cmake").write_text(
+                "add_test(A.Test /bin/duplicate)\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "A.Test.*2"):
+                dev_build.selected_generated_ctest_crosscheck(build, ["A.Test"])
 
     def test_lane_names_cannot_escape_cache_root(self):
         self.assertEqual(dev_build.validate_lane("callback-fix.2"), "callback-fix.2")
