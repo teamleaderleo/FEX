@@ -68,9 +68,11 @@ class OwnedForkCIPolicyTest(unittest.TestCase):
 
     def test_compiler_lane_is_same_repo_path_scoped_and_bounded(self) -> None:
         workflow = self.workflow("focused-compiler-compat.yml")
+        pull_request_scope = workflow.split("permissions:", 1)[0]
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("pull_request:", workflow)
         self.assertNotIn("\n  push:", workflow)
+        self.assertNotIn("- Scripts/ResearchDevBuild.py", pull_request_scope)
         self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", workflow)
         self.assertIn("runs-on: ubuntu-26.04", workflow)
         self.assertIn("clang-21", workflow)

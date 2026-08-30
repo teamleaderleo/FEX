@@ -13,6 +13,9 @@ GitHub's `ubuntu-26.04` preview image with Clang 21. External pull-request branc
 The job may also be dispatched manually. It does not run a guest, a test family, or any inherited
 matrix. The preview image changes weekly and carries no GA SLA, so its exact source SHA and printed
 toolchain identity are part of the result rather than an implicit stable environment claim.
+Helper-only changes to `Scripts/ResearchDevBuild.py` do not enqueue this compiler/product lane.
+They use the focused Python helper/policy tests locally; a later relevant product change still runs
+the lane through the helper at that exact head.
 
 Each research PR should instead report:
 

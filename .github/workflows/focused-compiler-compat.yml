@@ -6,7 +6,6 @@ on:
     paths:
       - .github/workflows/focused-compiler-compat.yml
       - CMakeLists.txt
-      - Scripts/ResearchDevBuild.py
       - ThunkLibs/Generator/**
       - ThunkLibs/HostLibs/CMakeLists.txt
       - ThunkLibs/include/common/**
