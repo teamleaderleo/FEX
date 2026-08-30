@@ -191,6 +191,34 @@ class ResearchDevBuildTest(unittest.TestCase):
         ])
         self.assertIn("-DBUILD_TESTING=True", command)
 
+    def test_editor_prerequisites_are_two_exact_generator_targets(self):
+        with mock.patch.object(dev_build, "required_tool", return_value="/tool/cmake"):
+            command = dev_build.editor_prerequisites_command(Path("/view/build"))
+
+        self.assertEqual(command, [
+            "/tool/cmake",
+            "--build",
+            "/view/build",
+            "--target",
+            "CONFIG_INC",
+            "IR_INC",
+            "--parallel",
+            "2",
+        ])
+
+    def test_editor_prerequisites_require_all_declared_headers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            for path in dev_build.EDITOR_GENERATED_OUTPUTS:
+                destination = build / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text("generated\n", encoding="utf-8")
+
+            dev_build.verify_editor_prerequisites(build)
+            (build / dev_build.EDITOR_GENERATED_OUTPUTS[0]).unlink()
+            with self.assertRaisesRegex(RuntimeError, "ConfigValues.inl"):
+                dev_build.verify_editor_prerequisites(build)
+
     def test_build_requires_one_explicit_target(self):
         with mock.patch.object(dev_build, "required_tool", return_value="/tool/cmake"):
             command = dev_build.build_command(Path("/view/build"), "vulkan-host-64", 8)
