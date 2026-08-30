@@ -371,8 +371,12 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertEqual((args.action, args.jobs), ("submodules", 4))
         cached = dev_build.parser().parse_args(["submodules", "--pack-cache"])
         self.assertTrue(cached.pack_cache)
+        seeded = dev_build.parser().parse_args(["submodules", "--origin-cache"])
+        self.assertTrue(seeded.origin_cache)
         inventory = dev_build.parser().parse_args(["submodule-cache"])
         self.assertEqual(inventory.action, "submodule-cache")
+        origin_inventory = dev_build.parser().parse_args(["submodule-origin-cache"])
+        self.assertEqual(origin_inventory.action, "submodule-origin-cache")
 
     def test_linux_test_commands_name_one_guest_build(self):
         with mock.patch.object(dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"):
@@ -601,6 +605,106 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertEqual(receipt["packCache"]["linkedEntries"], 72)
         self.assertEqual(require.call_count, 2)
         compact.assert_called_once_with(source.resolve(), (source / "cache").resolve(), "a" * 64, 18)
+
+    def test_submodule_action_composes_origin_and_pack_cache_receipts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            output = __import__("io").StringIO()
+            with mock.patch.object(
+                dev_build.submodule_origin_cache,
+                "update",
+                return_value={"format": "origin-cache", "state": "warm_hit"},
+            ) as update:
+                with mock.patch.object(dev_build, "require_pinned_submodules") as require:
+                    with mock.patch.object(
+                        dev_build,
+                        "pinned_submodule_identity",
+                        return_value=(18, "a" * 64),
+                    ):
+                        with mock.patch.object(
+                            dev_build.submodule_pack_cache,
+                            "compact",
+                            return_value={"format": "pack-cache", "linkedEntries": 54},
+                        ) as compact:
+                            with mock.patch.object(
+                                dev_build,
+                                "source_identity",
+                                return_value={"head": "b" * 40, "dirty": False},
+                            ):
+                                with mock.patch("sys.stdout", output):
+                                    result = dev_build.main(
+                                        [
+                                            "--source",
+                                            str(source),
+                                            "--cache-root",
+                                            str(source / "cache"),
+                                            "submodules",
+                                            "--origin-cache",
+                                            "--pack-cache",
+                                            "--jobs",
+                                            "4",
+                                        ]
+                                    )
+
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(receipt["originCache"]["state"], "warm_hit")
+        self.assertEqual(receipt["packCache"]["linkedEntries"], 54)
+        self.assertEqual(require.call_count, 2)
+        update.assert_called_once_with(
+            source.resolve(),
+            (source / "cache").resolve(),
+            4,
+            progress=mock.ANY,
+        )
+        compact.assert_called_once_with(
+            source.resolve(), (source / "cache").resolve(), "a" * 64, 18
+        )
+
+    def test_submodule_action_defers_pack_cache_for_cold_origin_population(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            output = __import__("io").StringIO()
+            with mock.patch.object(
+                dev_build.submodule_origin_cache,
+                "update",
+                return_value={"format": "origin-cache", "state": "cold_populated"},
+            ):
+                with mock.patch.object(dev_build, "require_pinned_submodules") as require:
+                    with mock.patch.object(
+                        dev_build,
+                        "pinned_submodule_identity",
+                        return_value=(18, "a" * 64),
+                    ):
+                        with mock.patch.object(
+                            dev_build.submodule_pack_cache, "compact"
+                        ) as compact:
+                            with mock.patch.object(
+                                dev_build,
+                                "source_identity",
+                                return_value={"head": "b" * 40, "dirty": False},
+                            ):
+                                with mock.patch("sys.stdout", output):
+                                    result = dev_build.main(
+                                        [
+                                            "--source",
+                                            str(source),
+                                            "--cache-root",
+                                            str(source / "cache"),
+                                            "submodules",
+                                            "--origin-cache",
+                                            "--pack-cache",
+                                        ]
+                                    )
+
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(receipt["originCache"]["state"], "cold_populated")
+        self.assertEqual(
+            receipt["packCache"]["state"], "deferred_until_warm_origin"
+        )
+        self.assertEqual(require.call_count, 1)
+        compact.assert_not_called()
 
     def test_lane_inventory_classifies_live_dead_active_and_unsafe_state(self):
         with tempfile.TemporaryDirectory() as temporary:
