@@ -138,13 +138,20 @@ run_profiled() {
     > "${receipts}/${label}.out" 2> "${receipts}/${label}.err" &
   active_pid=$!
   read_live_stats "${label}" "${expected}"
+  process_state=""
   for _ in $(seq 1 200); do
     if ! kill -0 "${active_pid}" 2>/dev/null; then
       break
     fi
+    # kill -0 also succeeds for an exited child until bash reaps it.
+    process_state="$(awk '{print $3}' "/proc/${active_pid}/stat" 2>/dev/null || true)"
+    if test -z "${process_state}" || test "${process_state}" = "Z"; then
+      break
+    fi
     sleep 0.05
   done
-  if kill -0 "${active_pid}" 2>/dev/null; then
+  process_state="$(awk '{print $3}' "/proc/${active_pid}/stat" 2>/dev/null || true)"
+  if test -n "${process_state}" && test "${process_state}" != "Z"; then
     echo "${label} FEX process exceeded its bounded guest lifetime" >&2
     return 1
   fi
