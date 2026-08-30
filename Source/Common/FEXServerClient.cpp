@@ -427,6 +427,7 @@ void PopulateCodeCache(int ServerSocket, int ProgramFD, bool HasMultiblock, uint
   FEXServerRequestPacket Req {
     .CodeCacheRequest {
       .Header {.Type = HasMultiblock ? PacketType::TYPE_POPULATE_CODE_CACHE : PacketType::TYPE_POPULATE_CODE_CACHE_NO_MULTIBLOCK},
+      .Reserved = 0,
       .ConfigId = ConfigId,
     },
   };

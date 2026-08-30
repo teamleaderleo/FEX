@@ -622,6 +622,13 @@ static void HandleSocketData(fasio::tcp_socket& Socket) {
       std::filesystem::path Path {std::string_view(Tmp, TmpLen)};
       auto filename_hash = XXH3_64bits(Tmp, TmpLen);
       const bool HasMultiblock = (Req->Header.Type == FEXServerClient::PacketType::TYPE_POPULATE_CODE_CACHE);
+      if (Req->CodeCacheRequest.Reserved != 0) {
+        LogMan::Msg::EFmt("Unsupported code-cache population request version");
+        SendEmptyErrorPacket(Socket);
+        close(inFD);
+        inFD = -1;
+        return;
+      }
       const uint64_t CodeCacheConfigId = Req->CodeCacheRequest.ConfigId;
 
       FEXCore::ExecutableFileInfo MainFileId = {nullptr, filename_hash, fextl::string(Tmp, TmpLen)};

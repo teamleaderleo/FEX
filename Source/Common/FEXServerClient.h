@@ -13,7 +13,7 @@ enum DebugLevels : uint32_t;
 }
 
 namespace FEXServerClient {
-enum class PacketType {
+enum class PacketType : uint32_t {
   // Request and Result
   TYPE_KILL,
   TYPE_GET_LOG_FD,
@@ -40,9 +40,14 @@ union FEXServerRequestPacket {
 
   struct {
     struct Header Header;
+    uint32_t Reserved {};
     uint64_t ConfigId;
   } CodeCacheRequest;
 };
+
+static_assert(sizeof(FEXServerRequestPacket::Header) == 4);
+static_assert(sizeof(FEXServerRequestPacket::BasicRequest) == 4);
+static_assert(sizeof(FEXServerRequestPacket::CodeCacheRequest) == 16);
 
 union FEXServerResultPacket {
   struct Header {
