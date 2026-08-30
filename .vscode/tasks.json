@@ -23,6 +23,13 @@
       "problemMatcher": []
     },
     {
+      "label": "FEX: discover configured targets and tests",
+      "type": "process",
+      "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
+      "args": ["--lane", "editor", "discover", "${input:fexDiscoveryQuery}"],
+      "problemMatcher": []
+    },
+    {
       "label": "FEX: explain one target rebuild",
       "type": "process",
       "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
@@ -62,6 +69,12 @@
     }
   ],
   "inputs": [
+    {
+      "id": "fexDiscoveryQuery",
+      "type": "promptString",
+      "description": "Literal fragment to find in configured CMake targets and CTests",
+      "default": "Vulkan"
+    },
     {
       "id": "fexTarget",
       "type": "promptString",

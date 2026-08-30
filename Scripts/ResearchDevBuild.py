@@ -30,6 +30,10 @@ PROFILE = "x86-host-dev-v1"
 CCACHE_SLOPPINESS = "time_macros"
 DEFAULT_SUBMODULE_JOBS = min(os.cpu_count() or 1, 16)
 PLAN_REGEN_DESCRIPTION = "FEX plan requires CMake regeneration"
+DISCOVERY_QUERY_LIMIT = 128
+DISCOVERY_DEFAULT_RESULTS = 32
+DISCOVERY_MAX_RESULTS = 64
+DISCOVERY_REGISTRY_LIMIT = 32 * 1024 * 1024
 DOCTOR_TOOLS = (
     "git",
     "cmake",
@@ -67,7 +71,7 @@ CONFIGURE_PROFILES = {
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description=(
-            "Initialize sources, plan or build one exact FEX target, or run one exact CTest."
+            "Initialize sources, discover/plan/build one exact FEX target, or run one exact CTest."
         )
     )
     result.add_argument("--lane", default="dev", help="isolated stable-path lane name")
@@ -136,6 +140,17 @@ def parser() -> argparse.ArgumentParser:
         help="explain pending work for one target without executing target commands",
     )
     plan.add_argument("target", help="exact target, for example vulkan-host-64")
+    discover = subparsers.add_parser(
+        "discover",
+        help="find configured CMake targets and CTests by one literal query",
+    )
+    discover.add_argument("query", help="case-insensitive literal target/test fragment")
+    discover.add_argument(
+        "--limit",
+        type=positive_int,
+        default=DISCOVERY_DEFAULT_RESULTS,
+        help=f"maximum results per registry (at most {DISCOVERY_MAX_RESULTS})",
+    )
     check = subparsers.add_parser(
         "check",
         help="build one named target and run one exact CTest",
@@ -191,6 +206,23 @@ def validate_ctest_name(raw: str) -> str:
     if not raw.isprintable() or any(character in raw for character in "\r\n\0"):
         raise ValueError("CTest name must be one printable line")
     return raw
+
+
+def validate_discovery_query(raw: str) -> str:
+    if not raw or len(raw) > DISCOVERY_QUERY_LIMIT or raw != raw.strip():
+        raise ValueError(
+            "discovery query must be one nonempty literal of at most "
+            f"{DISCOVERY_QUERY_LIMIT} characters"
+        )
+    if not raw.isprintable() or any(character in raw for character in "\r\n\0"):
+        raise ValueError("discovery query must be one printable line")
+    return raw
+
+
+def validate_discovery_limit(value: int) -> int:
+    if value > DISCOVERY_MAX_RESULTS:
+        raise ValueError(f"discovery limit must be at most {DISCOVERY_MAX_RESULTS}")
+    return value
 
 
 def required_tool(name: str) -> str:
@@ -374,25 +406,181 @@ def parse_ninja_plan(stdout: str, stderr: str, sample_limit: int = 64) -> dict[s
     }
 
 
+def configured_target_registry(manifest: Path) -> dict[str, object]:
+    try:
+        metadata = manifest.stat(follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 64 * 1024 * 1024:
+            raise RuntimeError(f"unsafe Ninja manifest: {manifest}")
+        payload = manifest.read_bytes()
+    except OSError as error:
+        raise RuntimeError(f"cannot read Ninja manifest: {manifest}") from error
+    if len(payload) != metadata.st_size:
+        raise RuntimeError(f"cannot read complete Ninja manifest: {manifest}")
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RuntimeError(f"invalid Ninja manifest encoding: {manifest}") from error
+
+    targets: dict[str, str] = {}
+    for line in lines:
+        match = re.fullmatch(r"# Object build statements for (\S+) target (.+)", line)
+        if match is not None:
+            target_type, name = match.groups()
+        else:
+            match = re.fullmatch(r"# Utility command for (.+)", line)
+            if match is None:
+                continue
+            name, target_type = match.group(1), "UTILITY"
+        if not name or len(name) > 512 or not name.isprintable():
+            raise RuntimeError("unsupported configured target name")
+        previous = targets.setdefault(name, target_type)
+        if previous != target_type:
+            raise RuntimeError(f"ambiguous configured target type: {name}")
+    if not targets:
+        raise RuntimeError(f"configured target registry is empty: {manifest}")
+    records = [
+        {"name": name, "type": targets[name]}
+        for name in sorted(targets, key=lambda item: (item.casefold(), item))
+    ]
+    return {
+        "digest": hashlib.sha256(payload).hexdigest(),
+        "targets": records,
+    }
+
+
+def ctest_show_only_command(build: Path) -> list[str]:
+    return [
+        required_tool("ctest"),
+        "--test-dir",
+        str(build),
+        "--show-only=json-v1",
+    ]
+
+
+def configured_test_registry(payload: str) -> dict[str, object]:
+    if len(payload.encode("utf-8")) > DISCOVERY_REGISTRY_LIMIT:
+        raise RuntimeError("CTest discovery registry exceeded the bounded output limit")
+    try:
+        document = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("invalid CTest discovery registry JSON") from error
+    tests = document.get("tests") if isinstance(document, dict) else None
+    if not isinstance(tests, list):
+        raise RuntimeError("invalid CTest discovery registry shape")
+    records = []
+    names: set[str] = set()
+    for test in tests:
+        if not isinstance(test, dict):
+            raise RuntimeError("invalid CTest discovery test record")
+        name = test.get("name")
+        command = test.get("command")
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 512
+            or not name.isprintable()
+        ):
+            raise RuntimeError("invalid CTest discovery test name")
+        if name in names:
+            raise RuntimeError(f"duplicate CTest discovery test name: {name}")
+        names.add(name)
+        if command is None:
+            state = "not_built"
+            command_head = None
+        elif (
+            isinstance(command, list)
+            and command
+            and all(isinstance(argument, str) for argument in command)
+        ):
+            state = "registered"
+            command_head = Path(command[0]).name
+            if not command_head or not command_head.isprintable():
+                raise RuntimeError(f"invalid CTest discovery command head: {name}")
+        else:
+            raise RuntimeError(f"invalid CTest discovery command: {name}")
+        records.append(
+            {"name": name, "state": state, "commandHead": command_head}
+        )
+    if not records:
+        raise RuntimeError("CTest discovery registry is empty")
+    records.sort(key=lambda record: (str(record["name"]).casefold(), record["name"]))
+    return {
+        "digest": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "tests": records,
+    }
+
+
+def literal_matches(
+    records: list[dict[str, object]], query: str, limit: int
+) -> dict[str, object]:
+    needle = query.casefold()
+    matches = [record for record in records if needle in str(record["name"]).casefold()]
+    return {
+        "totalMatches": len(matches),
+        "returned": min(len(matches), limit),
+        "truncated": len(matches) > limit,
+        "results": matches[:limit],
+    }
+
+
 def require_plan_lane(
     source: Path,
     source_view: Path,
     build: Path,
     profile_path: Path,
     expected: dict[str, object],
+    purpose: str = "plan",
 ) -> None:
     if not source_view.is_symlink():
-        raise RuntimeError("plan requires an existing configured lane")
+        raise RuntimeError(f"{purpose} requires an existing configured lane")
     try:
         current_source = source_view.resolve(strict=True)
     except OSError as error:
-        raise RuntimeError("plan lane source is unavailable") from error
+        raise RuntimeError(f"{purpose} lane source is unavailable") from error
     if current_source != source:
-        raise RuntimeError("plan refuses to switch or clean a lane; choose its current source")
+        raise RuntimeError(
+            f"{purpose} refuses to switch or clean a lane; choose its current source"
+        )
     if not (build / "build.ninja").is_file():
-        raise RuntimeError("plan requires an existing configured Ninja graph")
+        raise RuntimeError(f"{purpose} requires an existing configured Ninja graph")
     if not profile_matches(profile_path, expected):
-        raise RuntimeError("plan requires the lane's exact configured profile")
+        raise RuntimeError(f"{purpose} requires the lane's exact configured profile")
+
+
+def require_current_discovery_graph(build: Path, env: dict[str, str]) -> None:
+    verify_script = build / "CMakeFiles" / "VerifyGlobs.cmake"
+    try:
+        verify_metadata = verify_script.stat(follow_symlinks=False)
+    except OSError as error:
+        raise RuntimeError("discovery requires CMake's generated glob verifier") from error
+    if (
+        not stat.S_ISREG(verify_metadata.st_mode)
+        or verify_metadata.st_size > 16 * 1024 * 1024
+    ):
+        raise RuntimeError("discovery requires CMake's generated glob verifier")
+    subprocess.run(
+        [required_tool("cmake"), "-P", str(verify_script)],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    with shadow_plan_manifest(build) as manifest:
+        current_graph = subprocess.run(
+            ninja_plan_command(build, manifest, str(manifest)),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    if len(current_graph.stdout) + len(current_graph.stderr) > 8 * 1024 * 1024:
+        raise RuntimeError("Ninja discovery preflight exceeded the bounded output limit")
+    if current_graph.returncode != 0:
+        raise RuntimeError("Ninja discovery preflight failed")
+    graph_plan = parse_ninja_plan(current_graph.stdout, current_graph.stderr)
+    if graph_plan["requiresCMakeRegeneration"]:
+        raise RuntimeError(
+            "CMake inputs or configured globs changed; regenerate the lane before discovery"
+        )
 
 
 def protected_plan_state(paths: tuple[Path, ...]) -> dict[str, object]:
@@ -1213,13 +1401,101 @@ def main(argv: list[str] | None = None) -> int:
         require_pinned_submodules(source)
         for tool in ("ninja", "ccache", "ld.lld", "nasm", "pkg-config"):
             required_tool(tool)
-        lane_root.mkdir(parents=True, exist_ok=True)
-        build.mkdir(parents=True, exist_ok=True)
+        if args.action not in {"plan", "discover"}:
+            lane_root.mkdir(parents=True, exist_ok=True)
+            build.mkdir(parents=True, exist_ok=True)
         env = environment(cache_root, lane_root, profile_id)
-        with locked_lane(cache_root, lane):
-            profile_marker = expected_profile(
-                env["CCACHE_NAMESPACE"], profile_id, configure_options
+        profile_marker = expected_profile(
+            env["CCACHE_NAMESPACE"], profile_id, configure_options
+        )
+        if args.action in {"plan", "discover"}:
+            purpose = "discovery" if args.action == "discover" else "plan"
+            require_plan_lane(
+                source,
+                source_view,
+                build,
+                profile_path,
+                profile_marker,
+                purpose,
             )
+        with locked_lane(cache_root, lane):
+            if args.action == "discover":
+                query = validate_discovery_query(args.query)
+                limit = validate_discovery_limit(args.limit)
+                require_plan_lane(
+                    source,
+                    source_view,
+                    build,
+                    profile_path,
+                    profile_marker,
+                    "discovery",
+                )
+                identity = source_identity(source)
+                protected_paths = (
+                    build / "build.ninja",
+                    build / ".ninja_log",
+                    build / ".ninja_deps",
+                    receipt_path,
+                )
+                protected_before = protected_plan_state(protected_paths)
+                started = time.monotonic()
+                require_current_discovery_graph(build, env)
+
+                targets = configured_target_registry(build / "build.ninja")
+                ctest = subprocess.run(
+                    ctest_show_only_command(build),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                if ctest.returncode != 0:
+                    raise RuntimeError("CTest discovery registry enumeration failed")
+                ctest_output_bytes = len(ctest.stdout.encode("utf-8")) + len(
+                    ctest.stderr.encode("utf-8")
+                )
+                if ctest_output_bytes > DISCOVERY_REGISTRY_LIMIT:
+                    raise RuntimeError("CTest discovery registry exceeded the bounded output limit")
+                tests = configured_test_registry(ctest.stdout)
+
+                protected_after = protected_plan_state(protected_paths)
+                if protected_after != protected_before:
+                    raise RuntimeError("discovery changed Ninja or last-receipt state")
+                if source_identity(source) != identity:
+                    raise RuntimeError("source identity changed during discovery")
+                elapsed = time.monotonic() - started
+                receipt = {
+                    "format": "teamleaderleo-fex-configured-discovery-v1",
+                    "profile": profile_id,
+                    "requestedProfile": args.profile,
+                    "lane": lane,
+                    "head": identity["head"],
+                    "dirty": identity["dirty"],
+                    "query": query,
+                    "limit": limit,
+                    "targets": literal_matches(targets["targets"], query, limit),
+                    "tests": literal_matches(tests["tests"], query, limit),
+                    "registries": {
+                        "targets": len(targets["targets"]),
+                        "targetDigest": targets["digest"],
+                        "tests": len(tests["tests"]),
+                        "testDigest": tests["digest"],
+                    },
+                    "elapsedSeconds": round(elapsed, 6),
+                    "configurationMode": "reuse",
+                    "protectedStateUnchanged": True,
+                    "execution": {
+                        "configured": False,
+                        "targetCommands": False,
+                        "tests": False,
+                    },
+                    "ownershipInference": "none; target and test matches are separate registries",
+                    "mutation": (
+                        "CMake glob sentinel may update; target outputs, Ninja state, "
+                        "and build receipt are unchanged"
+                    ),
+                }
+                print(json.dumps(receipt, sort_keys=True))
+                return 0
             if args.action == "plan":
                 require_plan_lane(source, source_view, build, profile_path, profile_marker)
                 identity = source_identity(source)
