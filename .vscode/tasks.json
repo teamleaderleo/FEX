@@ -55,6 +55,13 @@
       "problemMatcher": ["$gcc"]
     },
     {
+      "label": "FEX: build CodeCacheConfig debug owner",
+      "type": "process",
+      "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
+      "args": ["--lane", "editor", "build", "FEXCore_Tests_CodeCacheConfig"],
+      "problemMatcher": ["$gcc"]
+    },
+    {
       "label": "FEX: show editor lane receipt",
       "type": "process",
       "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",

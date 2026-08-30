@@ -479,6 +479,33 @@ After preparation:
 - use the Run and Debug pane with GDB or LLDB only after identifying a runnable x86-host test or
   tool. The main FEX runtime still requires an ARM64 execution environment.
 
+### Debug one real focused owner
+
+The checked-in **FEX: debug CodeCacheConfig owner** launch is a small host-side debugger example,
+not a guest or full-runtime launch. It composes three existing boundaries:
+
+1. its pre-launch task asks `ResearchDevBuild.py` for only the exact
+   `FEXCore_Tests_CodeCacheConfig` target in the `editor` lane;
+2. the program and working directory name that target's generated executable and Catch2 working
+   directory under the default external lane; and
+3. `sourceFileMap` maps the stable compiler source view back to the workspace opened in VS Code, so
+   breakpoints belong to the current checkout rather than a machine-specific absolute path.
+
+Open `FEXCore/Source/Interface/Core/CodeCacheConfig.cpp`, set a breakpoint inside either
+`ComputeId`, select **FEX: debug CodeCacheConfig owner** in **Run and Debug**, and start it. The
+profile is `RelWithDebInfo`, so optimized statements can move or combine; a breakpoint on the
+function body may resolve to a later executable line. The complete example executable contains
+seven focused test cases. A breakpoint hit proves only that this host-side owner reached that
+production code; the final test result still decides whether its cases passed.
+
+The launch uses VS Code's `${userHome}` and `${workspaceFolder}` variables and assumes the existing
+default cache root plus the named `editor` lane. If that lane was configured with a non-default
+cache root, use the command-line helper for the selected lane instead of silently debugging a
+different binary. To add another debugger owner, first use `discover` to find the exact target and
+CTest names, prove one command-line breakpoint against its generated executable, and then give it
+its own explicit pre-launch task and launch entry. Do not turn this example into a guessed
+target-to-binary mapper or a broad build.
+
 The Microsoft C++ language engine is disabled for this workspace so it does not duplicate clangd's
 diagnostics and indexing. Its debugger remains available. CMake Tools supplies CMake syntax and
 project affordances, but automatic configuration is disabled so it cannot silently create a second,
