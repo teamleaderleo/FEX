@@ -48,12 +48,20 @@ jobs:
             libssl-dev pkg-config libgl-dev libx11-dev libffi-dev libedit-dev \
             libcurl4-openssl-dev libxml2-dev libzstd-dev zlib1g-dev
 
+          tool_bin="${RUNNER_TEMP}/clang18-bin"
+          mkdir -p "${tool_bin}"
+          ln -s "$(command -v clang-18)" "${tool_bin}/clang"
+          ln -s "$(command -v clang++-18)" "${tool_bin}/clang++"
+          ln -s "$(command -v ld.lld-18)" "${tool_bin}/ld.lld"
+          echo "${tool_bin}" >> "${GITHUB_PATH}"
+
       - name: Verify exact source and toolchain identity
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
           test -z "$(git status --porcelain)"
+          [[ "$(clang -dumpversion)" == 18.* ]]
           clang --version | sed -n '1p'
           cmake --version | sed -n '1p'
           ninja --version
