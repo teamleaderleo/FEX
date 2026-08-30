@@ -27,6 +27,7 @@ jobs:
     timeout-minutes: 25
     env:
       SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CMAKE_PREFIX_PATH: /usr/lib/llvm-21
 
     steps:
       - name: Check out the exact same-repository source revision
