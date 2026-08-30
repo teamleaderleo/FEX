@@ -14,7 +14,8 @@ Two narrow exceptions cover product boundaries that benefit from a same-reposito
 - `.github/workflows/focused-code-cache.yml` watches the format-3 whole-file cache parser, its direct
   consumer/producer, its test and their CMake registration. It builds only
   `FEXCore_Tests_CodeCacheFile` and `FEXOfflineCompiler`, then runs only the discovered
-  `*.CodeCacheFile.FEXCore_Tests` cases on `ubuntu-24.04`.
+  `*.CodeCacheFile.FEXCore_Tests` cases with the complete LLVM/Clang 18 development package on
+  `ubuntu-24.04`.
 
 Both refuse external pull-request branches and may be dispatched manually. Neither runs a guest, a
 test family or an inherited matrix. The Clang 21 preview image changes weekly and carries no GA SLA,

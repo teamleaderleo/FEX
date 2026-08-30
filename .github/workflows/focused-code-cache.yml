@@ -27,6 +27,7 @@ jobs:
     timeout-minutes: 20
     env:
       SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CMAKE_PREFIX_PATH: /usr/lib/llvm-18
 
     steps:
       - name: Check out the exact same-repository source revision
@@ -42,7 +43,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ccache clang lld cmake ninja-build nasm mold \
+            ccache clang-18 lld-18 llvm-18-dev libclang-18-dev \
+            cmake ninja-build nasm mold \
             libssl-dev pkg-config libgl-dev libx11-dev libffi-dev libedit-dev \
             libcurl4-openssl-dev libxml2-dev libzstd-dev zlib1g-dev
 
