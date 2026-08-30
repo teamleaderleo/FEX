@@ -20,6 +20,7 @@ from typing import Callable, Sequence
 
 
 TEST_FILES = (
+    "Scripts/test_analyze_disk_cache.py",
     "Scripts/test_fork_workflow_registry.py",
     "Scripts/test_owned_fork_ci_policy.py",
     "Scripts/test_research_dev_build.py",
