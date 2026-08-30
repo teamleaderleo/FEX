@@ -53,6 +53,7 @@ class ResearchDevBuildTest(unittest.TestCase):
             machine="x86_64",
         )
 
+        self.assertEqual(receipt["format"], "teamleaderleo-fex-experiment-doctor-v2")
         self.assertEqual(receipt["status"], "preflight_ready")
         self.assertEqual(receipt["source"]["head"], "b" * 40)
         self.assertEqual(receipt["submodules"]["repositories"], 1)
@@ -60,8 +61,18 @@ class ResearchDevBuildTest(unittest.TestCase):
             receipt["capabilities"]["focusedX86HostBuildAndCTest"]["state"],
             "preflight_ready",
         )
-        self.assertFalse(
-            receipt["capabilities"]["focusedX86HostBuildAndCTest"]["ready"]
+        focused = receipt["capabilities"]["focusedX86HostBuildAndCTest"]
+        self.assertTrue(focused["preflightReady"])
+        self.assertEqual(focused["executionState"], "not_run")
+        self.assertEqual(focused["evidenceState"], "not_established")
+        self.assertNotIn("ready", focused)
+        self.assertEqual(
+            focused["nextCommands"],
+            [
+                "./Scripts/ResearchDevBuild.py --lane NAME build TARGET",
+                "./Scripts/ResearchDevBuild.py --lane NAME check TARGET EXACT_CTEST",
+                "./Scripts/ResearchDevBuild.py --lane editor editor",
+            ],
         )
         self.assertEqual(
             receipt["capabilities"]["arm64ProductRuntime"]["state"],
@@ -91,6 +102,13 @@ class ResearchDevBuildTest(unittest.TestCase):
             receipt["capabilities"]["focusedX86HostBuildAndCTest"]["blockers"],
             ["missing_tools", "submodules"],
         )
+        self.assertFalse(
+            receipt["capabilities"]["focusedX86HostBuildAndCTest"]["preflightReady"]
+        )
+        self.assertEqual(
+            receipt["capabilities"]["focusedX86HostBuildAndCTest"]["nextCommands"],
+            [],
+        )
 
     def test_doctor_marks_dirty_source_as_feedback_only_without_blocking(self):
         receipt = dev_build.doctor_receipt(
@@ -104,6 +122,9 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertEqual(
             receipt["capabilities"]["reusableExactHeadEvidence"]["state"],
             "feedback_only",
+        )
+        self.assertFalse(
+            receipt["capabilities"]["reusableExactHeadEvidence"]["established"]
         )
 
     def test_doctor_refuses_to_call_arm_host_runtime_ready(self):
@@ -119,7 +140,11 @@ class ResearchDevBuildTest(unittest.TestCase):
             receipt["capabilities"]["arm64ProductRuntime"]["state"],
             "candidate_requires_checked_in_profile",
         )
-        self.assertFalse(receipt["capabilities"]["arm64ProductRuntime"]["ready"])
+        arm_runtime = receipt["capabilities"]["arm64ProductRuntime"]
+        self.assertFalse(arm_runtime["preflightReady"])
+        self.assertEqual(arm_runtime["executionState"], "not_run")
+        self.assertEqual(arm_runtime["evidenceState"], "not_established")
+        self.assertNotIn("ready", arm_runtime)
 
     def test_configure_profile_is_host_debug_without_lto(self):
         with mock.patch.object(dev_build, "required_tool", return_value="/tool/cmake"):
