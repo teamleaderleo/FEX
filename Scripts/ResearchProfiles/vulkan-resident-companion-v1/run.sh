@@ -27,7 +27,7 @@ sudo apt-get update > "${receipts}/apt-update.log" 2>&1
 sudo apt-get install -y --no-install-recommends \
   cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
   gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binutils \
-  libcap-dev libvulkan-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev xvfb \
+  libcap-dev libgl-dev libvulkan-dev libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxrender-dev xvfb \
   > "${receipts}/apt-install.log" 2>&1
 clang++-18 --version > "${receipts}/clang-version.txt"
 x86_64-linux-gnu-g++ --version > "${receipts}/guest-compiler-version.txt"
