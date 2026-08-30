@@ -1,4 +1,5 @@
-add_executable(thunkgentest generator.cpp abi.cpp)
+add_executable(thunkgentest generator.cpp abi.cpp host_layout.cpp)
+target_include_directories(thunkgentest PRIVATE "${CMAKE_SOURCE_DIR}/ThunkLibs/include/common")
 target_link_libraries(thunkgentest PRIVATE Catch2::Catch2WithMain)
 target_link_libraries(thunkgentest PRIVATE fmt::fmt)
 target_link_libraries(thunkgentest PRIVATE thunkgenlib)

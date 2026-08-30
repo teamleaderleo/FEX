@@ -376,6 +376,8 @@ SourceWithAST Fixture::run_thunkgen_host(std::string_view prelude, std::string_v
     "template<typename T> struct host_to_guest_convertible {\n"
     "  operator guest_layout<T>();\n"
     "  operator guest_layout<const unsigned long long*>() const requires(std::is_same_v<T, const unsigned long*>);\n"
+    "  operator guest_layout<const int8_t*>() const requires(std::is_same_v<T, const char*>);\n"
+    "  operator guest_layout<int8_t*>() const requires(std::is_same_v<T, char*>);\n"
     "  operator guest_layout<const uint8_t*>() const requires(std::is_same_v<T, const char*>);\n"
     "  operator guest_layout<uint8_t*>() const requires(std::is_same_v<T, char*>);\n"
     "  operator guest_layout<uint32_t*>() const requires(std::is_same_v<T, wchar_t*>);\n"
@@ -455,6 +457,24 @@ TEST_CASE_METHOD(Fixture, "Trivial") {
                                hasInit(0, expr()), hasInit(1, initListExpr(hasInit(0, implicitCastExpr()), hasInit(1, implicitCastExpr())))))
                              // TODO: check null termination
                              )));
+}
+
+TEST_CASE_METHOD(Fixture, "CharPointerReturnsUseConvertibleGuestLayout") {
+  const auto output = run_thunkgen_host("", "#include <thunks_common.h>\n"
+                                             "const char* const_char();\n"
+                                             "char* mutable_char();\n"
+                                             "const unsigned char* const_unsigned_char();\n"
+                                             "unsigned char* mutable_unsigned_char();\n"
+                                             "template<auto> struct fex_gen_config {};\n"
+                                             "template<> struct fex_gen_config<const_char> {};\n"
+                                             "template<> struct fex_gen_config<mutable_char> {};\n"
+                                             "template<> struct fex_gen_config<const_unsigned_char> {};\n"
+                                             "template<> struct fex_gen_config<mutable_unsigned_char> {};\n");
+
+  CHECK(output.code.find("to_guest(to_host_layout<const char *>") != std::string::npos);
+  CHECK(output.code.find("to_guest(to_host_layout<char *>") != std::string::npos);
+  CHECK(output.code.find("to_guest(to_host_layout<const unsigned char *>") != std::string::npos);
+  CHECK(output.code.find("to_guest(to_host_layout<unsigned char *>") != std::string::npos);
 }
 
 TEST_CASE_METHOD(Fixture, "LayoutWrapperOrderIsDeterministic") {

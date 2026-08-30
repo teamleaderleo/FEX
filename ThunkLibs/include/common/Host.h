@@ -437,7 +437,19 @@ struct host_to_guest_convertible {
     return (guest_layout<const unsigned long long*>)reinterpret_cast<const host_to_guest_convertible<const unsigned long long*>&>(*this);
   }
 
-  // Make guest_layout of "char" and "uint8_t" interoperable
+  // Make guest_layout of "char" and fixed-width 8-bit integers interoperable.
+  // Clang may render the guest ABI's canonical char type as either signed or
+  // unsigned, but both layouts carry only the pointer address here.
+  operator guest_layout<const int8_t*>() const requires (std::is_same_v<T, const char*>)
+  {
+    return (guest_layout<const int8_t*>)reinterpret_cast<const host_to_guest_convertible<const int8_t*>&>(*this);
+  }
+
+  operator guest_layout<int8_t*>() const requires (std::is_same_v<T, char*>)
+  {
+    return (guest_layout<int8_t*>)reinterpret_cast<const host_to_guest_convertible<int8_t*>&>(*this);
+  }
+
   operator guest_layout<const uint8_t*>() const requires (std::is_same_v<T, const char*>)
   {
     return (guest_layout<const uint8_t*>)reinterpret_cast<const host_to_guest_convertible<const uint8_t*>&>(*this);
