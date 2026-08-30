@@ -58,8 +58,10 @@ function-pointer signature. They contain `CallbackUnpack` exports only for the c
 subset recorded by `AnalysisAction`.
 
 The accessor include gives the unloadable wrapper typed functions for obtaining those resident
-addresses. Requesting an unpacker for a signature that analysis did not classify as a callback has
-no generated specialization and fails at compile time.
+addresses. All typed invoker accessors share one indexed C dispatcher, and the callback subset
+shares a second dispatcher. This keeps the wrapper's dynamic relocation surface constant instead
+of adding one imported symbol per signature. Requesting an unpacker for a signature that analysis
+did not classify as a callback has no generated specialization and fails at compile time.
 
 The normal output and bridge output share the same signature digest and numbering computed in
 `GenerateThunkLibsAction::OnAnalysisComplete`. Resident mode must not quietly create a second

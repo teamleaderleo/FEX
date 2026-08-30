@@ -583,10 +583,10 @@ TEST_CASE_METHOD(Fixture, "ResidentBridgeGeneration") {
   SECTION("ordinary output is unchanged and pure invokers do not gain unpackers") {
     CHECK(type_resident.guest == type_control.guest);
     CHECK(count(type_resident.bridge, "MAKE_CALLBACK_THUNK(") == 1);
-    CHECK(count(type_resident.bridge, "_invoker_") == 1);
-    CHECK(count(type_resident.bridge, "_unpacker_") == 0);
-    CHECK(count(type_resident.accessors, "_invoker_") == 2);
-    CHECK(count(type_resident.accessors, "_unpacker_") == 0);
+    CHECK(count(type_resident.bridge, "fex_bridge_libtest_invoker_lookup") == 1);
+    CHECK(count(type_resident.bridge, "fex_bridge_libtest_unpacker_lookup") == 0);
+    CHECK(count(type_resident.accessors, "fex_bridge_libtest_invoker_lookup") == 2);
+    CHECK(count(type_resident.accessors, "fex_bridge_libtest_unpacker_lookup") == 0);
     CHECK_NOTHROW(SourceWithAST {bridge_prelude + type_resident.bridge});
 
     const auto use_invoker = as_main_file(type_resident.accessors) +
@@ -607,10 +607,10 @@ TEST_CASE_METHOD(Fixture, "ResidentBridgeGeneration") {
   SECTION("real callback direction emits exactly one matching unpacker") {
     CHECK(callback_resident.guest == callback_control.guest);
     CHECK(count(callback_resident.bridge, "MAKE_CALLBACK_THUNK(") == 1);
-    CHECK(count(callback_resident.bridge, "_invoker_") == 1);
-    CHECK(count(callback_resident.bridge, "_unpacker_") == 1);
-    CHECK(count(callback_resident.accessors, "_invoker_") == 2);
-    CHECK(count(callback_resident.accessors, "_unpacker_") == 2);
+    CHECK(count(callback_resident.bridge, "fex_bridge_libtest_invoker_lookup") == 1);
+    CHECK(count(callback_resident.bridge, "fex_bridge_libtest_unpacker_lookup") == 1);
+    CHECK(count(callback_resident.accessors, "fex_bridge_libtest_invoker_lookup") == 2);
+    CHECK(count(callback_resident.accessors, "fex_bridge_libtest_unpacker_lookup") == 2);
     CHECK_NOTHROW(SourceWithAST {bridge_prelude + callback_resident.bridge});
 
     const auto use_callback = as_main_file(callback_resident.accessors) +
@@ -622,11 +622,22 @@ TEST_CASE_METHOD(Fixture, "ResidentBridgeGeneration") {
     const auto combined = run_thunkgen_guest_outputs(type_only, callback, true);
     const auto repeated = run_thunkgen_guest_outputs(type_only, callback, true);
     CHECK(count(combined.bridge, "MAKE_CALLBACK_THUNK(") == 1);
-    CHECK(count(combined.bridge, "_invoker_") == 1);
-    CHECK(count(combined.bridge, "_unpacker_") == 1);
+    CHECK(count(combined.bridge, "fex_bridge_libtest_invoker_lookup") == 1);
+    CHECK(count(combined.bridge, "fex_bridge_libtest_unpacker_lookup") == 1);
     CHECK(combined.guest == repeated.guest);
     CHECK(combined.bridge == repeated.bridge);
     CHECK(combined.accessors == repeated.accessors);
+  }
+
+  SECTION("distinct signatures share one imported dispatcher per direction") {
+    const std::string distinct_types = "template<typename> struct fex_gen_type {};\n"
+                                       "template<> struct fex_gen_type<int(char, char)> {};\n"
+                                       "template<> struct fex_gen_type<long(short)> {};\n";
+    const auto output = run_thunkgen_guest_outputs("", distinct_types, true);
+    CHECK(count(output.bridge, "MAKE_CALLBACK_THUNK(") == 2);
+    CHECK(count(output.bridge, "fex_bridge_libtest_invoker_lookup") == 1);
+    CHECK(count(output.accessors, "fex_bridge_libtest_invoker_lookup") == 3);
+    CHECK_NOTHROW(SourceWithAST {bridge_prelude + output.bridge});
   }
 }
 
