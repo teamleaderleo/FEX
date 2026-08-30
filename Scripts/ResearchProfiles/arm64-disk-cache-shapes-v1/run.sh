@@ -14,7 +14,6 @@ cache_root="${work_root}/cache"
 receipts="${FEX_RESEARCH_RECEIPTS}"
 guest_path="${rootfs}/opt/fex-ci/disk-cache-guest"
 active_pid=""
-ccache_stats_log="${work_root}/ccache-stats.log"
 
 cleanup() {
   if test -n "${active_pid}" && kill -0 "${active_pid}" 2>/dev/null; then
@@ -49,11 +48,9 @@ export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-1Gi}"
 export CCACHE_NAMESPACE="${CCACHE_NAMESPACE:-teamleaderleo-fex-arm64-research-v1}"
 export CCACHE_NOHASHDIR="${CCACHE_NOHASHDIR:-true}"
 export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS:-time_macros}"
-export CCACHE_STATSLOG="${ccache_stats_log}"
 mkdir -p "${CCACHE_DIR}"
-: > "${ccache_stats_log}"
-chmod 600 "${ccache_stats_log}"
 ccache --show-config > "${receipts}/ccache-config.txt"
+ccache --zero-stats
 
 configure_started_ns="$(date +%s%N)"
 
@@ -72,10 +69,8 @@ cmake --build "${build_root}" --target FEX FEXServer -- \
   }
 build_finished_ns="$(date +%s%N)"
 
-ccache --print-log-stats --format=json > "${receipts}/ccache-stats.json"
-rm -f "${ccache_stats_log}"
-unset CCACHE_STATSLOG
-python3 - "${receipts}/ccache-stats.json" "${receipts}/compiler-cache-observation.json" \
+ccache --print-stats > "${receipts}/ccache-stats.tsv"
+python3 - "${receipts}/ccache-stats.tsv" "${receipts}/compiler-cache-observation.json" \
   "${configure_started_ns}" "${configure_finished_ns}" "${build_finished_ns}" <<'PY'
 import json
 import sys
@@ -83,7 +78,12 @@ from pathlib import Path
 
 stats_path, output_path = map(Path, sys.argv[1:3])
 configure_started_ns, configure_finished_ns, build_finished_ns = map(int, sys.argv[3:])
-stats = json.loads(stats_path.read_text(encoding="utf-8"))
+stats = {}
+for line in stats_path.read_text(encoding="utf-8").splitlines():
+    key, separator, value = line.partition("\t")
+    if not separator or key in stats:
+        raise SystemExit(f"invalid ccache statistics row: {line!r}")
+    stats[key] = int(value)
 direct_hits = stats["direct_cache_hit"]
 preprocessed_hits = stats["preprocessed_cache_hit"]
 misses = stats["cache_miss"]

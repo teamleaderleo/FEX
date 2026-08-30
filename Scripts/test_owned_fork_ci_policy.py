@@ -178,6 +178,16 @@ class OwnedForkCIPolicyTest(unittest.TestCase):
         )
         self.assertNotIn("/build\n", workflow)
 
+        profile = (
+            REPO_ROOT
+            / "Scripts"
+            / "ResearchProfiles"
+            / "arm64-disk-cache-shapes-v1"
+            / "run.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ccache --print-stats", profile)
+        self.assertNotIn("ccache --print-log-stats", profile)
+
 
 if __name__ == "__main__":
     unittest.main()
