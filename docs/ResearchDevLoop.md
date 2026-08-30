@@ -174,6 +174,22 @@ unrelated CMake errors. It does not update submodules automatically because doin
 worktree and can erase the provenance distinction between the requested source and the environment
 that happened to be present.
 
+Ordinary focused actions validate the same recursive identity without treating a retained manifest,
+stamp, mtime or cache as source authority. Before the focused command, the helper reads each
+repository's current index, requires its checked-in `.gitmodules` blob paths to match the
+mode-`160000` gitlinks exactly, and compares every current-user submodule gitfile's detached `HEAD`
+with that parent gitlink. A child with a checked-in `.gitmodules` file is then queried the same way;
+leaves require no Git child process. Exact HEAD reads bracket this recursive observation. The
+resulting sorted commit/path digest is identical to the explicit setup receipt.
+
+The mandatory post-command porcelain-v2 observation records the final exact HEAD and dirty bit, so
+ordinary source, `.gitmodules` or submodule worktree edits remain feedback-only rather than reusable
+exact-head evidence. Index conflicts are refused directly. Named compatibility layouts such as an
+old-form submodule repository or symbolic submodule `HEAD` use Git's existing recursive porcelain.
+Malformed Git output, unsafe paths/files, duplicate or unmapped links and unsafe Gitdir placement
+remain hard errors even if recursive porcelain happens to look clean. A deinitialized top-level or
+nested repository therefore still fails closed with the existing recovery command.
+
 ### Discover the configured target and test names
 
 An established lane can search its configured CMake targets and CTest registry before you decide
