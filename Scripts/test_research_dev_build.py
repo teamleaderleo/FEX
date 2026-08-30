@@ -173,6 +173,180 @@ class ResearchDevBuildTest(unittest.TestCase):
 
         self.assertEqual(command[-4:], ["--target", "vulkan-host-64", "--parallel", "8"])
 
+    def test_plan_parser_and_command_are_exact_dry_run(self):
+        args = dev_build.parser().parse_args(["plan", "vulkan-host-64"])
+        self.assertEqual((args.action, args.target), ("plan", "vulkan-host-64"))
+        with mock.patch.object(dev_build, "required_tool", return_value="/tool/ninja"):
+            command = dev_build.ninja_plan_command(
+                Path("/lane/build"), Path("/lane/build/.plan.ninja"), args.target
+            )
+            with self.assertRaises(ValueError):
+                dev_build.ninja_plan_command(
+                    Path("/lane/build"), Path("/lane/build/.plan.ninja"), "--all"
+                )
+
+        self.assertEqual(command[0], "/tool/ninja")
+        self.assertIn("-n", command)
+        self.assertEqual(command[-1], "vulkan-host-64")
+
+    def test_shadow_plan_manifest_removes_only_verify_edge_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            manifest = build / "build.ninja"
+            manifest.write_text(
+                "rule VERIFY_GLOBS\n  command = cmake -P VerifyGlobs.cmake\n"
+                "rule RERUN_CMAKE\n  command = cmake --regenerate-during-build\n"
+                "build verify.force: phony\n"
+                "build verify.stamp: VERIFY_GLOBS | verify.force\n  pool = console\n\n"
+                "build build.ninja: RERUN_CMAKE verify.stamp | CMakeLists.txt\n"
+                "  pool = console\n\n"
+                "build object.o: CXX source.cpp\n",
+                encoding="utf-8",
+            )
+            with dev_build.shadow_plan_manifest(build) as shadow:
+                payload = shadow.read_text(encoding="utf-8")
+                shadow_path = shadow
+                self.assertNotIn(": VERIFY_GLOBS ", payload)
+                self.assertIn("rule FEX_PLAN_RERUN_CMAKE", payload)
+                self.assertIn(": FEX_PLAN_RERUN_CMAKE ", payload)
+                self.assertIn(f"build {shadow}:", payload)
+                self.assertNotIn("build build.ninja: RERUN_CMAKE", payload)
+                self.assertIn("build object.o: CXX source.cpp", payload)
+            self.assertFalse(shadow_path.exists())
+            self.assertIn(": VERIFY_GLOBS ", manifest.read_text(encoding="utf-8"))
+
+    def test_shadow_plan_manifest_rejects_unknown_regeneration_shape(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            (build / "build.ninja").write_text("build object.o: CXX source.cpp\n")
+            with self.assertRaisesRegex(RuntimeError, "unsupported Ninja regeneration graph"):
+                with dev_build.shadow_plan_manifest(build):
+                    self.fail("unsupported graph must not yield")
+
+    def test_parse_ninja_plan_counts_and_flags_cmake_regeneration(self):
+        plan = dev_build.parse_ninja_plan(
+            "ninja: Entering directory `/lane/build'\n"
+            "[1/2] Building CXX object object.o\n"
+            "[2/2] Linking CXX executable tool\n",
+            "ninja explain: source.cpp is dirty\n",
+        )
+        self.assertEqual(plan["plannedSteps"], 2)
+        self.assertEqual(plan["reasons"], 1)
+        self.assertFalse(plan["requiresCMakeRegeneration"])
+
+        stale = dev_build.parse_ninja_plan(
+            f"[1/1] {dev_build.PLAN_REGEN_DESCRIPTION}\n", ""
+        )
+        self.assertTrue(stale["requiresCMakeRegeneration"])
+
+    def test_plan_lane_requires_current_source_graph_and_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            other = root / "other"
+            lane = root / "lane"
+            build = lane / "build"
+            source.mkdir()
+            other.mkdir()
+            build.mkdir(parents=True)
+            os.symlink(source, lane / "src", target_is_directory=True)
+            (build / "build.ninja").write_text("", encoding="utf-8")
+            expected = dev_build.expected_profile("namespace")
+            dev_build.write_receipt(lane / "profile.json", expected)
+
+            dev_build.require_plan_lane(
+                source, lane / "src", build, lane / "profile.json", expected
+            )
+            with self.assertRaisesRegex(RuntimeError, "refuses to switch"):
+                dev_build.require_plan_lane(
+                    other, lane / "src", build, lane / "profile.json", expected
+                )
+
+    def test_plan_action_emits_receipt_without_replacing_build_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            cache = root / "cache"
+            lane = cache / "views" / "preview"
+            build = lane / "build"
+            source.mkdir()
+            build.mkdir(parents=True)
+            os.symlink(source, lane / "src", target_is_directory=True)
+            (build / "CMakeFiles").mkdir()
+            (build / "CMakeFiles" / "VerifyGlobs.cmake").write_text("", encoding="utf-8")
+            (build / "build.ninja").write_text(
+                "rule VERIFY_GLOBS\n  command = cmake -P VerifyGlobs.cmake\n"
+                "rule RERUN_CMAKE\n  command = cmake --regenerate-during-build\n"
+                "build verify.force: phony\n"
+                "build verify.stamp: VERIFY_GLOBS | verify.force\n\n"
+                "build build.ninja: RERUN_CMAKE verify.stamp | CMakeLists.txt\n\n"
+                "build tool: phony object.o\n",
+                encoding="utf-8",
+            )
+            for name, payload in (
+                (".ninja_log", "log\n"),
+                (".ninja_deps", "deps\n"),
+                ("last-receipt.json", '{"prior": true}\n'),
+            ):
+                (build / name if name.startswith(".ninja") else lane / name).write_text(
+                    payload, encoding="utf-8"
+                )
+            expected = dev_build.expected_profile("namespace")
+            dev_build.write_receipt(lane / "profile.json", expected)
+            before = (lane / "last-receipt.json").read_bytes()
+            output = __import__("io").StringIO()
+
+            def runner(command, **kwargs):
+                if command[-2:] == ["-P", str(build / "CMakeFiles" / "VerifyGlobs.cmake")]:
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                self.assertIn("-n", command)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="[1/1] Linking CXX executable tool\n",
+                    stderr="ninja explain: object.o is dirty\n",
+                )
+
+            with mock.patch.object(dev_build, "require_pinned_submodules"):
+                with mock.patch.object(
+                    dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"
+                ):
+                    with mock.patch.object(
+                        dev_build,
+                        "environment",
+                        return_value={
+                            "CCACHE_NAMESPACE": "namespace",
+                            "CCACHE_SLOPPINESS": "time_macros",
+                        },
+                    ):
+                        with mock.patch.object(
+                            dev_build,
+                            "source_identity",
+                            return_value={"head": "a" * 40, "dirty": True},
+                        ):
+                            with mock.patch.object(dev_build.subprocess, "run", side_effect=runner):
+                                with mock.patch("sys.stdout", output):
+                                    result = dev_build.main(
+                                        [
+                                            "--source",
+                                            str(source),
+                                            "--cache-root",
+                                            str(cache),
+                                            "--lane",
+                                            "preview",
+                                            "plan",
+                                            "tool",
+                                        ]
+                                    )
+
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(result, 0)
+            self.assertEqual(receipt["plan"]["plannedSteps"], 1)
+            self.assertTrue(receipt["protectedStateUnchanged"])
+            self.assertFalse(receipt["targetCommandsExecuted"])
+            self.assertEqual((lane / "last-receipt.json").read_bytes(), before)
+            self.assertEqual(list(build.glob(".fex-plan-*.ninja")), [])
+
     def test_submodule_action_uses_bounded_parallel_shallow_update(self):
         with mock.patch.object(dev_build, "required_tool", return_value="/tool/git"):
             command = dev_build.submodule_update_command(Path("/worktree"), 16)

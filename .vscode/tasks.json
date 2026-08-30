@@ -16,6 +16,13 @@
       "problemMatcher": []
     },
     {
+      "label": "FEX: explain one target rebuild",
+      "type": "process",
+      "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
+      "args": ["--lane", "editor", "plan", "${input:fexTarget}"],
+      "problemMatcher": []
+    },
+    {
       "label": "FEX: build one target",
       "type": "process",
       "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",

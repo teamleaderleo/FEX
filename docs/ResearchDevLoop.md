@@ -119,6 +119,35 @@ exports that setting explicitly because the CMake 4.2/Ninja launcher observed on
 timestamp, as intended by that repository policy. A target build does not claim a full build or
 full-test pass.
 
+### Explain a rebuild before spending it
+
+On an already configured lane, preview the exact pending target edges without compiling, linking,
+generating or testing:
+
+```sh
+./Scripts/ResearchDevBuild.py --lane vulkan plan vulkan-host-64
+```
+
+`plan` requires that the lane already points to the requested source and has the exact current
+profile marker. It never creates, switches, cleans or configures a lane. It runs CMake's generated
+glob comparison, then gives Ninja a private temporary manifest that removes only the glob check's
+always-dirty force edge. The real CMake-input regeneration relationship remains in the shadow graph.
+If a `CMakeLists.txt`, configured glob or other CMake input changed, the command exits 2 and asks for
+normal regeneration instead of reporting a stale downstream plan. A never-built graph may also
+fail closed when its dynamic-dependency files do not exist yet.
+
+The JSON receipt reports the exact source head/dirty state, profile, lane and target; glob-check and
+plan durations; pending edge/reason counts; and bounded samples with stable source/build path
+placeholders. A no-op reports zero steps. An ordinary source edit names the compile, archive and
+link chain it would trigger. Ninja runs with `-n`; the helper hashes `.ninja_log`, `.ninja_deps` and
+the last build/check receipt before and after, refuses any change, removes the private manifest and
+does not overwrite the last successful receipt. The CMake glob sentinel is the only permitted
+state change.
+
+This predicts Ninja's current work graph, not elapsed build time or ccache hit/miss outcome. Use it
+to decide whether the selected owner is unexpectedly broad; use the real focused build for timing
+and compiler-cache evidence. VS Code exposes the same command as **FEX: explain one target rebuild**.
+
 ### Build one owner and run one exact CTest
 
 When the smallest useful check is already registered with CTest, keep the target build and test
@@ -213,6 +242,7 @@ After preparation:
 
 - use `F12` for definition, `Shift+F12` for references and `Ctrl+P`, then `#`, for symbols;
 - press `Ctrl+Shift+B` for **FEX: build one target** and enter the exact CMake target;
+- run **FEX: explain one target rebuild** first when the pending owner chain is unclear;
 - run **FEX: build target and run one exact CTest** when a focused host-side test owns the oracle;
 - run **FEX: show editor lane receipt** before reporting what was built;
 - use the Run and Debug pane with GDB or LLDB only after identifying a runnable x86-host test or
