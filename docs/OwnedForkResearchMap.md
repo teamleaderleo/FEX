@@ -1,8 +1,8 @@
 # Owned-fork FEX research map
 
 Reviewed against owned-fork main
-[`66f88dd3a`](https://github.com/teamleaderleo/FEX/commit/66f88dd3ac323ceb7890cae92b27c09b7338a0fb)
-on 2026-08-30. This is a reading and experiment router for `teamleaderleo/FEX`, not an upstream
+[`16dbe0b2d`](https://github.com/teamleaderleo/FEX/commit/16dbe0b2d9f0e0abdaf35a9cdc65da9609458ea2)
+on 2026-08-31. This is a reading and experiment router for `teamleaderleo/FEX`, not an upstream
 submission plan and not a claim that every thunk or Vulkan lifetime problem is solved.
 
 If the starting question is “which fork PRs should I learn, and in what order?” use the
@@ -20,10 +20,10 @@ boundaries. Identify that boundary before changing code or choosing an oracle.
 | The same native address H is registered for a newer guest invoker, but later dispatch reaches the old one | synthetic CustomIR registry plus exact shared/thread cache retirement | merged exact-identity rebind transaction | [Callback lifetime map](LinuxFieldworkLifetimeMap.md) |
 | A native library retained a guest executable address after its ordinary wrapper unloaded | already-escaped executable ownership | measured GL and Vulkan companions; other libraries not adopted | [Resident thunk bridges](ResidentThunkBridge.md), [GL companion](GLResidentCompanion.md), and [Vulkan companion](VulkanResidentCompanion.md) |
 | `MREMAP_FIXED` replaced code at D, but execution at D used the old translation | guest virtual-memory mutation versus translated-code cache | merged destination invalidation for the focused fixed-remap sequence | [Fixed-remap destination cache](MremapFixedDestinationCache.md) |
-| A whole-file code cache was generated under different JIT settings or host features | cache namespace and offline-compiler configuration agreement | owned-fork configuration identity and fail-closed compiler handshake | [Whole-file code-cache identity](WholeFileCodeCacheIdentity.md) |
-| A block-level Fossilize cache lookup is corrupt, slow or confused with whole-file caching | per-block bucket/key identity, bounded blob/index layout and live publication | format-3 blobs are bounded before spans, torn writable index suffixes resume at the valid prefix and the next writer reclaims only an unreferenced physical data tail; interior compaction and allocation/runtime measurement remain separate | [Block-level Fossilize disk cache](BlockDiskCache.md) |
+| A whole-file code cache was generated under different JIT settings or host features | cache namespace and offline-compiler configuration agreement | owned-fork configuration identity, canonical snapshot transport, fail-closed compiler reconstruction and a lightweight seven-case owner | [Whole-file code-cache identity](WholeFileCodeCacheIdentity.md) |
+| A block-level Fossilize cache lookup is corrupt, slow or confused with whole-file caching | per-block bucket/key identity, bounded blob/index layout and live publication | format-3 blobs are bounded before spans, torn writable index suffixes resume at the valid prefix, the next writer reclaims only an unreferenced physical data tail and a read-only analyzer accounts physical extents; the real recovery owner is lightweight, while interior compaction and allocation/runtime measurement remain separate | [Block-level Fossilize disk cache](BlockDiskCache.md) |
 | GLX string-return thunks fail to compile under Clang 21 | fixed-width guest layout versus signed host character pointer conversion | merged shared host-layout conversion and two focused generator guards | [PR #25](https://github.com/teamleaderleo/FEX/pull/25) |
-| A new chat needs to configure, build or test something | environment, exact source and smallest owner | `doctor`, stable external lanes, one target and one literal CTest are merged | [Owned-fork development loop](ResearchDevLoop.md) |
+| A new chat needs to configure, build or test something | environment, exact source and smallest owner | `doctor`, stable external lanes, one target or one producer-owned CTest set, and lightweight cache identity/recovery owners are merged | [Owned-fork development loop](ResearchDevLoop.md) |
 
 Do not begin with a broad FEX build or suite merely because the symptom is unfamiliar. Most rows
 have a static inventory, generator case, one host target or one ARM profile that answers the first
@@ -123,10 +123,11 @@ file. Generator output, build integration and product adoption are three separat
 
 The whole-file code-cache configuration binding is separately explained in
 [Whole-file code-cache identity](WholeFileCodeCacheIdentity.md). It namespaces cached host code by
-the effective generated-code configuration, bitness and host features; independently rejects an
-offline compiler that cannot reproduce the requested identity; and stores the identity in the
-cache header. It does not transport app-specific configuration to the compiler, so a mismatch is a
-safe refusal rather than proof that every configured application can use whole-file caching.
+the effective generated-code configuration, bitness and host features. The client transports a
+bounded canonical app-specific snapshot and effective host features to the offline compiler; the
+compiler reconstructs and independently checks the requested identity before compiling, and the
+cache header stores that identity for the runtime consumer. Malformed, partial or mismatched
+snapshots fail closed.
 
 These are not callback-lifetime fixes. They are listed here because both can otherwise be mistaken
 for a reason to widen a thunk/cache experiment.
@@ -160,6 +161,8 @@ for a reason to widen a thunk/cache experiment.
 | GL unload/reload lifetime | checked-in `gl-resident-companion-v1` ARM profile |
 | Vulkan unload/reload lifetime | checked-in `vulkan-resident-companion-v1` ARM profile |
 | fixed-remap destination semantics | exact `smc-2.64` ARM case |
+| whole-file cache identity/snapshot | focused `FEXCore_Tests_CodeCacheConfig` check-set |
+| block-cache blob/index layout | focused parser owner; use `FEXCore_Tests_DiskCacheIndexRecovery` only for file/lock/recovery behavior |
 
 Use the command forms and evidence boundaries in [ResearchDevLoop.md](ResearchDevLoop.md). Reuse an
 accepted exact-head result when source, toolchain, inputs and relevant environment are unchanged.
