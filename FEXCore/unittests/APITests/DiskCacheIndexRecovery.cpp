@@ -49,6 +49,23 @@ std::vector<uint64_t> IndexHashes(const DiskCache::Index& Index) {
   return Result;
 }
 
+void AppendDataOnlyRecord(const std::filesystem::path& CachePath, const DiskCache::MesaFOZ::foz_payload_key& Key,
+                          std::span<const uint8_t> Blob) {
+  std::ofstream CacheFile(CachePath, std::ios::binary | std::ios::app);
+  REQUIRE(CacheFile.good());
+
+  const DiskCache::MesaFOZ::foz_payload_header Header {
+    .payload_size = static_cast<uint32_t>(Blob.size()),
+    .format = 1,
+    .crc = 0,
+    .uncompressed_size = static_cast<uint32_t>(Blob.size()),
+  };
+  CacheFile.write(reinterpret_cast<const char*>(Key.bytes), sizeof(Key.bytes));
+  CacheFile.write(reinterpret_cast<const char*>(&Header), sizeof(Header));
+  CacheFile.write(reinterpret_cast<const char*>(Blob.data()), Blob.size());
+  REQUIRE(CacheFile.good());
+}
+
 } // namespace
 
 TEST_CASE("DiskCacheIndexRecovery - a real writable database replaces its torn suffix") {
@@ -161,6 +178,76 @@ TEST_CASE("DiskCacheIndexRecovery - a stale writer rechecks another handle's com
     FinalDB.PopulateIndex(FinalIndex, FoundMetadata);
     REQUIRE(IndexHashes(FinalIndex) == std::vector<uint64_t> {0xA, 0xB, 0xC});
   }
+}
+
+TEST_CASE("DiskCacheIndexRecovery - the next writer reclaims a trailing unindexed data record") {
+  const auto Unique = std::chrono::steady_clock::now().time_since_epoch().count();
+  TempTree Temp {.Path = std::filesystem::temp_directory_path() / fmt::format("fex-data-tail-recovery-{}", Unique)};
+  REQUIRE(std::filesystem::create_directory(Temp.Path));
+
+  const auto BasePathString = (Temp.Path / "RWCacheDB").string();
+  const fextl::string FEXBasePath {BasePathString.c_str()};
+  const auto CachePath = std::filesystem::path {BasePathString + ".foz"};
+  const auto KeyA = MakeKey(0xA);
+  const auto OrphanKey = MakeKey(0xB);
+  const auto KeyC = MakeKey(0xC);
+  const std::array<uint8_t, 32> BlobA {0xA};
+  const std::array<uint8_t, 47> OrphanBlob {0xB};
+  const std::array<uint8_t, 64> BlobC {0xC};
+
+  {
+    DiskCache::IndexedDB DB;
+    DiskCache::Index Index;
+    std::mutex IndexMutex;
+    bool FoundMetadata = false;
+    REQUIRE(DB.Open(FEXBasePath, false));
+    DB.PopulateIndex(Index, FoundMetadata);
+    REQUIRE(DB.StoreCacheBlob(KeyA, BlobA, Index, IndexMutex));
+  }
+
+  constexpr uintmax_t DataRecordOverhead =
+    sizeof(DiskCache::MesaFOZ::foz_payload_key) + sizeof(DiskCache::MesaFOZ::foz_payload_header);
+  const auto ReferencedSize = std::filesystem::file_size(CachePath);
+  AppendDataOnlyRecord(CachePath, OrphanKey, OrphanBlob);
+  const auto OrphanedSize = std::filesystem::file_size(CachePath);
+  REQUIRE(OrphanedSize == ReferencedSize + DataRecordOverhead + OrphanBlob.size());
+
+  {
+    DiskCache::IndexedDB ReadOnly;
+    DiskCache::Index Index;
+    bool FoundMetadata = false;
+    REQUIRE(ReadOnly.Open(FEXBasePath, true));
+    ReadOnly.PopulateIndex(Index, FoundMetadata);
+    REQUIRE(IndexHashes(Index) == std::vector<uint64_t> {0xA});
+  }
+  REQUIRE(std::filesystem::file_size(CachePath) == OrphanedSize);
+
+  {
+    DiskCache::IndexedDB Writer;
+    DiskCache::Index Index;
+    std::mutex IndexMutex;
+    bool FoundMetadata = false;
+    REQUIRE(Writer.Open(FEXBasePath, false));
+    Writer.PopulateIndex(Index, FoundMetadata);
+    REQUIRE(IndexHashes(Index) == std::vector<uint64_t> {0xA});
+    REQUIRE(Writer.StoreCacheBlob(KeyC, BlobC, Index, IndexMutex));
+  }
+
+  REQUIRE(std::filesystem::file_size(CachePath) == ReferencedSize + DataRecordOverhead + BlobC.size());
+
+  DiskCache::IndexedDB Restarted;
+  DiskCache::Index RestartedIndex;
+  bool FoundMetadata = false;
+  REQUIRE(Restarted.Open(FEXBasePath, true));
+  Restarted.PopulateIndex(RestartedIndex, FoundMetadata);
+  REQUIRE(IndexHashes(RestartedIndex) == std::vector<uint64_t> {0xA, 0xC});
+
+  std::array<uint8_t, BlobA.size()> ReadbackA {};
+  REQUIRE(Restarted.ReadCacheBlob(RestartedIndex.at(0xA).Offset, ReadbackA));
+  REQUIRE(ReadbackA == BlobA);
+  std::array<uint8_t, BlobC.size()> ReadbackC {};
+  REQUIRE(Restarted.ReadCacheBlob(RestartedIndex.at(0xC).Offset, ReadbackC));
+  REQUIRE(ReadbackC == BlobC);
 }
 
 TEST_CASE("DiskCacheIndexRecovery - a minimal block blob retains nonzero guest identity") {

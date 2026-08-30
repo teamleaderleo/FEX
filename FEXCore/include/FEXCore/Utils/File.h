@@ -275,6 +275,16 @@ public:
 #endif
   }
 
+  bool Truncate(uint64_t Size) {
+#ifndef _WIN32
+    return ftruncate(Handle, Size) == 0;
+#else
+    FILE_END_OF_FILE_INFO EndOfFile {};
+    EndOfFile.EndOfFile.QuadPart = Size;
+    return SetFileInformationByHandle(Handle, FileEndOfFileInfo, &EndOfFile, sizeof(EndOfFile));
+#endif
+  }
+
   /**
    * @brief Seek the file pointer location.
    *
