@@ -98,6 +98,39 @@ class OwnedForkCIPolicyTest(unittest.TestCase):
                 self.assertEqual(separator, "@")
                 self.assertRegex(revision, r"^[0-9a-f]{40}$")
 
+    def test_research_tooling_lane_is_path_scoped_and_product_free(self) -> None:
+        workflow = self.workflow("research-tooling.yml")
+        pull_request_scope = workflow.split("permissions:", 1)[0]
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("pull_request:", workflow)
+        self.assertNotIn("\n  push:", workflow)
+        self.assertIn("- Scripts/ResearchDevBuild.py", pull_request_scope)
+        self.assertIn("- Scripts/test_*.py", pull_request_scope)
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            workflow,
+        )
+        self.assertIn("runs-on: ubuntu-24.04", workflow)
+        self.assertIn("RunResearchToolingTests.py --jobs 4", workflow)
+        for forbidden in (
+            "ResearchDevBuild.py submodules",
+            "ResearchProfileCarrier.py run",
+            "cmake ",
+            "ctest ",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+
+    def test_research_tooling_lane_actions_are_commit_pinned(self) -> None:
+        workflow = self.workflow("research-tooling.yml")
+        actions = re.findall(r"^\s*uses:\s+([^\s#]+)", workflow, flags=re.MULTILINE)
+        self.assertTrue(actions)
+        for action in actions:
+            with self.subTest(action=action):
+                _, separator, revision = action.rpartition("@")
+                self.assertEqual(separator, "@")
+                self.assertRegex(revision, r"^[0-9a-f]{40}$")
+
     def test_arm64_lane_is_manual_exact_sha_and_profile_only(self) -> None:
         workflow = self.workflow("focused-arm64-research.yml")
         self.assertIn("workflow_dispatch:", workflow)

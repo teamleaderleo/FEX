@@ -28,6 +28,17 @@ Before configuring anything on a new machine or chat container, inspect the loca
 ./Scripts/ResearchDevBuild.py doctor
 ```
 
+When the thing being edited is the fork's Python research machinery rather than FEX product code,
+use its separate bounded check:
+
+```sh
+python3 Scripts/RunResearchToolingTests.py
+```
+
+That command runs only the closed `Scripts/test_*.py` research-tooling inventory. Independent files
+run concurrently; logs remain in a stable order. It does not initialize submodules, configure
+CMake, compile FEX, run CTest, launch a guest, or establish ARM64 product evidence.
+
 `doctor` is read-only. Its JSON receipt reports the exact source head/dirty state, recursive pinned
 submodule digest, required tool paths, host architecture, and three deliberately separate outcomes:
 focused x86-host build/CTest preflight, whether a dirty tree limits the result to developer
