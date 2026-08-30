@@ -326,6 +326,27 @@ evidence, point the lane at a dedicated clean worktree, make no concurrent edits
 worktree identity after the command before publishing the receipt. A dirty receipt is developer
 feedback, not an exact-head acceptance record.
 
+When the executable target owns several independently registered CTests, let the configured build
+and test registries compose the set instead of hand-writing a regular expression or copying names:
+
+```sh
+./Scripts/ResearchDevBuild.py --lane code-cache check-set FEXCore_Tests_CodeCacheFile
+```
+
+`check-set` builds that one target, asks Ninja to resolve its phony target alias to exactly one
+concrete executable inside the lane, then selects every CTest whose configured command's first
+argument is exactly that artifact path. It sorts the unique literal names, requires each once in
+the generated CMake test registry, writes them to a private temporary file, and uses CTest's
+`--tests-from-file` selector. It refuses an empty set, aliases with zero or multiple concrete
+artifacts, libraries and other non-executables, symlinked or out-of-build artifacts, wrappers,
+duplicate/malformed registry rows, and sets larger than 256 tests. Those refusals are intentional:
+the command does not guess ownership from filenames, source dependencies, labels or test names.
+
+The receipt records both registry digests, the concrete artifact, sorted selected names/count,
+fixed selection limit, exact head/dirty state and separate build, selection and test timings. This
+is still evidence for only that executable's configured host-side CTests, never a suite-level or
+ARM-runtime claim.
+
 When the question needs an x86 guest Linux test binary, select the bounded profile explicitly:
 
 ```sh
@@ -362,6 +383,12 @@ the actual `fresh`, `incremental` or `reuse` mode; do not infer it from target t
 
 Use different lane names for simultaneous experiments. Do not share one active lane.
 
+Do not run `git submodule deinit` from a linked FEX worktree as a cleanup step. Linked worktrees
+share the superproject's submodule configuration, so deinitializing a retired worktree can make the
+canonical checkout appear uninitialized too. After resolving the exact owner, path and cleanliness,
+remove the exact linked worktree with Git's worktree command; `--force` may be necessary because Git
+otherwise refuses even a clean linked worktree that contains populated submodules.
+
 List every retained lane before reusing or cleaning one:
 
 ```sh
@@ -396,6 +423,8 @@ After preparation:
   other linked owner;
 - run **FEX: explain one target rebuild** first when the pending owner chain is unclear;
 - run **FEX: build target and run one exact CTest** when a focused host-side test owns the oracle;
+- run **FEX: build target and run its exact CTest set** when one executable owns several focused
+  registered cases;
 - run **FEX: show editor lane receipt** before reporting what was built;
 - use the Run and Debug pane with GDB or LLDB only after identifying a runnable x86-host test or
   tool. The main FEX runtime still requires an ARM64 execution environment.

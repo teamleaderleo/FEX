@@ -34,6 +34,8 @@ DISCOVERY_QUERY_LIMIT = 128
 DISCOVERY_DEFAULT_RESULTS = 32
 DISCOVERY_MAX_RESULTS = 64
 DISCOVERY_REGISTRY_LIMIT = 32 * 1024 * 1024
+NINJA_QUERY_LIMIT = 1024 * 1024
+EXACT_CTEST_SET_LIMIT = 256
 CCACHE_STATS_OUTPUT_LIMIT = 64 * 1024
 CCACHE_STATS_LOG_LIMIT = 1024 * 1024
 GIT_INSPECTION_OUTPUT_LIMIT = 32 * 1024 * 1024
@@ -107,7 +109,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description=(
             "Initialize sources, compile one exact file, discover/plan/build one exact FEX target, "
-            "or run one exact CTest."
+            "run one exact CTest, or derive one target's bounded exact CTest set."
         )
     )
     result.add_argument("--lane", default="dev", help="isolated stable-path lane name")
@@ -209,6 +211,14 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument(
         "--jobs", type=positive_int, default=min(os.cpu_count() or 1, 16), help="build workers"
     )
+    check_set = subparsers.add_parser(
+        "check-set",
+        help="build one named executable target and run every exact CTest it owns",
+    )
+    check_set.add_argument("target", help="exact executable target, for example thunkgentest")
+    check_set.add_argument(
+        "--jobs", type=positive_int, default=min(os.cpu_count() or 1, 16), help="build workers"
+    )
     linux_test = subparsers.add_parser(
         "linux-test-build",
         help="build FEX prerequisites plus one exact guest Linux test binary",
@@ -243,6 +253,12 @@ def validate_lane(raw: str) -> str:
 def validate_linux_test(raw: str) -> str:
     if not LINUX_TEST_PATTERN.fullmatch(raw):
         raise ValueError("Linux test must be one exact target basename")
+    return raw
+
+
+def validate_target(raw: str) -> str:
+    if not LINUX_TEST_PATTERN.fullmatch(raw):
+        raise ValueError("target must be one exact target name")
     return raw
 
 
@@ -503,6 +519,54 @@ def ctest_show_only_command(build: Path) -> list[str]:
     ]
 
 
+def ninja_query_command(build: Path, target: str) -> list[str]:
+    return [required_tool("ninja"), "-C", str(build), "-t", "query", target]
+
+
+def configured_target_artifact(build: Path, target: str, payload: str) -> Path:
+    if len(payload.encode("utf-8")) > NINJA_QUERY_LIMIT:
+        raise RuntimeError("Ninja target query exceeded the bounded output limit")
+    lines = payload.splitlines()
+    if (
+        len(lines) < 4
+        or lines[0] != f"{target}:"
+        or lines[1] != "  input: phony"
+        or lines[-1] != "  outputs:"
+    ):
+        raise RuntimeError(f"unsupported Ninja target query shape: {target}")
+    dependencies = []
+    for line in lines[2:-1]:
+        match = re.fullmatch(r"    (\S+)", line)
+        if match is None:
+            raise RuntimeError(f"unsupported Ninja target dependency: {target}")
+        dependencies.append(match.group(1))
+    if len(dependencies) != 1:
+        raise RuntimeError(
+            f"target must bind to exactly one concrete artifact: {target}"
+        )
+    relative = PurePosixPath(dependencies[0])
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise RuntimeError(f"unsafe Ninja target artifact: {dependencies[0]}")
+    build_root = build.resolve(strict=True)
+    candidate = build_root.joinpath(*relative.parts)
+    try:
+        metadata = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(build_root)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            f"target artifact is unavailable or outside the build: {target}"
+        ) from error
+    if (
+        candidate != resolved
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o111 == 0
+    ):
+        raise RuntimeError(f"target artifact is not a private executable: {target}")
+    return resolved
+
+
 def configured_test_registry(payload: str) -> dict[str, object]:
     if len(payload.encode("utf-8")) > DISCOVERY_REGISTRY_LIMIT:
         raise RuntimeError("CTest discovery registry exceeded the bounded output limit")
@@ -553,6 +617,31 @@ def configured_test_registry(payload: str) -> dict[str, object]:
     return {
         "digest": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
         "tests": records,
+    }
+
+
+def configured_ctest_set(
+    payload: str, artifact: Path, limit: int = EXACT_CTEST_SET_LIMIT
+) -> dict[str, object]:
+    registry = configured_test_registry(payload)
+    document = json.loads(payload)
+    selected = []
+    artifact_text = str(artifact)
+    for test in document["tests"]:
+        command = test.get("command")
+        if command is not None and command[0] == artifact_text:
+            selected.append(test["name"])
+    selected.sort(key=lambda name: (name.casefold(), name))
+    if not selected:
+        raise RuntimeError("target artifact owns no exact configured CTests")
+    if len(selected) > limit:
+        raise RuntimeError(
+            f"target owns {len(selected)} CTests, exceeding the bounded limit of {limit}"
+        )
+    return {
+        "digest": registry["digest"],
+        "registeredTests": len(registry["tests"]),
+        "selectedTests": selected,
     }
 
 
@@ -1089,6 +1178,7 @@ def doctor_receipt(
             "./Scripts/ResearchDevBuild.py --lane editor compile SOURCE.cpp",
             "./Scripts/ResearchDevBuild.py --lane NAME build TARGET",
             "./Scripts/ResearchDevBuild.py --lane NAME check TARGET EXACT_CTEST",
+            "./Scripts/ResearchDevBuild.py --lane NAME check-set TARGET",
             "./Scripts/ResearchDevBuild.py --lane editor editor",
         ]
         if local_preflight_ready
@@ -2013,7 +2103,15 @@ def lane_inventory(cache_root: Path) -> dict[str, object]:
             if isinstance(receipt, dict):
                 receipt_summary = {
                     key: receipt.get(key)
-                    for key in ("format", "head", "dirty", "target", "test", "exitCode")
+                    for key in (
+                        "format",
+                        "head",
+                        "dirty",
+                        "target",
+                        "test",
+                        "selectedTestCount",
+                        "exitCode",
+                    )
                 }
             records.append(
                 {
@@ -2567,6 +2665,120 @@ def main(argv: list[str] | None = None) -> int:
                     "test": test,
                     "selectedTests": selected_tests,
                     "testRegistry": registry_receipt,
+                    "head": identity["head"],
+                    "dirty": identity["dirty"],
+                    "submoduleValidation": preflight["submoduleValidation"],
+                    "sourceSwitched": switched,
+                    "configurationMode": configure_mode,
+                    "setupElapsedSeconds": round(setup_elapsed, 6),
+                    "jobs": args.jobs,
+                    "buildElapsedSeconds": round(build_elapsed, 6),
+                    "selectionElapsedSeconds": round(selection_elapsed, 6),
+                    "testElapsedSeconds": round(test_elapsed, 6),
+                    "elapsedSeconds": round(time.monotonic() - started, 6),
+                    "exitCode": completed.returncode,
+                    "cacheNamespace": env["CCACHE_NAMESPACE"],
+                    "ccacheSloppiness": env["CCACHE_SLOPPINESS"],
+                }
+                write_receipt(receipt_path, receipt)
+                print(json.dumps(receipt, sort_keys=True))
+                return completed.returncode
+            if args.action == "check-set":
+                target = validate_target(args.target)
+                print(
+                    f"scope=FOCUSED_CTEST_SET profile={args.profile} lane={lane} "
+                    f"target={target} head={source_head} dirty=checked_after"
+                )
+                print(
+                    "one exact executable target and its bounded exact CTest set are selected; "
+                    "other targets and tests are not implied"
+                )
+                sys.stdout.flush()
+                started = time.monotonic()
+                build_started = time.monotonic()
+                completed = subprocess.run(command, env=env)
+                build_elapsed = time.monotonic() - build_started
+                selection_elapsed = 0.0
+                test_elapsed = 0.0
+                selected_tests: list[str] = []
+                artifact: Path | None = None
+                configured_receipt: dict[str, object] | None = None
+                generated_receipt: dict[str, object] | None = None
+                if completed.returncode == 0:
+                    selection_started = time.monotonic()
+                    query = subprocess.run(
+                        ninja_query_command(build, target),
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                    )
+                    query_bytes = len(query.stdout.encode("utf-8")) + len(
+                        query.stderr.encode("utf-8")
+                    )
+                    if query_bytes > NINJA_QUERY_LIMIT:
+                        raise RuntimeError(
+                            "Ninja exact target query exceeded the bounded output limit"
+                        )
+                    if query.returncode != 0 or query.stderr:
+                        raise RuntimeError("Ninja exact target artifact query failed")
+                    artifact = configured_target_artifact(build, target, query.stdout)
+                    ctest = subprocess.run(
+                        ctest_show_only_command(build),
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if ctest.returncode != 0:
+                        raise RuntimeError("CTest exact target registry enumeration failed")
+                    output_bytes = len(ctest.stdout.encode("utf-8")) + len(
+                        ctest.stderr.encode("utf-8")
+                    )
+                    if output_bytes > DISCOVERY_REGISTRY_LIMIT:
+                        raise RuntimeError(
+                            "CTest exact target registry exceeded the bounded output limit"
+                        )
+                    configured = configured_ctest_set(ctest.stdout, artifact)
+                    selected_tests = configured.pop("selectedTests")
+                    configured_receipt = configured
+                    generated = generated_ctest_registry(build)
+                    generated_names = generated.pop("names")
+                    generated_receipt = generated
+                    mismatches = {
+                        name: generated_names.count(name)
+                        for name in selected_tests
+                        if generated_names.count(name) != 1
+                    }
+                    if mismatches:
+                        raise RuntimeError(
+                            f"exact target CTest generated-registry mismatch: {mismatches}"
+                        )
+                    selection_elapsed = time.monotonic() - selection_started
+                    with tempfile.TemporaryDirectory(
+                        prefix=".focused-ctest-set-", dir=lane_root
+                    ) as temporary:
+                        names = Path(temporary) / "tests.txt"
+                        names.write_text(
+                            "".join(f"{name}\n" for name in selected_tests),
+                            encoding="utf-8",
+                        )
+                        test_started = time.monotonic()
+                        completed = subprocess.run(ctest_command(build, names), env=env)
+                        test_elapsed = time.monotonic() - test_started
+                identity = source_identity(source)
+                if identity["head"] != source_head:
+                    raise RuntimeError("source HEAD changed during the focused CTest set")
+                receipt = {
+                    "format": "teamleaderleo-fex-x86-host-check-set-receipt-v1",
+                    "profile": profile_id,
+                    "requestedProfile": args.profile,
+                    "lane": lane,
+                    "target": target,
+                    "targetArtifact": str(artifact) if artifact is not None else None,
+                    "selectedTests": selected_tests,
+                    "selectedTestCount": len(selected_tests),
+                    "configuredTestRegistry": configured_receipt,
+                    "generatedTestRegistry": generated_receipt,
+                    "selectionLimit": EXACT_CTEST_SET_LIMIT,
                     "head": identity["head"],
                     "dirty": identity["dirty"],
                     "submoduleValidation": preflight["submoduleValidation"],
