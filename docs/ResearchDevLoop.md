@@ -326,9 +326,11 @@ VS Code is a good FEX editor when it is treated as a view over the same explicit
 a second build system. Install the recommended clangd, CMake Tools and Microsoft C/C++ extensions,
 open the repository root, then run **Terminal → Run Task → FEX: prepare editor lane** once.
 
-The task configures the external `editor` lane when needed and writes an ignored
-`compile_commands.json` at the worktree root. That file tells clangd the real compiler flags for
-every translation unit. The helper translates the stable cache-view source paths back to the open
+The task configures the external `editor` lane when needed, runs only the lightweight `CONFIG_INC`
+and `IR_INC` generator targets, and writes an ignored `compile_commands.json` at the worktree root.
+Those two targets create the configuration and IR headers needed by most source parses; they do not
+compile or link a FEX product. The database tells clangd the real compiler flags for every
+translation unit. The helper translates the stable cache-view source paths back to the open
 worktree; this is why simply symlinking the external compilation database is not equivalent.
 
 After preparation:
@@ -355,8 +357,9 @@ Command-line users get the same setup with:
 
 Re-run `editor` after pulling or switching commits, changing CMake structure, switching the lane to
 another worktree or changing the build profile. On an existing lane it performs an incremental CMake
-regeneration before exporting the database; it does not throw away the warm object tree. Ordinary
-edits inside already-known source files do not require regenerating the database.
+regeneration and refreshes those two generated-header targets before exporting the database; it does
+not throw away the warm object tree or build a product target. Ordinary edits inside already-known
+source files do not require regenerating the database.
 
 ## Measured big-red checkpoint
 

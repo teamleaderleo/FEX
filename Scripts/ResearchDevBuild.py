@@ -34,6 +34,13 @@ DISCOVERY_QUERY_LIMIT = 128
 DISCOVERY_DEFAULT_RESULTS = 32
 DISCOVERY_MAX_RESULTS = 64
 DISCOVERY_REGISTRY_LIMIT = 32 * 1024 * 1024
+EDITOR_GENERATED_TARGETS = ("CONFIG_INC", "IR_INC")
+EDITOR_GENERATED_OUTPUTS = (
+    Path("include/FEXCore/Config/ConfigValues.inl"),
+    Path("include/FEXCore/Config/ConfigOptions.inl"),
+    Path("include/FEXCore/IR/IRDefines.inc"),
+    Path("include/FEXCore/IR/IRDefines_Dispatch.inc"),
+)
 DOCTOR_TOOLS = (
     "git",
     "cmake",
@@ -1074,6 +1081,25 @@ def write_editor_compile_commands(
     return len(entries)
 
 
+def editor_prerequisites_command(build: Path) -> list[str]:
+    """Generate the small headers required by most FEX editor parses."""
+    return [
+        required_tool("cmake"),
+        "--build",
+        str(build),
+        "--target",
+        *EDITOR_GENERATED_TARGETS,
+        "--parallel",
+        str(len(EDITOR_GENERATED_TARGETS)),
+    ]
+
+
+def verify_editor_prerequisites(build: Path) -> None:
+    missing = [str(path) for path in EDITOR_GENERATED_OUTPUTS if not (build / path).is_file()]
+    if missing:
+        raise RuntimeError("editor prerequisite targets omitted outputs: " + ", ".join(missing))
+
+
 def expected_profile(
     cache_namespace: str,
     profile: str = PROFILE,
@@ -1627,6 +1653,14 @@ def main(argv: list[str] | None = None) -> int:
                         env=env,
                     )
                     configure_mode = "incremental"
+                prerequisites_started = time.monotonic()
+                subprocess.run(
+                    editor_prerequisites_command(build),
+                    check=True,
+                    env=env,
+                )
+                verify_editor_prerequisites(build)
+                prerequisites_elapsed = time.monotonic() - prerequisites_started
                 destination = source / "compile_commands.json"
                 count = write_editor_compile_commands(
                     source_view, source, build, destination
@@ -1634,6 +1668,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     f"editor lane={lane} entries={count} "
                     f"configuration={configure_mode} "
+                    f"generated_headers={len(EDITOR_GENERATED_OUTPUTS)} "
+                    f"prerequisites_seconds={prerequisites_elapsed:.6f} "
                     f"compile_commands={destination} build={build}"
                 )
                 return 0
