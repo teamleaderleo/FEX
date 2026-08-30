@@ -151,9 +151,11 @@ int main(void) {
   if (map_has((void*)get0, "/usr/lib/x86_64-linux-gnu/libvulkan.so.1", 1) != 0) return 7;
   if (!maps_contain("/libfex-vulkan-bridge.so")) return 8;
   if (!maps_contain("/libX11.so.6")) return 9;
+  if (maps_contain("/usr/lib/x86_64-linux-gnu/libvulkan.so.1")) return 18;
   const struct map_memory bridge_memory = map_memory_for("/libfex-vulkan-bridge.so");
   fprintf(stderr, "BRIDGE_AFTER_CLOSE mappings=%u rss_kib=%ld pss_kib=%ld\n",
           bridge_memory.mappings, bridge_memory.rss_kib, bridge_memory.pss_kib);
+  reserve_old_wrapper();
 
   version = 0;
   if (version0(&version) != VK_SUCCESS || version != VK_MAKE_API_VERSION(0, 1, 3, 151)) return 10;
@@ -166,7 +168,6 @@ int main(void) {
   fprintf(stderr, "RESIDENT_VULKAN_XLIB_CALLBACK_AFTER_CLOSE_OK\n");
   free(display);
 
-  reserve_old_wrapper();
   void* wrapper2 = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
   if (!wrapper2) {
     fprintf(stderr, "RELOAD_FAIL %s\n", dlerror());
