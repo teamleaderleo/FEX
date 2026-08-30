@@ -254,6 +254,9 @@ public:
    */
   virtual uint64_t GetConfigId() const = 0;
 
+  /** Returns the effective host feature state included in GetConfigId(). */
+  virtual uint64_t GetHostFeaturesHash() const = 0;
+
   /**
    * Computes a unique identifier for the referenced binary file to be used for
    * generating the code map.

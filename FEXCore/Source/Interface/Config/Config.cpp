@@ -18,7 +18,9 @@
 #include <FEXHeaderUtils/Filesystem.h>
 
 #include <array>
+#include <charconv>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <stddef.h>
 #include <stdint.h>
@@ -551,6 +553,103 @@ fextl::string SerializeForCache() {
 #define OPT_STRENUM(group, enum, json, default)  // Unsupported.
 #include <FEXCore/Config/ConfigValues.inl>
   return Config;
+}
+
+template<typename T>
+static bool IsCanonicalCacheValue(std::string_view Value) {
+  if constexpr (std::is_same_v<T, fextl::string>) {
+    return true;
+  } else if constexpr (std::is_same_v<T, bool>) {
+    return Value == "true" || Value == "false";
+  } else {
+    using ParsedType = std::conditional_t<std::is_signed_v<T>, int64_t, uint64_t>;
+    ParsedType Parsed {};
+    const auto Result = std::from_chars(Value.data(), Value.data() + Value.size(), Parsed, 10);
+    if (Value.empty() || Result.ec != std::errc {} || Result.ptr != Value.data() + Value.size()) {
+      return false;
+    }
+    if constexpr (std::is_signed_v<T>) {
+      if (Parsed < std::numeric_limits<T>::min() || Parsed > std::numeric_limits<T>::max()) {
+        return false;
+      }
+    } else if (Parsed > std::numeric_limits<T>::max()) {
+      return false;
+    }
+    return fextl::fmt::format("{}", static_cast<T>(Parsed)) == Value;
+  }
+}
+
+bool ApplySerializedForCache(std::string_view Config) {
+  if (Config.empty() || Config.size() > MAX_SERIALIZED_CACHE_CONFIG_SIZE) {
+    return false;
+  }
+
+  struct PendingValue {
+    ConfigOption Option;
+    fextl::string Value;
+  };
+  fextl::vector<PendingValue> Pending;
+  std::string_view Remaining = Config;
+
+  const auto ReadField = [&Remaining]() -> std::optional<std::string_view> {
+    const auto End = Remaining.find('\0');
+    if (End == std::string_view::npos) {
+      return std::nullopt;
+    }
+    const auto Field = Remaining.substr(0, End);
+    Remaining.remove_prefix(End + 1);
+    return Field;
+  };
+
+  const auto Consume = [&]<typename T, ConfigOption Option>(std::string_view ExpectedKey) -> bool {
+    const auto Key = ReadField();
+    const auto SerializedOption = ReadField();
+    const auto Value = ReadField();
+    if (!Key || !SerializedOption || !Value || *Key != ExpectedKey || !IsCanonicalCacheValue<T>(*Value)) {
+      return false;
+    }
+
+    uint64_t ParsedOption {};
+    const auto Result = std::from_chars(SerializedOption->data(), SerializedOption->data() + SerializedOption->size(), ParsedOption, 10);
+    if (SerializedOption->empty() || Result.ec != std::errc {} || Result.ptr != SerializedOption->data() + SerializedOption->size() ||
+        ParsedOption != FEXCore::ToUnderlying(Option) || fextl::fmt::format("{}", ParsedOption) != *SerializedOption) {
+      return false;
+    }
+
+    if constexpr (std::is_same_v<T, bool>) {
+      // The cache format uses fmt's canonical bool spelling, while the
+      // configuration conversion layer accepts numeric booleans.
+      Pending.emplace_back(Option, *Value == "true" ? "1" : "0");
+    } else {
+      Pending.emplace_back(Option, fextl::string {*Value});
+    }
+    return true;
+  };
+
+#define OPT_BASE(type, group, enum, json, default)                                                                               \
+  if (Config_AffectsCodeGen[FEXCore::ToUnderlying(CONFIG_##enum)] && !Consume.template operator()<type, CONFIG_##enum>(#json)) { \
+    return false;                                                                                                                \
+  }
+#define OPT_STR(group, enum, json, default) OPT_BASE(fextl::string, group, enum, json, default)
+#define OPT_STRARRAY(group, enum, json, default)                                                                                        \
+  static_assert(!Config_AffectsCodeGen[FEXCore::ToUnderlying(CONFIG_##enum)], "codegen-affecting string arrays need a canonical cache " \
+                                                                              "serialization");
+#define OPT_STRENUM(group, enum, json, default)                                                                                            \
+  static_assert(CONFIG_##enum == CONFIG_HOSTFEATURES || !Config_AffectsCodeGen[FEXCore::ToUnderlying(CONFIG_##enum)], "codegen-affecting " \
+                                                                                                                      "string enums need " \
+                                                                                                                      "an effective "      \
+                                                                                                                      "cache "             \
+                                                                                                                      "representation");
+#include <FEXCore/Config/ConfigValues.inl>
+
+  if (!Remaining.empty()) {
+    return false;
+  }
+
+  for (auto& [Option, Value] : Pending) {
+    Set(Option, std::move(Value));
+  }
+  return true;
 }
 
 FEX_DEFAULT_VISIBILITY bool CheckConfigMatches(std::string_view Config) {

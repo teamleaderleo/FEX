@@ -409,7 +409,8 @@ static FEXCore::HostFeatures FetchOfflineCompilerHostFeatures(bool Is64Bit) {
 
 // Returns filename of generated cache on success
 static std::optional<std::string> GenerateSingleCache(FEXCore::ExecutableFileInfo& Binary, std::optional<uint64_t> ExpectedConfigId,
-                                                      fextl::set<uintptr_t> BlockList, std::string_view OutDir) {
+                                                      std::optional<uint64_t> ExpectedHostFeaturesHash, fextl::set<uintptr_t> BlockList,
+                                                      std::string_view OutDir) {
 #ifndef _WIN32
   ELFCodeLoader Loader(Binary.Filename.c_str(), -1, "", fextl::vector<fextl::string> {Binary.Filename.c_str()},
                        fextl::vector<fextl::string> {}, nullptr, nullptr, true /* skip interpreter */);
@@ -424,6 +425,9 @@ static std::optional<std::string> GenerateSingleCache(FEXCore::ExecutableFileInf
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, Is64Bit ? "1" : "0");
 
   auto HostFeatures = FetchOfflineCompilerHostFeatures(Is64Bit);
+  if (ExpectedHostFeaturesHash) {
+    HostFeatures.ApplyCacheHash(*ExpectedHostFeaturesHash);
+  }
 
   auto CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
   const uint64_t CodeCacheConfigId = CTX->GetCodeCache().GetConfigId();
@@ -563,6 +567,10 @@ static int GenerateCache(int argc, const char** argv) {
   Parser.add_option("--outdir").set_default(FEX::Config::GetCacheDirectory() + "cache").help("Output directory for generated cache files");
   Parser.add_option("--fileid").help("Select binary to generate cache for");
   Parser.add_option("--config-id").set_default("").help("Require an exact 16-digit code-generation configuration identity");
+#ifndef _WIN32
+  Parser.add_option("--config-fd").set_default("").help("Read a canonical code-generation configuration snapshot from this inherited FD");
+  Parser.add_option("--host-features").set_default("").help("Require an exact 16-digit effective host-feature state");
+#endif
 
   optparse::Values Options = Parser.parse_args(argc, argv);
   if (Parser.args().size() != 1) {
@@ -583,6 +591,61 @@ static int GenerateCache(int argc, const char** argv) {
     }
     ExpectedConfigId = ParsedConfigId;
   }
+
+  std::optional<uint64_t> ExpectedHostFeaturesHash;
+  std::optional<fextl::string> SerializedConfig;
+#ifndef _WIN32
+  const fextl::string ConfigFDArgument {static_cast<const char*>(Options.get("config_fd"))};
+  const fextl::string HostFeaturesArgument {static_cast<const char*>(Options.get("host_features"))};
+  if (!ConfigFDArgument.empty() || !HostFeaturesArgument.empty()) {
+    if (ConfigFDArgument.empty() || HostFeaturesArgument.empty() || !ExpectedConfigId) {
+      fmt::print(stderr, "--config-fd and --host-features require each other and --config-id\n");
+      return 1;
+    }
+
+    int ConfigFD {};
+    const auto FDResult = std::from_chars(ConfigFDArgument.data(), ConfigFDArgument.data() + ConfigFDArgument.size(), ConfigFD, 10);
+    if (ConfigFDArgument.empty() || FDResult.ec != std::errc {} || FDResult.ptr != ConfigFDArgument.data() + ConfigFDArgument.size() ||
+        ConfigFD < 0 || (ConfigFDArgument.size() > 1 && ConfigFDArgument.front() == '0')) {
+      fmt::print(stderr, "Invalid --config-fd: expected a canonical non-negative descriptor\n");
+      return 1;
+    }
+
+    uint64_t ParsedHostFeatures {};
+    const auto HostResult =
+      std::from_chars(HostFeaturesArgument.data(), HostFeaturesArgument.data() + HostFeaturesArgument.size(), ParsedHostFeatures, 16);
+    if (HostFeaturesArgument.size() != 16 || HostResult.ec != std::errc {} ||
+        HostResult.ptr != HostFeaturesArgument.data() + HostFeaturesArgument.size()) {
+      fmt::print(stderr, "Invalid --host-features: expected exactly 16 hexadecimal digits\n");
+      return 1;
+    }
+    ExpectedHostFeaturesHash = ParsedHostFeatures;
+
+    fextl::string Snapshot(FEXCore::Config::MAX_SERIALIZED_CACHE_CONFIG_SIZE + 1, '\0');
+    size_t Size {};
+    while (Size < Snapshot.size()) {
+      const auto Result = ::read(ConfigFD, Snapshot.data() + Size, Snapshot.size() - Size);
+      if (Result > 0) {
+        Size += Result;
+      } else if (Result == 0) {
+        break;
+      } else if (errno == EINTR) {
+        continue;
+      } else {
+        fmt::print(stderr, "Could not read code-generation configuration snapshot\n");
+        close(ConfigFD);
+        return 1;
+      }
+    }
+    close(ConfigFD);
+    if (Size == 0 || Size > FEXCore::Config::MAX_SERIALIZED_CACHE_CONFIG_SIZE) {
+      fmt::print(stderr, "Invalid code-generation configuration snapshot size\n");
+      return 1;
+    }
+    Snapshot.resize(Size);
+    SerializedConfig = std::move(Snapshot);
+  }
+#endif
 
   std::ifstream Codemap(CodeMapPath.c_str(), std::ios_base::binary);
   if (!Codemap) {
@@ -639,9 +702,13 @@ static int GenerateCache(int argc, const char** argv) {
   char* envp[] = {nullptr};
   FEXCore::Config::Shutdown();
   FEX::Config::LoadConfig("", envp, PortableInfo);
+  if (SerializedConfig && !FEXCore::Config::ApplySerializedForCache(*SerializedConfig)) {
+    fmt::print(stderr, "Invalid code-generation configuration snapshot\n");
+    return 1;
+  }
 
   auto NumBlocks = Data.at(ProgramName).size();
-  auto GeneratedCache = GenerateSingleCache(ProgramName, ExpectedConfigId, Data.at(ProgramName), OutDir);
+  auto GeneratedCache = GenerateSingleCache(ProgramName, ExpectedConfigId, ExpectedHostFeaturesHash, Data.at(ProgramName), OutDir);
   if (GeneratedCache) {
     fmt::print("Successfully populated cache {} ({} blocks) via {}\n\n", GeneratedCache.value(), NumBlocks,
                std::filesystem::path {CodeMapPath}.filename().string());

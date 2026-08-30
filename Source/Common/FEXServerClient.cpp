@@ -4,6 +4,7 @@
 #include "FDUtils.h"
 #include "Common/FEXServerClient.h"
 
+#include <FEXCore/Config/Config.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/FileLoading.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -16,6 +17,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <linux/limits.h>
+#include <limits>
 #include <unistd.h>
 #include <poll.h>
 #include <sys/prctl.h>
@@ -419,7 +421,13 @@ int RequestPIDFD(int ServerSocket) {
   return RequestPIDFDPacket(ServerSocket, PacketType::TYPE_GET_PID_FD);
 }
 
-void PopulateCodeCache(int ServerSocket, int ProgramFD, bool HasMultiblock, uint64_t ConfigId) {
+void PopulateCodeCache(int ServerSocket, int ProgramFD, bool HasMultiblock, uint64_t ConfigId, uint64_t HostFeaturesHash,
+                       std::string_view SerializedConfig) {
+  if (SerializedConfig.empty() || SerializedConfig.size() > FEXCore::Config::MAX_SERIALIZED_CACHE_CONFIG_SIZE ||
+      SerializedConfig.size() > std::numeric_limits<uint32_t>::max()) {
+    return;
+  }
+
   fasio::error ec;
   fasio::tcp_socket Socket {ServerSocket};
 
@@ -429,12 +437,17 @@ void PopulateCodeCache(int ServerSocket, int ProgramFD, bool HasMultiblock, uint
       .Header {.Type = HasMultiblock ? PacketType::TYPE_POPULATE_CODE_CACHE : PacketType::TYPE_POPULATE_CODE_CACHE_NO_MULTIBLOCK},
       .Reserved = 0,
       .ConfigId = ConfigId,
+      .HostFeaturesHash = HostFeaturesHash,
+      .ConfigSize = static_cast<uint32_t>(SerializedConfig.size()),
+      .Reserved2 = 0,
     },
   };
 
-  fasio::mutable_buffer WriteBuffer {std::as_writable_bytes(std::span {&Req.CodeCacheRequest, 1})};
-  WriteBuffer.FD = &ProgramFD;
-  write(Socket, WriteBuffer, ec);
+  fasio::mutable_buffer WriteBuffers[] = {
+    {.Data = std::as_writable_bytes(std::span {&Req.CodeCacheRequest, 1}), .FD = &ProgramFD},
+    {.Data = std::as_writable_bytes(std::span {const_cast<char*>(SerializedConfig.data()), SerializedConfig.size()})},
+  };
+  write(Socket, Chained(WriteBuffers), ec);
   if (ec != fasio::error::success) {
     return;
   }

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <type_traits>
@@ -231,7 +232,9 @@ FEX_DEFAULT_VISIBILITY std::optional<T> GetConv(ConfigOption Option);
 FEX_DEFAULT_VISIBILITY std::optional<fextl::string*> Get(ConfigOption Option);
 FEX_DEFAULT_VISIBILITY void Set(ConfigOption Option, std::string_view Data);
 FEX_DEFAULT_VISIBILITY void Erase(ConfigOption Option);
+inline constexpr size_t MAX_SERIALIZED_CACHE_CONFIG_SIZE = 64 * 1024;
 FEX_DEFAULT_VISIBILITY fextl::string SerializeForCache();
+FEX_DEFAULT_VISIBILITY bool ApplySerializedForCache(std::string_view Config);
 FEX_DEFAULT_VISIBILITY bool CheckConfigMatches(std::string_view Config);
 
 template<typename T>
