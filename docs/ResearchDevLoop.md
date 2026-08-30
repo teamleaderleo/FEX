@@ -398,6 +398,19 @@ canonical checkout appear uninitialized too. After resolving the exact owner, pa
 remove the exact linked worktree with Git's worktree command; `--force` may be necessary because Git
 otherwise refuses even a clean linked worktree that contains populated submodules.
 
+Treat a fresh canonical-checkout `doctor` result as the postcondition of linked-worktree cleanup;
+an old `compile_commands.json` or retained lane receipt does not prove current submodule readiness.
+If `doctor` reports only that the pinned submodules are not ready, restore their exact registrations
+and commits through the existing caches, then rerun the read-only check:
+
+```sh
+./Scripts/ResearchDevBuild.py submodules --origin-cache --pack-cache
+./Scripts/ResearchDevBuild.py doctor
+```
+
+This repairs the canonical checkout's declared pins. It does not validate, recover or authorize
+deletion of the retired worktree or any build lane.
+
 List every retained lane before reusing or cleaning one:
 
 ```sh
