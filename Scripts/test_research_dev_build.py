@@ -1091,6 +1091,54 @@ class ResearchDevBuildTest(unittest.TestCase):
             "incremental",
         )
 
+    def test_same_worktree_stale_provenance_uses_bounded_refresh(self):
+        self.assertEqual(
+            dev_build.configuration_mode(
+                "build",
+                switched=False,
+                build_configured=True,
+                profile_compatible=True,
+                provenance_compatible=False,
+            ),
+            "provenance-refresh",
+        )
+
+    def test_configured_git_hash_accepts_only_one_exact_owned_header(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            generated = build / "generated"
+            generated.mkdir()
+            header = generated / "git_version.h"
+            expected = "0123456789abcdef0123456789abcdef01234567"
+            fields = ", ".join(
+                f"0x{expected[index:index + 2]}" for index in range(0, len(expected), 2)
+            )
+            header.write_text(
+                "#pragma once\n"
+                f"static constexpr std::array<uint8_t, 20> GIT_HASH = {{{fields}, }};\n",
+                encoding="ascii",
+            )
+
+            self.assertEqual(dev_build.configured_git_hash(build), expected)
+            self.assertTrue(dev_build.configured_provenance_matches(build, expected.upper()))
+            header.write_text(
+                "static constexpr std::array<uint8_t, 20> GIT_HASH = {0x01};\n",
+                encoding="ascii",
+            )
+            self.assertIsNone(dev_build.configured_git_hash(build))
+            self.assertFalse(dev_build.configured_provenance_matches(build, expected))
+            duplicate = (
+                f"static constexpr std::array<uint8_t, 20> GIT_HASH = {{{fields}, }};\n"
+            )
+            header.write_text(duplicate + duplicate, encoding="ascii")
+            self.assertIsNone(dev_build.configured_git_hash(build))
+
+    def test_missing_configured_provenance_is_not_a_warm_match(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            self.assertIsNone(dev_build.configured_git_hash(build))
+            self.assertFalse(dev_build.configured_provenance_matches(build, "a" * 40))
+
     def test_configuration_mode_keeps_fail_closed_fresh_cases(self):
         self.assertEqual(
             dev_build.configuration_mode(

@@ -756,6 +756,58 @@ def source_identity(source: Path) -> dict[str, object]:
     }
 
 
+def configured_git_hash(build: Path) -> str | None:
+    """Return the exact Git hash embedded by CMake, or None for an unsafe/stale header."""
+    path = build / "generated" / "git_version.h"
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size > 16 * 1024
+        ):
+            return None
+        payload = os.read(descriptor, 16 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) != metadata.st_size:
+        return None
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    matches = list(
+        re.finditer(
+            r"^\s*static constexpr std::array<uint8_t,\s*20>\s+GIT_HASH\s*=\s*\{([^}]*)\};\s*$",
+            text,
+            re.MULTILINE,
+        )
+    )
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    fields = [field.strip() for field in match.group(1).split(",") if field.strip()]
+    if len(fields) != 20:
+        return None
+    values = []
+    for field in fields:
+        byte = re.fullmatch(r"0x([0-9A-Fa-f]{1,2})", field)
+        if byte is None:
+            return None
+        values.append(f"{int(byte.group(1), 16):02x}")
+    return "".join(values)
+
+
+def configured_provenance_matches(build: Path, head: str) -> bool:
+    return bool(re.fullmatch(r"[0-9A-Fa-f]{40}", head)) and configured_git_hash(
+        build
+    ) == head.lower()
+
+
 def doctor_git_output(
     git: str,
     source: Path,
@@ -1345,12 +1397,15 @@ def configuration_mode(
     switched: bool,
     build_configured: bool,
     profile_compatible: bool,
+    provenance_compatible: bool = True,
 ) -> str:
     """Choose fresh, incremental, or reused configuration without weakening profile checks."""
     if action == "configure" or not build_configured or not profile_compatible:
         return "fresh"
     if switched:
         return "incremental"
+    if not provenance_compatible:
+        return "provenance-refresh"
     return "reuse"
 
 
@@ -1644,11 +1699,13 @@ def main(argv: list[str] | None = None) -> int:
                     focused_linux_test_build(build, 64),
                 ),
             )
+            source_head = git_output(source, "rev-parse", "HEAD")
             configure_mode = configuration_mode(
                 args.action,
                 switched,
                 (build / "build.ninja").is_file(),
                 profile_matches(profile_path, profile_marker),
+                configured_provenance_matches(build, source_head),
             )
             if configure_mode == "fresh":
                 subprocess.run(
@@ -1657,11 +1714,15 @@ def main(argv: list[str] | None = None) -> int:
                     env=env,
                 )
                 write_receipt(profile_path, profile_marker)
-            elif configure_mode == "incremental":
+            elif configure_mode in {"incremental", "provenance-refresh"}:
                 subprocess.run(
                     reconfigure_command(source_view, build, configure_options),
                     check=True,
                     env=env,
+                )
+            if not configured_provenance_matches(build, source_head):
+                raise RuntimeError(
+                    "configured git_version.h does not match the source HEAD after configuration"
                 )
             if args.action == "configure":
                 print(f"configured lane={lane} source={source} build={build}")
@@ -1682,6 +1743,8 @@ def main(argv: list[str] | None = None) -> int:
 
             setup_elapsed = time.monotonic() - setup_started
             identity = source_identity(source)
+            if identity["head"] != source_head:
+                raise RuntimeError("source HEAD changed while preparing the build lane")
             if args.action == "linux-test-build":
                 if args.profile != "linux-tests":
                     raise ValueError("linux-test-build action requires --profile linux-tests")
