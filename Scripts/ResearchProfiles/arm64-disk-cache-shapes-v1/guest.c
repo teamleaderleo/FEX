@@ -50,7 +50,7 @@ static __attribute__((noinline)) u64 branchy(u64 value, u64 iteration) {
   }
 }
 
-void _start(void) {
+__attribute__((force_align_arg_pointer, noreturn)) void _start(void) {
   static const char marker[] = "FEX_DISK_CACHE_GUEST_OK\n";
   struct timespec pause = {5, 0};
   u64 value = 0x123456789abcdef0UL;
@@ -60,7 +60,7 @@ void _start(void) {
   observed = value;
   syscall3(1, 1, (long)marker, sizeof(marker) - 1);
   syscall3(35, (long)&pause, 0, 0);
-  syscall3(60, 0, 0, 0);
+  syscall3(231, 0, 0, 0);
   for (;;) {
   }
 }
