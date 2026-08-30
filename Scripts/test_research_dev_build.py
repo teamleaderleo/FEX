@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -421,6 +422,28 @@ class ResearchDevBuildTest(unittest.TestCase):
             dev_build.write_receipt(lane / "profile.json", profile)
             output = __import__("io").StringIO()
             completed = subprocess.CompletedProcess(["cmake", "--build"], 0)
+            empty_stats = {
+                "cache_miss": 0,
+                "compile_failed": 0,
+                "direct_cache_hit": 0,
+                "preprocessed_cache_hit": 0,
+                "max_cache_size_kibibyte": 1024,
+                "stats_updated_timestamp": 123,
+            }
+            build_environment = {
+                "CCACHE_NAMESPACE": "namespace",
+                "CCACHE_SLOPPINESS": "time_macros",
+            }
+
+            def run(command, **kwargs):
+                if "--print-log-stats" in command:
+                    return subprocess.CompletedProcess(
+                        command, 0, stdout=json.dumps(empty_stats), stderr=""
+                    )
+                stats_log = Path(kwargs["env"]["CCACHE_STATSLOG"])
+                self.assertTrue(stats_log.is_file())
+                self.assertEqual(stat.S_IMODE(stats_log.stat().st_mode), 0o600)
+                return completed
 
             with mock.patch.object(dev_build, "require_pinned_submodules"):
                 with mock.patch.object(
@@ -429,10 +452,7 @@ class ResearchDevBuildTest(unittest.TestCase):
                     with mock.patch.object(
                         dev_build,
                         "environment",
-                        return_value={
-                            "CCACHE_NAMESPACE": "namespace",
-                            "CCACHE_SLOPPINESS": "time_macros",
-                        },
+                        return_value=build_environment,
                     ):
                         with mock.patch.object(dev_build, "git_output", return_value="a" * 40):
                             with mock.patch.object(
@@ -444,8 +464,8 @@ class ResearchDevBuildTest(unittest.TestCase):
                                     return_value={"head": "a" * 40, "dirty": True},
                                 ):
                                     with mock.patch.object(
-                                        dev_build.subprocess, "run", return_value=completed
-                                    ) as run:
+                                        dev_build.subprocess, "run", side_effect=run
+                                    ) as run_mock:
                                         with mock.patch("sys.stdout", output):
                                             result = dev_build.main(
                                                 [
@@ -473,8 +493,103 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertEqual(receipt["head"], "a" * 40)
         self.assertTrue(receipt["dirty"])
         self.assertEqual(receipt["exitCode"], 0)
-        command = run.call_args.args[0]
+        self.assertEqual(receipt["cacheObservation"]["result"], "not_invoked")
+        self.assertFalse(receipt["cacheObservation"]["rawLogRetained"])
+        self.assertNotIn("CCACHE_STATSLOG", build_environment)
+        build_calls = [
+            call for call in run_mock.call_args_list if "--print-log-stats" not in call.args[0]
+        ]
+        self.assertEqual(len(build_calls), 1)
+        command = build_calls[0].args[0]
         self.assertEqual(command[-4:], ["--target", object_target, "--parallel", "4"])
+        self.assertFalse(any(lane.glob(".compile-cache-*")))
+
+    def test_ccache_stats_json_classifies_outcomes_and_preserves_events(self):
+        base = {
+            "cache_miss": 0,
+            "compile_failed": 0,
+            "direct_cache_hit": 0,
+            "preprocessed_cache_hit": 0,
+            "max_cache_size_kibibyte": 1024,
+            "stats_updated_timestamp": 123,
+        }
+
+        def classify(**updates):
+            counters = {**base, **updates}
+            return dev_build.parse_ccache_stats_json(json.dumps(counters))
+
+        self.assertEqual(classify()["result"], "not_invoked")
+        direct = classify(direct_cache_hit=1, local_storage_hit=1)
+        self.assertEqual(direct["result"], "direct_hit")
+        self.assertEqual(direct["eventCounters"]["local_storage_hit"], 1)
+        self.assertNotIn("max_cache_size_kibibyte", direct["eventCounters"])
+        self.assertEqual(classify(preprocessed_cache_hit=1)["result"], "preprocessed_hit")
+        self.assertEqual(classify(cache_miss=1)["result"], "cache_miss")
+        self.assertEqual(classify(compile_failed=1)["result"], "compile_failed")
+        self.assertEqual(classify(called_for_link=1)["result"], "uncacheable")
+        multiple = classify(direct_cache_hit=1, cache_miss=1)
+        self.assertEqual(multiple["result"], "multiple_invocations")
+        self.assertEqual(multiple["cacheableCalls"], 2)
+
+    def test_ccache_stats_json_refuses_malformed_oversized_and_invalid_counters(self):
+        core = {
+            "cache_miss": 0,
+            "compile_failed": 0,
+            "direct_cache_hit": 0,
+            "preprocessed_cache_hit": 0,
+        }
+        invalid = (
+            "not json",
+            "[]",
+            json.dumps({"cache_miss": 0}),
+            json.dumps({**core, "bad": -1}),
+            json.dumps({**core, "bad": True}),
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload[:40]):
+                with self.assertRaises(RuntimeError):
+                    dev_build.parse_ccache_stats_json(payload)
+        with mock.patch.object(dev_build, "CCACHE_STATS_OUTPUT_LIMIT", 8):
+            with self.assertRaisesRegex(RuntimeError, "bounded"):
+                dev_build.parse_ccache_stats_json(json.dumps(core))
+
+    def test_compile_cache_observation_is_private_isolated_and_deleted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            lane = Path(temporary)
+            caller_env = {"CCACHE_STATSLOG": "/caller/log", "KEEP": "yes"}
+            calls = []
+
+            def run(command, **kwargs):
+                calls.append((command, kwargs))
+                stats_log = Path(kwargs["env"]["CCACHE_STATSLOG"])
+                self.assertTrue(stats_log.is_file())
+                if "--print-log-stats" in command:
+                    counters = {
+                        "cache_miss": int(stats_log.stat().st_size > 0),
+                        "compile_failed": 0,
+                        "direct_cache_hit": 0,
+                        "preprocessed_cache_hit": 0,
+                    }
+                    return subprocess.CompletedProcess(
+                        command, 0, stdout=json.dumps(counters), stderr=""
+                    )
+                stats_log.write_text("# /private/source.cpp\ncache_miss\n", encoding="utf-8")
+                os.chmod(stats_log, 0o600)
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(dev_build, "required_tool", return_value="/tool/ccache"):
+                completed, observation = dev_build.run_compile_with_cache_observation(
+                    ["/tool/cmake", "--build"], caller_env, lane, run
+                )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(observation["result"], "cache_miss")
+            self.assertEqual(caller_env, {"CCACHE_STATSLOG": "/caller/log", "KEEP": "yes"})
+            self.assertEqual(len(calls), 3)
+            private_path = Path(calls[0][1]["env"]["CCACHE_STATSLOG"])
+            self.assertNotEqual(private_path, Path("/caller/log"))
+            self.assertFalse(private_path.exists())
+            self.assertFalse(any(lane.glob(".compile-cache-*")))
 
     def test_plan_parser_and_command_are_exact_dry_run(self):
         args = dev_build.parser().parse_args(["plan", "vulkan-host-64"])

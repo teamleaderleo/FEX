@@ -34,6 +34,24 @@ DISCOVERY_QUERY_LIMIT = 128
 DISCOVERY_DEFAULT_RESULTS = 32
 DISCOVERY_MAX_RESULTS = 64
 DISCOVERY_REGISTRY_LIMIT = 32 * 1024 * 1024
+CCACHE_STATS_OUTPUT_LIMIT = 64 * 1024
+CCACHE_STATS_LOG_LIMIT = 1024 * 1024
+CCACHE_CORE_COUNTERS = (
+    "cache_miss",
+    "compile_failed",
+    "direct_cache_hit",
+    "preprocessed_cache_hit",
+)
+CCACHE_GAUGE_COUNTERS = frozenset(
+    {
+        "cache_size_kibibyte",
+        "files_in_cache",
+        "max_cache_size_kibibyte",
+        "max_files_in_cache",
+        "stats_updated_timestamp",
+        "stats_zeroed_timestamp",
+    }
+)
 EDITOR_GENERATED_TARGETS = ("CONFIG_INC", "IR_INC")
 EDITOR_GENERATED_OUTPUTS = (
     Path("include/FEXCore/Config/ConfigValues.inl"),
@@ -1261,6 +1279,132 @@ def configured_compile_unit(
     }
 
 
+def create_private_ccache_stats_log(directory: Path) -> Path:
+    """Create the path-bearing per-action ccache log without following an existing name."""
+    path = directory / "stats.log"
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    os.close(descriptor)
+    return path
+
+
+def require_private_ccache_stats_log(path: Path) -> None:
+    """Refuse replaced, linked, oversized or permissive stats logs before parsing them."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise RuntimeError("cannot safely open the private ccache stats log") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > CCACHE_STATS_LOG_LIMIT
+        ):
+            raise RuntimeError("unsafe private ccache stats log")
+    finally:
+        os.close(descriptor)
+
+
+def parse_ccache_stats_json(payload: str) -> dict[str, object]:
+    """Validate bounded ccache machine output and reduce it to one compact outcome."""
+    if len(payload.encode("utf-8")) > CCACHE_STATS_OUTPUT_LIMIT:
+        raise RuntimeError("ccache stats JSON exceeded the bounded output limit")
+    try:
+        counters = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("ccache stats reader returned malformed JSON") from error
+    if not isinstance(counters, dict) or len(counters) > 256:
+        raise RuntimeError("ccache stats reader returned an invalid counter object")
+    if not all(isinstance(key, str) and key.isprintable() for key in counters):
+        raise RuntimeError("ccache stats reader returned an unsafe counter ID")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in counters.values()
+    ):
+        raise RuntimeError("ccache stats reader returned a nonnegative-integer violation")
+    missing = sorted(set(CCACHE_CORE_COUNTERS) - counters.keys())
+    if missing:
+        raise RuntimeError("ccache stats reader omitted core counters: " + ", ".join(missing))
+
+    direct_hits = counters["direct_cache_hit"]
+    preprocessed_hits = counters["preprocessed_cache_hit"]
+    misses = counters["cache_miss"]
+    compile_failures = counters["compile_failed"]
+    outcome_count = direct_hits + preprocessed_hits + misses + compile_failures
+    event_counters = {
+        key: value
+        for key, value in sorted(counters.items())
+        if value and key not in CCACHE_GAUGE_COUNTERS
+    }
+    if outcome_count > 1:
+        result = "multiple_invocations"
+    elif compile_failures == 1:
+        result = "compile_failed"
+    elif direct_hits == 1:
+        result = "direct_hit"
+    elif preprocessed_hits == 1:
+        result = "preprocessed_hit"
+    elif misses == 1:
+        result = "cache_miss"
+    elif event_counters:
+        result = "uncacheable"
+    else:
+        result = "not_invoked"
+    return {
+        "format": "teamleaderleo-fex-ccache-observation-v1",
+        "result": result,
+        "cacheableCalls": direct_hits + preprocessed_hits + misses,
+        "directHits": direct_hits,
+        "preprocessedHits": preprocessed_hits,
+        "misses": misses,
+        "compileFailures": compile_failures,
+        "eventCounters": event_counters,
+        "rawLogRetained": False,
+    }
+
+
+def read_ccache_stats_observation(
+    log_path: Path, env: dict[str, str], runner
+) -> dict[str, object]:
+    """Read one private stats log through ccache's documented machine interface."""
+    require_private_ccache_stats_log(log_path)
+    completed = runner(
+        [required_tool("ccache"), "--print-log-stats", "--format=json"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("ccache stats JSON reader failed")
+    return parse_ccache_stats_json(completed.stdout)
+
+
+def run_compile_with_cache_observation(
+    command: list[str], env: dict[str, str], lane_root: Path, runner
+) -> tuple[subprocess.CompletedProcess, dict[str, object]]:
+    """Run one object command with an action-private, path-redacted ccache observation."""
+    with tempfile.TemporaryDirectory(prefix=".compile-cache-", dir=lane_root) as temporary:
+        stats_directory = Path(temporary)
+        if stat.S_IMODE(stats_directory.stat().st_mode) != 0o700:
+            raise RuntimeError("private ccache stats directory has unsafe permissions")
+        stats_log = create_private_ccache_stats_log(stats_directory)
+        compile_env = env.copy()
+        compile_env["CCACHE_STATSLOG"] = str(stats_log)
+
+        empty = read_ccache_stats_observation(stats_log, compile_env, runner)
+        if empty["result"] != "not_invoked":
+            raise RuntimeError("new private ccache stats log was not empty")
+        completed = runner(command, env=compile_env)
+        observation = read_ccache_stats_observation(stats_log, compile_env, runner)
+    return completed, observation
+
+
 def editor_prerequisites_command(build: Path) -> list[str]:
     """Generate the small headers required by most FEX editor parses."""
     return [
@@ -1933,7 +2077,9 @@ def main(argv: list[str] | None = None) -> int:
                 print("one configured object is selected; linking and tests are not implied")
                 sys.stdout.flush()
                 started = time.monotonic()
-                completed = subprocess.run(command, env=env)
+                completed, cache_observation = run_compile_with_cache_observation(
+                    command, env, lane_root, subprocess.run
+                )
                 receipt = {
                     "format": "teamleaderleo-fex-x86-host-compile-receipt-v1",
                     "profile": profile_id,
@@ -1954,6 +2100,7 @@ def main(argv: list[str] | None = None) -> int:
                     "exitCode": completed.returncode,
                     "cacheNamespace": env["CCACHE_NAMESPACE"],
                     "ccacheSloppiness": env["CCACHE_SLOPPINESS"],
+                    "cacheObservation": cache_observation,
                 }
                 write_receipt(receipt_path, receipt)
                 print(json.dumps(receipt, sort_keys=True))
