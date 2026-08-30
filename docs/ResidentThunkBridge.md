@@ -124,3 +124,6 @@ enabled merely by adding the generator primitive.
 Do not run a broad FEX suite to answer a generator ownership question. Escalate to a bounded ARM64
 profile only when the unresolved claim is physical unload/reload or callback execution on the real
 cross-ISA path.
+
+The first GL-only integration and its bounded runtime oracle are explained in
+[`GLResidentCompanion.md`](GLResidentCompanion.md).

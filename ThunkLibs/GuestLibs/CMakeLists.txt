@@ -264,10 +264,26 @@ if (BUILD_FEX_LINUX_TESTS)
   add_guest_lib(fex_thunk_test "libfex_thunk_test.so")
 endif()
 
-generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp)
+generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp RESIDENT_BRIDGE)
 target_include_directories_from_pkgconfig(libGL-guest-deps gl)
 target_include_directories_from_pkgconfig(libGL-guest-deps "xcb;x11;xrandr;xrender")
+
+# The resident bridge is the process-lived owner for guest executable addresses
+# that libGL publishes outside the ordinary wrapper. Keep its generated bridge
+# definitions and custom callback forwarders in a separate DSO so libGL itself
+# remains unloadable.
+add_library(libGL_bridge-guest-deps INTERFACE)
+target_include_directories(libGL_bridge-guest-deps INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+target_link_libraries(libGL_bridge-guest-deps INTERFACE libGL-guest-deps)
+set(GEN_libGL_bridge "${GEN_libGL_BRIDGE}")
+add_guest_lib(GL_bridge "libfex-GL-bridge.so")
+set_target_properties(GL_bridge-guest PROPERTIES OUTPUT_NAME "fex-GL-bridge")
+target_link_options(GL_bridge-guest PRIVATE "LINKER:-z,nodelete")
+set_target_properties(GL_bridge-guest PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
+
 add_guest_lib(GL "libGL.so.1")
+target_sources(GL-guest PRIVATE "${GEN_libGL_BRIDGE_ACCESSORS}")
+target_link_libraries(GL-guest PRIVATE GL_bridge-guest)
 
 generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp)
 target_include_directories_from_pkgconfig(libEGL-guest-deps egl)
@@ -279,6 +295,7 @@ add_library(PlaceholderX11 SHARED ../libX11/libX11_NativeGuest.cpp)
 target_link_options(PlaceholderX11 PRIVATE "LINKER:-soname,libX11.so.6")
 set_target_properties(PlaceholderX11 PROPERTIES NO_SONAME ON)
 target_link_libraries(GL-guest PRIVATE PlaceholderX11)
+target_link_libraries(GL_bridge-guest PRIVATE "LINKER:--no-as-needed" PlaceholderX11 "LINKER:--as-needed")
 
 generate(libcuda ${CMAKE_CURRENT_SOURCE_DIR}/../libcuda/libcuda_interface.cpp)
 add_guest_lib(cuda "libcuda.so.1")
