@@ -25,6 +25,12 @@ Agents may create disposable workflow branches, add or edit workflow files, trig
 
 Read `docs/OwnedForkCI.md` before scheduling validation. Broad inherited matrices are opt-in in this fork; prefer the smallest exact-head target or runtime discriminator that answers the open question, and record its scope and receipt.
 
+Never run `git submodule deinit` as linked-worktree cleanup. FEX worktrees share the superproject's
+submodule registration, so this can make the canonical checkout fail `doctor`. After proving the
+exact worktree path, ownership, cleanliness and merge/tree disposition, use Git's exact worktree
+removal (`--force` may be required for populated submodules), then rerun `doctor` from the canonical
+checkout. The full cleanup boundary is in `docs/ResearchDevLoop.md`.
+
 Keep runtime provenance precise: when an experiment is meant to test an exact FEX product revision, build product source from that exact revision or clearly document any source delta. Policy-only or workflow-only fork commits must not be described as product-source changes.
 
 Workflow authority is limited to owned repositories/forks. It does not authorize writes, workflow dispatches, comments, reactions, reviews, issues, pull requests, or other interaction in third-party/upstream repositories.
