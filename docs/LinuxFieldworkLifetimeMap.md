@@ -4,6 +4,9 @@ This is an owned-fork research map, not an upstream-ready design. It explains th
 tracked in `teamleaderleo/linux-fieldwork` in terms of the current FEX code. The three failures share
 a Vulkan/X11 symptom, but they occur at different boundaries and need different fixes.
 
+For current merge/adoption status across these fixes, start with
+[the owned-fork research map](OwnedForkResearchMap.md). This note retains the deeper causal history.
+
 ## The minimum mental model
 
 - **Guest** means the x86 application and its x86 code addresses.
@@ -49,12 +52,14 @@ bridge existed.
 
 ### Bounded fork fix
 
-Draft fork PR #1 adds those names to the custom lookup and checks whether the native driver actually
-exposes the function before substituting FEX's wrapper. The second rule matters: FEX must not make an
-unavailable extension appear available merely because it has a wrapper symbol.
+Owned-fork PR #1, merged as `77bebaf521`, adds those names to the custom lookup and checks whether
+the native driver actually exposes the function before substituting FEX's wrapper. The second rule
+matters: FEX must not make an unavailable extension appear available merely because it has a wrapper
+symbol.
 
-Draft PR #2 adds a 64/32-bit static invariant: every generated `custom_host_impl` declaration must be
-represented in the lookup inventory. That catches future drift without running Vulkan.
+PR #2, merged as `582d925062`, adds a 64/32-bit static invariant: every generated
+`custom_host_impl` declaration must be represented in the lookup inventory. That catches future
+drift without running Vulkan.
 
 ## Failure B: a removed H → G route can remain compiled
 
@@ -98,10 +103,11 @@ Those receipts came from run `31817790502` at source `1e8b042e`: the registry-on
 `SIGSEGV`, while the exact-retirement child returned `1001035` and exited zero. They demonstrate the
 cache mechanism, but they are not a current-head acceptance result.
 
-The owned-fork candidate therefore treats re-registration as one transaction. Under the existing
-thread-creation boundary it takes the exclusive code-invalidation lock, replaces only an identical
-thunk handler's H → G mapping, erases the exact shared H entry while delinking inbound direct-block
-links, and clears every live thread's exact L1/L2 entry and call/return shadow cache. First
+Owned-fork PR #15, merged as `1ab30cadba`, therefore treats re-registration as one transaction.
+Under the existing thread-creation boundary it takes the exclusive code-invalidation lock, replaces
+only an identical thunk handler's H → G mapping, erases the exact shared H entry while delinking
+inbound direct-block links, and clears every live thread's exact L1/L2 entry and call/return shadow
+cache. First
 registration and identical re-registration remain no-ops for invalidation. The lock order is
 `ThreadCreationMutex` → `CodeInvalidationMutex` → `CustomIRMutex`.
 
@@ -113,14 +119,13 @@ empty-`CodePages` case: range invalidation cannot find it, while exact invalidat
 This does not revoke a block another thread already selected before the transaction. Concurrent
 in-flight execution and already-escaped host trampolines remain separate lifetime questions.
 
-At current base `f1f1e6a` and candidate `93fe514dc`, hosted `ubuntu-24.04-arm` runs `33274263989` and
-`33274784324` both failed before the first linked host call completed. The line-buffered trace reached
-generation 1, then GDB stopped at the same FEX JIT sequence and inputs in both treatments: default
-codegen trapped on unaligned `LDAPUR`, and disabling LRCPC/LRCPC2 selected `LDAR` but still trapped.
-This is an execution-environment/unaligned-TSO boundary, not a rebind comparison. It must not be
-relabeled as a candidate failure or success. Current-head ARM64 acceptance remains for a Glaeda or
-installed-FEX lane that first proves its ordinary x86 runtime control; x86-host compilation and the
-lookup-cache unit test are necessary but not that acceptance proof.
+Two earlier hosted `ubuntu-24.04-arm` attempts at base `f1f1e6a` and candidate `93fe514dc` trapped at
+the same unaligned-TSO environment boundary before the first linked host call; they remain invalid
+A/B evidence. A later composed exact-head run `33276996655` first passed an ordinary x86 control,
+moved the guest invoker while retaining the native H identity, and changed the post-registration
+link from the stale failure to `rv=1001035`, exit zero. The current callback also exited zero. The
+pre-registration link/callback still faulted, preserving the explicit non-goal for code selected
+before registration. The merged source tree was byte-identical to the tested composition.
 
 ## Failure C: a host trampoline already escaped into native state
 
@@ -147,6 +152,7 @@ Fieldwork evidence currently ranks the choices as follows:
    was falsified under `dlmopen`/new namespaces.
 2. **Move escaped bridge code into a process-resident per-library sidecar** while allowing the
    ordinary wrapper to unload. This gives the persistent native owner a persistent bridge owner.
+   The owned fork now applies and measures this design for GL only; it is not a Vulkan result.
    Per-library identity is safer than global signature deduplication because ABI annotations are part
    of the contract even when C++ signatures look alike.
 3. **Add owner generations plus execution leases/hazards and a grace period** only if the bridge code

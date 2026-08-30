@@ -1,8 +1,9 @@
 # Resident thunk bridges: keeping escaped code alive
 
 This guide explains the owned fork's optional resident-output primitive for `thunkgen`. It assumes
-ordinary C++ familiarity, but not FEX internals. The primitive does not yet make GL, Vulkan, or any
-other thunk library resident; library integration and ARM64 runtime acceptance are separate work.
+ordinary C++ familiarity, but not FEX internals. The primitive is now adopted by the measured GL
+companion; Vulkan and every other thunk library remain unadopted. Generator capability, each library
+integration and ARM64 runtime acceptance are still separate claims.
 
 ## The problem in one picture
 
@@ -102,7 +103,7 @@ The case proves:
 
 This is x86-host generator evidence. It does not execute x86 code under FEX.
 
-## What remains before a library can adopt it
+## What remains before another library can adopt it
 
 A product integration still needs a separate, per-library decision and evidence chain:
 
