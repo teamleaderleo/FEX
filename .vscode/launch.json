@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "FEX: debug CodeCacheConfig owner",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${userHome}/.cache/fex-dev/views/editor/build/FEXCore_Tests/FEXCore_Tests_CodeCacheConfig",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${userHome}/.cache/fex-dev/views/editor/build/FEXCore/unittests/APITests",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "sourceFileMap": {
+        "${userHome}/.cache/fex-dev/views/editor/src": "${workspaceFolder}"
+      },
+      "preLaunchTask": "FEX: build CodeCacheConfig debug owner"
+    }
+  ]
+}
