@@ -37,6 +37,11 @@ union FEXServerRequestPacket {
   struct {
     struct Header Header;
   } BasicRequest;
+
+  struct {
+    struct Header Header;
+    uint64_t ConfigId;
+  } CodeCacheRequest;
 };
 
 union FEXServerResultPacket {
@@ -131,8 +136,9 @@ int RequestPIDFD(int ServerSocket);
  * @param ServerSocket - Socket to the server
  * @param ProgramFD - FD for program binary
  * @param HasMultiblock - true if multiblock is enabled (used for selecting code maps)
+ * @param ConfigId - exact effective code-generation configuration identity
  */
-void PopulateCodeCache(int ServerSocket, int ProgramFD, bool HasMultiblock);
+void PopulateCodeCache(int ServerSocket, int ProgramFD, bool HasMultiblock, uint64_t ConfigId);
 
 /**
  * @brief Request FEXServer to create a new code map for disk cache population

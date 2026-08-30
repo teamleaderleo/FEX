@@ -20,6 +20,20 @@
 
 namespace FEXCore {
 
+struct HostFeatures;
+
+namespace CodeCacheConfig {
+  /**
+   * Computes the versioned identity of all inputs that may change generated
+   * host code for a whole-file code cache.
+   *
+   * SerializedConfig is Config::SerializeForCache(). HostFeaturesHash is the
+   * effective HostFeatures::HashForCaching() value after overrides.
+   */
+  FEX_DEFAULT_VISIBILITY uint64_t ComputeId(std::string_view SerializedConfig, uint64_t HostFeaturesHash, bool Is64BitMode);
+  FEX_DEFAULT_VISIBILITY uint64_t ComputeId(const HostFeatures& HostFeatures, bool Is64BitMode);
+} // namespace CodeCacheConfig
+
 namespace Core {
   struct InternalThreadState;
 } // namespace Core
@@ -233,6 +247,12 @@ class AbstractCodeCache {
 
 public:
   virtual ~AbstractCodeCache() = default;
+
+  /**
+   * Returns the whole-file cache identity for this context's exact effective
+   * code-generation configuration.
+   */
+  virtual uint64_t GetConfigId() const = 0;
 
   /**
    * Computes a unique identifier for the referenced binary file to be used for

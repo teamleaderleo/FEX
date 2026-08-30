@@ -234,7 +234,7 @@ void ImageTracker::LoadAOTImages(MappedImageInfo& ImageInfo) {
   }
 
   auto ID = FEXCore::CodeMap::GetBaseFilename(ImageInfo.Info, false);
-  const uint64_t CodeCacheConfigId = 0; // TODO
+  const uint64_t CodeCacheConfigId = CTX.GetCodeCache().GetConfigId();
   const auto AnsiPath = fmt::format("\\??\\{}cache\\{}-{:016x}", FEX::Config::GetCacheDirectory(), ID, CodeCacheConfigId);
 
   IO_STATUS_BLOCK IOSB;

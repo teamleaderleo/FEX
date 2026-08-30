@@ -17,6 +17,7 @@ boundaries. Identify that boundary before changing code or choosing an oracle.
 | The same native address H is registered for a newer guest invoker, but later dispatch reaches the old one | synthetic CustomIR registry plus exact shared/thread cache retirement | merged exact-identity rebind transaction | [Callback lifetime map](LinuxFieldworkLifetimeMap.md) |
 | A native library retained a guest executable address after its ordinary wrapper unloaded | already-escaped executable ownership | measured GL and Vulkan companions; other libraries not adopted | [Resident thunk bridges](ResidentThunkBridge.md), [GL companion](GLResidentCompanion.md), and [Vulkan companion](VulkanResidentCompanion.md) |
 | `MREMAP_FIXED` replaced code at D, but execution at D used the old translation | guest virtual-memory mutation versus translated-code cache | merged destination invalidation for the focused fixed-remap sequence | [Fixed-remap destination cache](MremapFixedDestinationCache.md) |
+| A whole-file code cache was generated under different JIT settings or host features | cache namespace and offline-compiler configuration agreement | owned-fork configuration identity and fail-closed compiler handshake | [Whole-file code-cache identity](WholeFileCodeCacheIdentity.md) |
 | GLX string-return thunks fail to compile under Clang 21 | fixed-width guest layout versus signed host character pointer conversion | merged shared host-layout conversion and two focused generator guards | [PR #25](https://github.com/teamleaderleo/FEX/pull/25) |
 | A new chat needs to configure, build or test something | environment, exact source and smallest owner | `doctor`, stable external lanes, one target and one literal CTest are merged | [Owned-fork development loop](ResearchDevLoop.md) |
 
@@ -115,6 +116,13 @@ file. Generator output, build integration and product adoption are three separat
   destination of a successful moved `MREMAP_FIXED` operation.
 - [PR #25](https://github.com/teamleaderleo/FEX/pull/25), merge `3c0de317aa`, retains fixed-width
   guest character layout while accepting signed `int8_t*` host returns under Clang 21.
+
+The whole-file code-cache configuration binding is separately explained in
+[Whole-file code-cache identity](WholeFileCodeCacheIdentity.md). It namespaces cached host code by
+the effective generated-code configuration, bitness and host features; independently rejects an
+offline compiler that cannot reproduce the requested identity; and stores the identity in the
+cache header. It does not transport app-specific configuration to the compiler, so a mismatch is a
+safe refusal rather than proof that every configured application can use whole-file caching.
 
 These are not callback-lifetime fixes. They are listed here because both can otherwise be mistaken
 for a reason to widen a thunk/cache experiment.

@@ -789,6 +789,7 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context* _CTX, FEX::HLE::Signal
   , CTX {_CTX}
   , SignalDelegation {_SignalDelegation}
   , ThunkHandler {ThunkHandler} {
+  CodeCacheConfigId = _CTX->GetCodeCache().GetConfigId();
   FEX::HLE::_SyscallHandler = this;
   HostKernelVersion = LinuxVersion::CalculateHostKernelVersion();
   GuestKernelVersion = CalculateGuestKernelVersion();
