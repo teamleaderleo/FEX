@@ -6,13 +6,20 @@ The upstream FEX workflows are designed for the upstream project's always-on sel
 
 Opening or updating a pull request does **not** enqueue the broad build, GLIBC fault, hostrunner, instruction-count, MinGW, Steam Runtime, Wine DLL, or VIXL matrices in `teamleaderleo/FEX`. Those matrices cover unrelated platforms and can consume many runner-hours even for a deterministic generator or documentation change. They also do not create skipped check-suite noise on ordinary research pull requests.
 
-One narrow exception is `.github/workflows/focused-compiler-compat.yml`. A same-repository pull
-request that changes the thunk generator, shared host layout helpers, GL thunk sources, their focused
-tests, or the lane itself runs two exact char-pointer return tests and builds only `GL-host-64` on
-GitHub's `ubuntu-26.04` preview image with Clang 21. External pull-request branches are refused.
-The job may also be dispatched manually. It does not run a guest, a test family, or any inherited
-matrix. The preview image changes weekly and carries no GA SLA, so its exact source SHA and printed
-toolchain identity are part of the result rather than an implicit stable environment claim.
+Two narrow exceptions cover product boundaries that benefit from a same-repository PR check:
+
+- `.github/workflows/focused-compiler-compat.yml` watches the thunk generator, shared host layout
+  helpers, GL thunk sources, their focused tests and the lane itself. It runs two exact char-pointer
+  return tests and builds only `GL-host-64` on GitHub's `ubuntu-26.04` preview image with Clang 21.
+- `.github/workflows/focused-code-cache.yml` watches the format-3 whole-file cache parser, its direct
+  consumer/producer, its test and their CMake registration. It builds only
+  `FEXCore_Tests_CodeCacheFile` and `FEXOfflineCompiler`, then runs only the discovered
+  `*.CodeCacheFile.FEXCore_Tests` cases on `ubuntu-24.04`.
+
+Both refuse external pull-request branches and may be dispatched manually. Neither runs a guest, a
+test family or an inherited matrix. The Clang 21 preview image changes weekly and carries no GA SLA,
+so that lane's exact source SHA and printed toolchain identity are part of the result rather than an
+implicit stable environment claim.
 Helper-only changes to `Scripts/ResearchDevBuild.py` do not enqueue this compiler/product lane.
 They use `.github/workflows/research-tooling.yml`: one same-repository, path-filtered job that checks
 out the exact PR head and runs the closed Python research-tooling test inventory. It does not

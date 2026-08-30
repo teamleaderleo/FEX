@@ -1,0 +1,93 @@
+name: Focused code-cache parser
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/focused-code-cache.yml
+      - FEXCore/include/FEXCore/Core/CodeCacheFile.h
+      - FEXCore/Source/CMakeLists.txt
+      - FEXCore/Source/Interface/Core/CodeCache.cpp
+      - FEXCore/Source/Interface/Core/CodeCacheFile.cpp
+      - FEXCore/unittests/APITests/CMakeLists.txt
+      - FEXCore/unittests/APITests/CodeCacheFile.cpp
+      - Source/Tools/FEXOfflineCompiler/Main.cpp
+
+permissions:
+  contents: read
+
+concurrency:
+  group: focused-code-cache-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  whole-file-parser:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CACHE_ROOT: ${{ runner.temp }}/fex-dev
+
+    steps:
+      - name: Check out the exact same-repository source revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install the bounded x86 build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ccache clang lld cmake ninja-build nasm mold \
+            libssl-dev pkg-config libgl-dev libx11-dev libffi-dev libedit-dev \
+            libcurl4-openssl-dev libxml2-dev libzstd-dev zlib1g-dev
+
+      - name: Verify exact source and toolchain identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          test -z "$(git status --porcelain)"
+          clang --version | sed -n '1p'
+          cmake --version | sed -n '1p'
+          ninja --version
+
+      - name: Initialize only the exact pinned submodule graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 Scripts/ResearchDevBuild.py submodules --jobs 8
+
+      - name: Build only the whole-file parser and affected producer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 Scripts/ResearchDevBuild.py \
+            --cache-root "${CACHE_ROOT}" --lane code-cache-parser \
+            build FEXCore_Tests_CodeCacheFile --jobs 4
+          python3 Scripts/ResearchDevBuild.py \
+            --cache-root "${CACHE_ROOT}" --lane code-cache-parser \
+            build FEXOfflineCompiler --jobs 4
+
+      - name: Run only the whole-file parser cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest \
+            --test-dir "${CACHE_ROOT}/views/code-cache-parser/build" \
+            --output-on-failure \
+            --no-tests=error \
+            -R '[.]CodeCacheFile[.]FEXCore_Tests$'
+
+      - name: Prove final source identity
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SOURCE_SHA}"
+          test -z "$(git status --porcelain)"
