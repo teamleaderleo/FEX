@@ -1667,6 +1667,186 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertEqual(inventory["totals"]["lanes"], 0)
         self.assertFalse(cache.exists())
 
+    @staticmethod
+    def retirement_source(root: Path) -> tuple[Path, str]:
+        source = root / "source"
+        source.mkdir()
+        subprocess.run(["git", "init", "-q", str(source)], check=True)
+        subprocess.run(
+            ["git", "-C", str(source), "config", "user.name", "FEX test"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(source), "config", "user.email", "fex@example.invalid"],
+            check=True,
+        )
+        (source / "owned.txt").write_text("owned\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(source), "add", "owned.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(source), "commit", "-q", "-m", "fixture"], check=True
+        )
+        head = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        return source, head
+
+    @staticmethod
+    def retirement_lane(
+        cache: Path,
+        root: Path,
+        lane: str,
+        head: str,
+        *,
+        dirty: bool = False,
+        exit_code: int = 0,
+        live: bool = False,
+        receipt_format: str = "teamleaderleo-fex-x86-host-dev-receipt-v1",
+    ) -> Path:
+        lane_root = cache / "views" / lane
+        (lane_root / "build").mkdir(parents=True)
+        (cache / "locks").mkdir(parents=True, exist_ok=True)
+        target = root / f"{lane}-source"
+        if live:
+            target.mkdir()
+        os.symlink(target, lane_root / "src", target_is_directory=True)
+        (lane_root / "build" / "build.ninja").write_text("# fixture\n", encoding="utf-8")
+        dev_build.write_receipt(
+            lane_root / "last-receipt.json",
+            {
+                "format": receipt_format,
+                "head": head,
+                "dirty": dirty,
+                "target": "FEX",
+                "exitCode": exit_code,
+            },
+        )
+        dev_build.write_receipt(
+            lane_root / "profile.json",
+            dev_build.expected_profile(dev_build.cpu_namespace()),
+        )
+        return lane_root
+
+    def test_retirement_plan_is_deterministic_read_only_and_commit_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            source, head = self.retirement_source(root)
+            lane_root = self.retirement_lane(cache, root, "dead-clean", head)
+            before = sorted(
+                (path.relative_to(lane_root).as_posix(), os.lstat(path).st_size)
+                for path in lane_root.rglob("*")
+            )
+
+            first = dev_build.lane_retirement_plan(cache, "dead-clean", source)
+            second = dev_build.lane_retirement_plan(cache, "dead-clean", source)
+            after = sorted(
+                (path.relative_to(lane_root).as_posix(), os.lstat(path).st_size)
+                for path in lane_root.rglob("*")
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(before, after)
+        self.assertEqual(first["status"], "ready")
+        self.assertEqual(first["authority"], "read_only_plan")
+        self.assertEqual(first["blockers"], [])
+        self.assertEqual(first["receipt"]["head"], head)
+        self.assertTrue(first["receiptHeadReachable"])
+        self.assertRegex(first["retirementToken"], r"^[0-9a-f]{64}$")
+        self.assertGreater(first["laneIdentity"]["entries"], 1)
+
+    def test_retirement_plan_names_dirty_live_active_unreachable_and_unsafe_vetoes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            source, head = self.retirement_source(root)
+            self.retirement_lane(cache, root, "dirty", head, dirty=True)
+            self.retirement_lane(cache, root, "live", head, live=True)
+            self.retirement_lane(cache, root, "active", head)
+            self.retirement_lane(cache, root, "unreachable", "f" * 40)
+            self.retirement_lane(
+                cache, root, "unknown-format", head, receipt_format="foreign-receipt"
+            )
+            bad_profile = self.retirement_lane(cache, root, "unknown-profile", head)
+            dev_build.write_receipt(
+                bad_profile / "profile.json", {"format": "foreign-profile"}
+            )
+
+            outside = root / "outside-lane"
+            outside.mkdir()
+            os.symlink(outside, cache / "views" / "linked", target_is_directory=True)
+
+            active_lock = (cache / "locks" / "active.lock").open("a+", encoding="utf-8")
+            fcntl = __import__("fcntl")
+            fcntl.flock(active_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            plans = {
+                lane: dev_build.lane_retirement_plan(cache, lane, source)
+                for lane in (
+                    "dirty",
+                    "live",
+                    "active",
+                    "unreachable",
+                    "unknown-format",
+                    "unknown-profile",
+                    "linked",
+                )
+            }
+            fcntl.flock(active_lock, fcntl.LOCK_UN)
+            active_lock.close()
+
+        self.assertIn("receipt_dirty_or_unknown", plans["dirty"]["blockers"])
+        self.assertIsNone(plans["dirty"]["retirementToken"])
+        self.assertIn("source_view_live", plans["live"]["blockers"])
+        self.assertIn("lane_lock_active", plans["active"]["blockers"])
+        self.assertIn("receipt_head_unreachable", plans["unreachable"]["blockers"])
+        self.assertIn("receipt_format_unknown", plans["unknown-format"]["blockers"])
+        self.assertIn("profile_contract_unknown", plans["unknown-profile"]["blockers"])
+        self.assertIn("lane_unsafe", plans["linked"]["blockers"])
+        self.assertIsNone(plans["linked"]["retirementToken"])
+        self.assertTrue(all(plan["status"] == "refused" for plan in plans.values()))
+
+    def test_retirement_plan_refuses_observation_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            source, head = self.retirement_source(root)
+            self.retirement_lane(cache, root, "changing", head)
+            stable = dev_build.lane_inventory(cache)
+            changed = json.loads(json.dumps(stable))
+            changed["lanes"][0]["allocatedBytes"] += 4096
+            with mock.patch.object(
+                dev_build, "lane_inventory", side_effect=[stable, changed]
+            ):
+                plan = dev_build.lane_retirement_plan(cache, "changing", source)
+
+        self.assertEqual(plan["status"], "refused")
+        self.assertIn("lane_changed_during_plan", plan["blockers"])
+
+    def test_retire_plan_missing_lane_creates_no_cache_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "missing-cache"
+            source, _ = self.retirement_source(root)
+            output = __import__("io").StringIO()
+            with mock.patch("sys.stdout", output):
+                result = dev_build.main(
+                    [
+                        "--lane",
+                        "missing",
+                        "--source",
+                        str(source),
+                        "--cache-root",
+                        str(cache),
+                        "retire-plan",
+                    ]
+                )
+
+        plan = json.loads(output.getvalue())
+        self.assertEqual(result, 2)
+        self.assertEqual(plan["blockers"], ["lane_missing"])
+        self.assertFalse(cache.exists())
+
     def test_profile_marker_must_match_exactly(self):
         expected = dev_build.expected_profile("cache-namespace")
         with tempfile.TemporaryDirectory() as temporary:

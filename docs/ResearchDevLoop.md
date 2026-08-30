@@ -411,6 +411,26 @@ helper lock and a valid receipt. It is a prompt for ownership/process review, no
 the command never removes a lane or shared ccache entry. A non-symlink source view, malformed lane
 root, unsafe metadata file, cross-filesystem tree or size error fails closed as unsafe.
 
+Before considering one review candidate for retirement, ask the helper for a reconstructibility
+plan against a repository that still owns its commit:
+
+```sh
+./Scripts/ResearchDevBuild.py --lane NAME retire-plan
+```
+
+`retire-plan` is also read-only. It requires a dead source view, no held helper lock, a known valid
+receipt with `dirty=false` and `exitCode=0`, a valid profile, a reachable exact Git commit and a
+stable no-follow lane inventory. It hashes the receipt/profile bytes plus every lane entry's name,
+device, inode, mode, ownership, size, modification/change time and symlink text into one
+revalidation token. The current source-repository HEAD also participates, so a later repository or
+lane change requires a fresh plan. Two unchanged plans are byte-identical.
+
+A refused plan exits 2, names every observed blocker and emits no retirement token. A ready token is
+still only evidence for later exact-state review: this action has no `--apply`, never creates a lock,
+never moves or removes a lane and grants no process, mount, ownership, quarantine, deletion or
+shared-ccache authority. Do not hand-delete a dirty lane merely because its last commit remains in
+Git; its build tree may be the only retained evidence for uncommitted source state.
+
 ## VS Code without a mystery build
 
 VS Code is a good FEX editor when it is treated as a view over the same explicit build lane, not as
