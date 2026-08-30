@@ -78,7 +78,8 @@ CONFIGURE_PROFILES = {
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description=(
-            "Initialize sources, discover/plan/build one exact FEX target, or run one exact CTest."
+            "Initialize sources, compile one exact file, discover/plan/build one exact FEX target, "
+            "or run one exact CTest."
         )
     )
     result.add_argument("--lane", default="dev", help="isolated stable-path lane name")
@@ -140,6 +141,16 @@ def parser() -> argparse.ArgumentParser:
     build = subparsers.add_parser("build", help="build one named CMake target")
     build.add_argument("target", help="exact target, for example vulkan-host-64")
     build.add_argument(
+        "--jobs", type=positive_int, default=min(os.cpu_count() or 1, 16), help="build workers"
+    )
+    compile_source = subparsers.add_parser(
+        "compile",
+        help="compile the unique configured object for one repository source file",
+    )
+    compile_source.add_argument(
+        "file", type=Path, help="repository C/C++ source path, absolute or relative to --source"
+    )
+    compile_source.add_argument(
         "--jobs", type=positive_int, default=min(os.cpu_count() or 1, 16), help="build workers"
     )
     plan = subparsers.add_parser(
@@ -949,6 +960,7 @@ def doctor_receipt(
     )
     focused_next_commands = (
         [
+            "./Scripts/ResearchDevBuild.py --lane editor compile SOURCE.cpp",
             "./Scripts/ResearchDevBuild.py --lane NAME build TARGET",
             "./Scripts/ResearchDevBuild.py --lane NAME check TARGET EXACT_CTEST",
             "./Scripts/ResearchDevBuild.py --lane editor editor",
@@ -974,7 +986,10 @@ def doctor_receipt(
                 "evidenceState": "not_established",
                 "blockers": local_blockers,
                 "nextCommands": focused_next_commands,
-                "scope": "one named x86-host target or one exact host-side CTest",
+                "scope": (
+                    "one configured source object, named x86-host target, "
+                    "or exact host-side CTest"
+                ),
                 "proof": "required command paths and pinned submodules only; configure/build/test did not run",
             },
             "reusableExactHeadEvidence": {
@@ -1131,6 +1146,119 @@ def write_editor_compile_commands(
     translated = replace_path(entries, str(source_view), str(source))
     write_receipt(destination, translated)
     return len(entries)
+
+
+def read_bounded_regular_bytes(path: Path, limit: int, label: str) -> bytes:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise RuntimeError(f"cannot safely open {label}: {path}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+            raise RuntimeError(f"unsafe {label}: {path}")
+        chunks = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if len(payload) > limit:
+        raise RuntimeError(f"{label} exceeded the bounded size limit: {path}")
+    return payload
+
+
+def configured_compile_unit(
+    source: Path, build: Path, requested: Path
+) -> dict[str, object]:
+    """Resolve one repository source to exactly one configured object output."""
+    candidate = requested.expanduser()
+    if not candidate.is_absolute():
+        candidate = source / candidate
+    try:
+        candidate_metadata = candidate.stat(follow_symlinks=False)
+        selected = candidate.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(f"compile source is unavailable: {requested}") from error
+    if not stat.S_ISREG(candidate_metadata.st_mode):
+        raise RuntimeError("compile source must be a regular file, not a directory or symlink")
+    try:
+        source_relative = selected.relative_to(source)
+    except ValueError as error:
+        raise RuntimeError("compile source must be inside the selected source tree") from error
+
+    database = build / "compile_commands.json"
+    try:
+        database_payload = read_bounded_regular_bytes(
+            database, DISCOVERY_REGISTRY_LIMIT, "compilation database"
+        )
+        entries = json.loads(database_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read compilation database: {database}") from error
+    if not isinstance(entries, list) or not entries:
+        raise RuntimeError(f"invalid or empty compilation database: {database}")
+
+    build_root = build.resolve(strict=True)
+    matches: list[Path] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError("invalid compilation database entry")
+        directory_raw = entry.get("directory")
+        file_raw = entry.get("file")
+        if not isinstance(directory_raw, str) or not isinstance(file_raw, str):
+            raise RuntimeError("compilation database entry has no directory/file identity")
+        if not directory_raw.isprintable() or not file_raw.isprintable():
+            raise RuntimeError("compilation database entry contains an unsafe path")
+        directory = Path(directory_raw)
+        file_path = Path(file_raw)
+        if not directory.is_absolute():
+            raise RuntimeError("compilation database directory must be absolute")
+        if not file_path.is_absolute():
+            file_path = directory / file_path
+        try:
+            normalized_file = file_path.resolve(strict=False)
+        except OSError as error:
+            raise RuntimeError("cannot normalize compilation database source path") from error
+        if normalized_file != selected:
+            continue
+        output_raw = entry.get("output")
+        if not isinstance(output_raw, str) or not output_raw or not output_raw.isprintable():
+            raise RuntimeError("matching compilation database entry has no safe object output")
+        output = Path(output_raw)
+        if not output.is_absolute():
+            output = directory / output
+        try:
+            normalized_output = output.resolve(strict=False)
+            output_relative = normalized_output.relative_to(build_root)
+        except (OSError, ValueError) as error:
+            raise RuntimeError(
+                "configured compile output escapes the selected build tree"
+            ) from error
+        if output_relative == Path("."):
+            raise RuntimeError("configured compile output cannot be the build directory")
+        matches.append(output_relative)
+
+    if not matches:
+        raise RuntimeError(
+            "source has no configured compile command; choose a C/C++ translation unit from "
+            "compile_commands.json (headers require a representative source owner)"
+        )
+    if len(matches) != 1:
+        sample = ", ".join(path.as_posix() for path in matches[:8])
+        raise RuntimeError(
+            f"source has {len(matches)} configured outputs and is ambiguous: {sample}"
+        )
+    return {
+        "sourceFile": source_relative.as_posix(),
+        "objectTarget": matches[0].as_posix(),
+        "databaseEntries": len(entries),
+        "databaseSha256": hashlib.sha256(database_payload).hexdigest(),
+    }
 
 
 def editor_prerequisites_command(build: Path) -> list[str]:
@@ -1791,6 +1919,43 @@ def main(argv: list[str] | None = None) -> int:
                 write_receipt(receipt_path, receipt)
                 print(f"guestBinary={guest_build / guest_target}")
                 print(f"fexBinary={build / 'Bin' / 'FEX'}")
+                print(json.dumps(receipt, sort_keys=True))
+                return completed.returncode
+
+            if args.action == "compile":
+                unit = configured_compile_unit(source, build, args.file)
+                command = build_command(build, str(unit["objectTarget"]), args.jobs)
+                print(
+                    f"scope=FOCUSED_COMPILE profile={args.profile} lane={lane} "
+                    f"file={unit['sourceFile']} object={unit['objectTarget']} "
+                    f"head={identity['head']} dirty={str(identity['dirty']).lower()}"
+                )
+                print("one configured object is selected; linking and tests are not implied")
+                sys.stdout.flush()
+                started = time.monotonic()
+                completed = subprocess.run(command, env=env)
+                receipt = {
+                    "format": "teamleaderleo-fex-x86-host-compile-receipt-v1",
+                    "profile": profile_id,
+                    "requestedProfile": args.profile,
+                    "lane": lane,
+                    "target": unit["objectTarget"],
+                    "sourceFile": unit["sourceFile"],
+                    "objectTarget": unit["objectTarget"],
+                    "compilationDatabaseEntries": unit["databaseEntries"],
+                    "compilationDatabaseSha256": unit["databaseSha256"],
+                    "head": identity["head"],
+                    "dirty": identity["dirty"],
+                    "sourceSwitched": switched,
+                    "configurationMode": configure_mode,
+                    "setupElapsedSeconds": round(setup_elapsed, 6),
+                    "jobs": args.jobs,
+                    "elapsedSeconds": round(time.monotonic() - started, 6),
+                    "exitCode": completed.returncode,
+                    "cacheNamespace": env["CCACHE_NAMESPACE"],
+                    "ccacheSloppiness": env["CCACHE_SLOPPINESS"],
+                }
+                write_receipt(receipt_path, receipt)
                 print(json.dumps(receipt, sort_keys=True))
                 return completed.returncode
 

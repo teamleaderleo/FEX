@@ -23,6 +23,17 @@
       "problemMatcher": []
     },
     {
+      "label": "FEX: compile current C++ file",
+      "type": "process",
+      "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
+      "args": ["--lane", "editor", "compile", "${file}"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"]
+    },
+    {
       "label": "FEX: discover configured targets and tests",
       "type": "process",
       "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
@@ -41,10 +52,6 @@
       "type": "process",
       "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
       "args": ["--lane", "editor", "build", "${input:fexTarget}"],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
       "problemMatcher": ["$gcc"]
     },
     {

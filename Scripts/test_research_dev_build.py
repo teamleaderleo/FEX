@@ -69,6 +69,7 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertEqual(
             focused["nextCommands"],
             [
+                "./Scripts/ResearchDevBuild.py --lane editor compile SOURCE.cpp",
                 "./Scripts/ResearchDevBuild.py --lane NAME build TARGET",
                 "./Scripts/ResearchDevBuild.py --lane NAME check TARGET EXACT_CTEST",
                 "./Scripts/ResearchDevBuild.py --lane editor editor",
@@ -300,6 +301,180 @@ class ResearchDevBuildTest(unittest.TestCase):
                 dev_build.build_command(Path("/view/build"), "--all", 8)
 
         self.assertEqual(command[-4:], ["--target", "vulkan-host-64", "--parallel", "8"])
+
+    def test_compile_parser_and_unique_configured_object(self):
+        args = dev_build.parser().parse_args(
+            ["compile", "ThunkLibs/Generator/analysis.cpp", "--jobs", "4"]
+        )
+        self.assertEqual(
+            (args.action, args.file, args.jobs),
+            ("compile", Path("ThunkLibs/Generator/analysis.cpp"), 4),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source_file = source / "Source" / "unit.cpp"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text("int unit;\n", encoding="utf-8")
+            lane = root / "lane"
+            build = lane / "build"
+            build.mkdir(parents=True)
+            os.symlink(source, lane / "src", target_is_directory=True)
+            object_output = build / "Source" / "CMakeFiles" / "unit.dir" / "unit.cpp.o"
+            database = [
+                {
+                    "directory": str(build),
+                    "command": "clang++ -c unit.cpp",
+                    "file": str(lane / "src" / "Source" / "unit.cpp"),
+                    "output": str(object_output),
+                }
+            ]
+            (build / "compile_commands.json").write_text(
+                json.dumps(database), encoding="utf-8"
+            )
+
+            unit = dev_build.configured_compile_unit(
+                source.resolve(), build, Path("Source/unit.cpp")
+            )
+
+        self.assertEqual(unit["sourceFile"], "Source/unit.cpp")
+        self.assertEqual(
+            unit["objectTarget"], "Source/CMakeFiles/unit.dir/unit.cpp.o"
+        )
+        self.assertEqual(unit["databaseEntries"], 1)
+        self.assertRegex(unit["databaseSha256"], r"^[0-9a-f]{64}$")
+
+    def test_configured_compile_unit_refuses_non_source_and_ambiguous_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            source_file = source / "unit.cpp"
+            header = source / "unit.h"
+            source_file.write_text("int unit;\n", encoding="utf-8")
+            header.write_text("extern int unit;\n", encoding="utf-8")
+            outside = root / "outside.cpp"
+            outside.write_text("int outside;\n", encoding="utf-8")
+            linked = source / "linked.cpp"
+            linked.symlink_to(source_file)
+            lane = root / "lane"
+            build = lane / "build"
+            build.mkdir(parents=True)
+            os.symlink(source, lane / "src", target_is_directory=True)
+
+            def write_database(outputs):
+                entries = [
+                    {
+                        "directory": str(build),
+                        "file": str(lane / "src" / "unit.cpp"),
+                        "output": str(output),
+                    }
+                    for output in outputs
+                ]
+                (build / "compile_commands.json").write_text(
+                    json.dumps(entries), encoding="utf-8"
+                )
+
+            write_database([build / "one.o"])
+            with self.assertRaisesRegex(RuntimeError, "no configured compile command"):
+                dev_build.configured_compile_unit(source.resolve(), build, header)
+            with self.assertRaisesRegex(RuntimeError, "inside the selected source tree"):
+                dev_build.configured_compile_unit(source.resolve(), build, outside)
+            with self.assertRaisesRegex(RuntimeError, "regular file"):
+                dev_build.configured_compile_unit(source.resolve(), build, linked)
+
+            write_database([build / "one.o", build / "two.o"])
+            with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+                dev_build.configured_compile_unit(source.resolve(), build, source_file)
+
+            write_database([root / "escaped.o"])
+            with self.assertRaisesRegex(RuntimeError, "escapes"):
+                dev_build.configured_compile_unit(source.resolve(), build, source_file)
+
+    def test_compile_action_emits_exact_object_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source_file = source / "Source" / "unit.cpp"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text("int unit;\n", encoding="utf-8")
+            cache = root / "cache"
+            lane = cache / "views" / "focused"
+            build = lane / "build"
+            build.mkdir(parents=True)
+            os.symlink(source, lane / "src", target_is_directory=True)
+            (build / "build.ninja").write_text("", encoding="utf-8")
+            object_target = "Source/CMakeFiles/unit.dir/unit.cpp.o"
+            (build / "compile_commands.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "directory": str(build),
+                            "file": str(lane / "src" / "Source" / "unit.cpp"),
+                            "output": str(build / object_target),
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            profile = dev_build.expected_profile("namespace")
+            dev_build.write_receipt(lane / "profile.json", profile)
+            output = __import__("io").StringIO()
+            completed = subprocess.CompletedProcess(["cmake", "--build"], 0)
+
+            with mock.patch.object(dev_build, "require_pinned_submodules"):
+                with mock.patch.object(
+                    dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"
+                ):
+                    with mock.patch.object(
+                        dev_build,
+                        "environment",
+                        return_value={
+                            "CCACHE_NAMESPACE": "namespace",
+                            "CCACHE_SLOPPINESS": "time_macros",
+                        },
+                    ):
+                        with mock.patch.object(dev_build, "git_output", return_value="a" * 40):
+                            with mock.patch.object(
+                                dev_build, "configured_provenance_matches", return_value=True
+                            ):
+                                with mock.patch.object(
+                                    dev_build,
+                                    "source_identity",
+                                    return_value={"head": "a" * 40, "dirty": True},
+                                ):
+                                    with mock.patch.object(
+                                        dev_build.subprocess, "run", return_value=completed
+                                    ) as run:
+                                        with mock.patch("sys.stdout", output):
+                                            result = dev_build.main(
+                                                [
+                                                    "--source",
+                                                    str(source),
+                                                    "--cache-root",
+                                                    str(cache),
+                                                    "--lane",
+                                                    "focused",
+                                                    "compile",
+                                                    "Source/unit.cpp",
+                                                    "--jobs",
+                                                    "4",
+                                                ]
+                                            )
+
+            receipt = json.loads(output.getvalue().splitlines()[-1])
+            stored = json.loads((lane / "last-receipt.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(receipt, stored)
+        self.assertEqual(receipt["format"], "teamleaderleo-fex-x86-host-compile-receipt-v1")
+        self.assertEqual(receipt["sourceFile"], "Source/unit.cpp")
+        self.assertEqual(receipt["objectTarget"], object_target)
+        self.assertEqual(receipt["head"], "a" * 40)
+        self.assertTrue(receipt["dirty"])
+        self.assertEqual(receipt["exitCode"], 0)
+        command = run.call_args.args[0]
+        self.assertEqual(command[-4:], ["--target", object_target, "--parallel", "4"])
 
     def test_plan_parser_and_command_are_exact_dry_run(self):
         args = dev_build.parser().parse_args(["plan", "vulkan-host-64"])
