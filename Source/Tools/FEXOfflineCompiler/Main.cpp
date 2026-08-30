@@ -545,7 +545,10 @@ static std::optional<std::string> GenerateSingleCache(FEXCore::ExecutableFileInf
 
     auto Filename = fmt::format("{}{}-{:016x}", OutDir, FEXCore::CodeMap::GetBaseFilename(Binary, false), CodeCacheConfigId);
     auto FilenameNew = Filename + ".new";
-    int fd = open(FilenameNew.c_str(), O_CREAT | O_WRONLY | O_BINARY, 0644);
+    // A previous interrupted generation may have left a longer .new file.
+    // Exact file-layout validation rejects trailing bytes, so always begin
+    // the replacement generation from an empty inode.
+    int fd = open(FilenameNew.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_BINARY, 0644);
     {
       auto Entry = SyscallHandler->LookupExecutableFileSection(Thread, SyscallHandler->VAFileStart).value();
 #ifndef _WIN32

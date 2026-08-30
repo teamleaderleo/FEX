@@ -16,6 +16,7 @@
 #include <Interface/IR/PassManager.h>
 
 #include <FEXCore/Config/Config.h>
+#include <FEXCore/Core/CodeCacheFile.h>
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/HLE/SourcecodeResolver.h>
 #include <FEXCore/HLE/SyscallHandler.h>
@@ -315,27 +316,6 @@ uint64_t CodeCache::ComputeCodeMapId(std::string_view Filename, int FD) {
   return XXH3_64bits(Filename.data(), Filename.size());
 }
 
-struct CodeCacheHeader {
-  std::array<char, 4> Magic = ExpectedMagic;
-  // Version history:
-  // 1: Initial version
-  // 2: Padding code buffer data to enable direct mapping
-  // 3: Bind contents to the effective code-generation configuration
-  uint32_t FormatVersion = ExpectedFormatVersion;
-  uint8_t FEXVersion[20] = {};
-  uint64_t ConfigId;
-  uint32_t NumBlocks;
-  uint32_t NumCodePages;
-  uint32_t CodeBufferSize;
-  uint32_t NumRelocations;
-  uint32_t padding;
-  uint64_t SerializedBaseAddress;
-  // TODO: Consider including information from LookupCache.BlockLinks
-
-  static constexpr std::array<char, 4> ExpectedMagic = {'F', 'X', 'C', 'C'};
-  static constexpr uint32_t ExpectedFormatVersion = 3;
-};
-
 template<typename T>
 concept OrderedContainer = requires { typename T::key_compare; };
 
@@ -343,11 +323,13 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
   auto CodeBuffer = CTX.GetLatest();
   auto& LookupCache = *Thread.LookupCache->Shared;
   auto Relocations = Thread.CPUBackend->TakeRelocations(SourceBinary.FileStartVA);
+  LOGMAN_THROW_A_FMT(std::ranges::is_sorted(Relocations, {}, [](const auto& Relocation) { return Relocation.Header.Offset; }),
+                     "Code cache relocations aren't sorted");
 
   // Write file header
-  CodeCacheHeader header {};
+  CodeCacheFile::Header header {};
   static_assert(GIT_HASH.size() == sizeof(header.FEXVersion));
-  std::ranges::copy(GIT_HASH, header.FEXVersion);
+  header.FEXVersion = GIT_HASH;
   header.ConfigId = GetConfigId();
   header.NumBlocks = LookupCache.BlockList.size();
   header.NumCodePages = LookupCache.CodePages.size();
@@ -651,56 +633,18 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
 
   FEXCORE_PROFILE_SCOPED("LoadCache");
 
-  // Read file header
-  CodeCacheHeader header {};
-  ::memcpy(&header, CacheFile.data(), sizeof(header));
-
-  if (!std::ranges::equal(header.Magic, header.ExpectedMagic)) {
-    LogMan::Msg::EFmt("Invalid cache file header");
+  const auto Validation = CodeCacheFile::Validate(CacheFile, GIT_HASH, GetConfigId());
+  if (!Validation.Parsed) {
+    LogMan::Msg::IFmt("Invalid code cache file ({}); skipping", CodeCacheFile::ToString(Validation.Error));
     return nullptr;
   }
+  const auto& Layout = *Validation.Parsed;
+  const auto& header = Layout.FileHeader;
 
-  if (header.FormatVersion != header.ExpectedFormatVersion) {
-    LogMan::Msg::IFmt("Unsupported code cache format {}; expected {}", header.FormatVersion, header.ExpectedFormatVersion);
-    return nullptr;
-  }
-
-  if (!std::ranges::equal(header.FEXVersion, GIT_HASH)) {
-    LogMan::Msg::IFmt("Cache generated from old FEX version {:02x}, current is {:02x}; skipping", fmt::join(header.FEXVersion, ""),
-                      fmt::join(GIT_HASH, ""));
-    return nullptr;
-  }
-
-  if (header.ConfigId != GetConfigId()) {
-    LogMan::Msg::IFmt("Code cache configuration mismatch; skipping");
-    return nullptr;
-  }
-
-  if (header.NumBlocks == 0) {
-    // Valid caches are never empty
-    LogMan::Msg::IFmt("Code cache empty, aborting");
-    return nullptr;
-  }
-
-  // Skip over BlockEntry data since it won't be used until EnableLoadedSection
-  // TODO: Store direct offset to relocations in the header
-  auto* BlockListStart = CacheFile.data() + sizeof(header);
-  auto* Cursor = BlockListStart;
-  for (uint32_t i = 0; i < header.NumBlocks; ++i) {
-    Cursor += sizeof(uint64_t); // guest address
-    Cursor += sizeof(uint64_t); // host code address
-    uint64_t NumGuestCodePages;
-    ::memcpy(&NumGuestCodePages, Cursor, sizeof(NumGuestCodePages));
-    Cursor += sizeof(NumGuestCodePages);
-    Cursor += NumGuestCodePages * sizeof(uint64_t);
-  }
-
-  auto Relocations = std::span {reinterpret_cast<const FEXCore::CPU::Relocation*>(Cursor), header.NumRelocations};
-  Cursor += Relocations.size_bytes();
-
-  // Pad to next page to get the code buffer data
-  Cursor = reinterpret_cast<std::byte*>(AlignUp(reinterpret_cast<uintptr_t>(Cursor), Utils::FEX_PAGE_SIZE));
-  auto CodeDataInFile = std::span {Cursor, header.CodeBufferSize};
+  auto* BlockListStart = CacheFile.data() + Layout.BlockListOffset;
+  auto Relocations = std::span {reinterpret_cast<const FEXCore::CPU::Relocation*>(CacheFile.data() + Layout.RelocationsOffset),
+                                header.NumRelocations};
+  auto CodeDataInFile = CacheFile.subspan(Layout.CodeBufferOffset, header.CodeBufferSize);
 
 #ifndef _WIN32
   // Allocate target memory for post-relocation code. This is PROT_NONE until
@@ -729,7 +673,7 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
   // Group relocations by page
   size_t NumPages = header.CodeBufferSize / Utils::FEX_PAGE_SIZE;
   fextl::vector<MappedCodeCacheFile::PageRelocationRange> PageRelocationRanges(NumPages, {0, 0});
-  auto RelocBaseOffset = std::as_bytes(Relocations).data() - CacheFile.data();
+  auto RelocBaseOffset = Layout.RelocationsOffset;
   auto RelocIt = Relocations.begin();
   for (size_t Page = 0; Page < NumPages; ++Page) {
     auto EndRelocIt = std::upper_bound(RelocIt, Relocations.end(), Page,
