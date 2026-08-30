@@ -18,6 +18,9 @@ add_test(NAME VulkanInstancePNextCopyInventory.ThunkGen
 add_test(NAME VulkanRepackCleanupInventory.ThunkGen
   COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_repack_cleanup_inventory.py" "${CMAKE_SOURCE_DIR}")
 
+add_test(NAME VulkanResidentBridgeInventory.ThunkGen
+  COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_resident_bridge_inventory.py" "${CMAKE_SOURCE_DIR}")
+
 add_custom_target(thunkgen_tests
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
   USES_TERMINAL
