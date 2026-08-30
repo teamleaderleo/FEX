@@ -11,8 +11,8 @@ Two narrow exceptions cover product boundaries that benefit from a same-reposito
 - `.github/workflows/focused-compiler-compat.yml` watches the thunk generator, shared host layout
   helpers, GL thunk sources, their focused tests and the lane itself. It runs two exact char-pointer
   return tests and builds only `GL-host-64` on GitHub's `ubuntu-26.04` preview image with Clang 21.
-- `.github/workflows/focused-code-cache.yml` watches the format-3 whole-file cache parser, its direct
-  consumer, its test and their CMake registration. It compiles the pure parser directly into
+- `.github/workflows/focused-code-cache.yml` watches the format-3 whole-file cache parser, its test
+  and focused test registration. It compiles the pure parser directly into
   `FEXCore_Tests_CodeCacheFile` rather than linking the full JIT library, then runs only the
   discovered `*.CodeCacheFile.FEXCore_Tests` cases with the complete LLVM/Clang 18 development
   package on `ubuntu-24.04`. A producer change still gets an explicit affected-target build in its
