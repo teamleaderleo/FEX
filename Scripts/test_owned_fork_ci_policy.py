@@ -161,11 +161,17 @@ class OwnedForkCIPolicyTest(unittest.TestCase):
 
     def test_arm64_compiler_cache_is_bounded_and_profile_scoped(self) -> None:
         workflow = self.workflow("focused-arm64-research.yml")
+        job_environment = workflow.split("    steps:", 1)[0]
         self.assertIn("actions/cache/restore@", workflow)
         self.assertIn("actions/cache/save@", workflow)
         self.assertIn("CCACHE_MAXSIZE: 1Gi", workflow)
         self.assertIn("CCACHE_COMPILERCHECK: content", workflow)
-        self.assertIn("path: ${{ env.CCACHE_DIR }}", workflow)
+        self.assertNotIn("${{ runner.", job_environment)
+        self.assertIn(
+            'printf \'CCACHE_DIR=%s\\n\' "${RUNNER_TEMP}/fex-arm64-ccache"',
+            workflow,
+        )
+        self.assertIn("path: ${{ runner.temp }}/fex-arm64-ccache", workflow)
         self.assertIn(
             "if: ${{ inputs.profile == 'arm64-disk-cache-shapes-v1' }}",
             workflow,
