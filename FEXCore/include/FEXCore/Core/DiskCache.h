@@ -3,6 +3,7 @@
 #include "FEXCore/Core/CodeCache.h"
 #include "FEXCore/Core/Context.h"
 #include "FEXCore/Core/DiskCacheFile.h"
+#include "FEXCore/Core/DiskCacheIndexFile.h"
 #include "Interface/Core/JIT/Relocations.h"
 #include "Interface/Core/Frontend.h"
 #include "Interface/Core/CPUBackend.h"
@@ -27,23 +28,6 @@ namespace Context {
 }
 
 namespace DiskCache {
-
-  namespace MesaFOZ {
-
-#define FOSSILIZE_BLOB_HASH_LENGTH 40 /* SHA1 hexadecimal string length */
-
-    struct __attribute__((packed)) foz_payload_key {
-      uint8_t bytes[FOSSILIZE_BLOB_HASH_LENGTH];
-    };
-
-    struct __attribute__((packed)) foz_payload_header {
-      uint32_t payload_size;
-      uint32_t format;
-      uint32_t crc;
-      uint32_t uncompressed_size;
-    };
-
-  } // namespace MesaFOZ
 
   class IndexedDB;
 
@@ -93,7 +77,8 @@ namespace DiskCache {
     ssize_t Size();
     bool ReadAll(fextl::vector<uint8_t>& Out); // from first blob
     bool ReadBlob(uint64_t Offset, std::span<uint8_t> OutBlob);
-    bool WriteBlob(const MesaFOZ::foz_payload_key& Key, std::span<const std::span<const uint8_t>> BlobChunks, uint64_t& OutBlobOffset);
+    bool WriteBlob(const MesaFOZ::foz_payload_key& Key, std::span<const std::span<const uint8_t>> BlobChunks, uint64_t& OutBlobOffset,
+                   std::optional<uint64_t> WriteOffset = std::nullopt);
 
   private:
     static constexpr uint32_t OPEN_LOCK_TIMEOUT_MS = 100;
@@ -119,6 +104,8 @@ namespace DiskCache {
     uint8_t* CacheFileMapping = nullptr;
     std::atomic<uint64_t> CacheFileSize;
     FOZFile IndexFOZ;
+    uint64_t ObservedIndexFileSize {};
+    std::optional<uint64_t> IndexAppendOffset;
     bool ReadOnly = false;
   };
 

@@ -6,12 +6,17 @@ on:
     paths:
       - .github/workflows/focused-code-cache.yml
       - FEXCore/include/FEXCore/Core/CodeCacheFile.h
+      - FEXCore/include/FEXCore/Core/DiskCache.h
       - FEXCore/include/FEXCore/Core/DiskCacheFile.h
+      - FEXCore/include/FEXCore/Core/DiskCacheIndexFile.h
       - FEXCore/Source/Interface/Core/CodeCacheFile.cpp
+      - FEXCore/Source/Interface/Core/DiskCache.cpp
       - FEXCore/Source/Interface/Core/DiskCacheFile.cpp
+      - FEXCore/Source/Interface/Core/DiskCacheIndexFile.cpp
       - FEXCore/unittests/APITests/CMakeLists.txt
       - FEXCore/unittests/APITests/CodeCacheFile.cpp
       - FEXCore/unittests/APITests/DiskCacheFile.cpp
+      - FEXCore/unittests/APITests/DiskCacheIndexFile.cpp
 
 permissions:
   contents: read
@@ -82,6 +87,9 @@ jobs:
           python3 Scripts/ResearchDevBuild.py \
             --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
             build FEXCore_Tests_DiskCacheFile --jobs 4
+          python3 Scripts/ResearchDevBuild.py \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
+            build FEXCore_Tests_DiskCacheIndexFile --jobs 4
 
       - name: Run only the pure cache-parser cases
         shell: bash
@@ -91,7 +99,7 @@ jobs:
             --test-dir "${RUNNER_TEMP}/fex-dev/views/code-cache-parser/build" \
             --output-on-failure \
             --no-tests=error \
-            -R '[.](CodeCacheFile|DiskCacheFile)[.]FEXCore_Tests$'
+            -R '[.](CodeCacheFile|DiskCacheFile|DiskCacheIndexFile)[.]FEXCore_Tests$'
 
       - name: Prove final source identity
         if: always()

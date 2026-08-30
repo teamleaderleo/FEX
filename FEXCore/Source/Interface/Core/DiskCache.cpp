@@ -10,9 +10,9 @@
 #include "FEXCore/HLE/SyscallHandler.h"
 #include "FEXCore/Utils/File.h"
 #include "FEXCore/fextl/memory.h"
+#include <charconv>
 #include <cstdint>
 #include <cstring>
-#include <charconv>
 #include <span>
 
 namespace FEXCore {
@@ -29,13 +29,6 @@ namespace DiskCache {
 
     static const uint8_t stream_reference_magic_and_version[FOZ_REF_MAGIC_SIZE] = {
       0x81, 'F', 'O', 'S', 'S', 'I', 'L', 'I', 'Z', 'E', 'D', 'B', 0, 0, 0, FOSSILIZE_FORMAT_VERSION, /* 4 bytes to use for versioning. */
-    };
-
-    struct __attribute__((packed)) mesa_index_db_file_entry {
-      uint64_t hash;
-      uint32_t size;
-      uint64_t last_access_time;
-      uint64_t cache_db_file_offset;
     };
 
   } // namespace MesaFOZ
@@ -111,12 +104,16 @@ namespace DiskCache {
     return true;
   }
 
-  bool FOZFile::WriteBlob(const MesaFOZ::foz_payload_key& Key, std::span<const std::span<const uint8_t>> BlobChunks, uint64_t& OutBlobOffset) {
+  bool FOZFile::WriteBlob(const MesaFOZ::foz_payload_key& Key, std::span<const std::span<const uint8_t>> BlobChunks, uint64_t& OutBlobOffset,
+                          std::optional<uint64_t> RequestedWriteOffset) {
     ssize_t FileSize = FD->Size();
     if (FileSize < 0) {
       return false;
     }
-    uint64_t WriteOffset = (uint64_t)FileSize;
+    if (RequestedWriteOffset && (*RequestedWriteOffset < FOZ_REF_MAGIC_SIZE || *RequestedWriteOffset > static_cast<uint64_t>(FileSize))) {
+      return false;
+    }
+    uint64_t WriteOffset = RequestedWriteOffset.value_or(static_cast<uint64_t>(FileSize));
 
     if (FD->PWrite(Key.bytes, sizeof(Key.bytes), WriteOffset) != sizeof(Key.bytes)) {
       return false;
@@ -182,38 +179,23 @@ namespace DiskCache {
       return;
     }
 
-    const uint8_t* IndexDataStart = Data.data();
-    const size_t IndexDataSize = Data.size();
-    size_t ReadOffset = 0;
-    while (ReadOffset + sizeof(MesaFOZ::foz_payload_key) + sizeof(MesaFOZ::foz_payload_header) <= IndexDataSize) {
-      const auto* FOZKey = reinterpret_cast<const MesaFOZ::foz_payload_key*>(IndexDataStart + ReadOffset);
-      ReadOffset += sizeof(MesaFOZ::foz_payload_key);
-      const auto* FOZHeader = reinterpret_cast<const MesaFOZ::foz_payload_header*>(IndexDataStart + ReadOffset);
-      ReadOffset += sizeof(MesaFOZ::foz_payload_header);
-
-      if (FOZHeader->payload_size != sizeof(MesaFOZ::mesa_index_db_file_entry) || ReadOffset + FOZHeader->payload_size > IndexDataSize) {
-        break;
-      }
-      const auto* IndexBlobPayload = reinterpret_cast<const MesaFOZ::mesa_index_db_file_entry*>(IndexDataStart + ReadOffset);
-      ReadOffset += FOZHeader->payload_size;
-
-      // skip corrupt (carefully) so we don't have to figure that out in the hot path later
-      if (IndexBlobPayload->cache_db_file_offset > (uint64_t)CacheFOZSize ||
-          IndexBlobPayload->size > (uint64_t)CacheFOZSize - IndexBlobPayload->cache_db_file_offset) {
-        continue;
-      }
-      if (FOZKey->bytes[39] != 0xFF) {
-        uint64_t Key;
-        std::from_chars(reinterpret_cast<const char*>(FOZKey->bytes), reinterpret_cast<const char*>(&FOZKey->bytes[16]), Key, 16);
-        if (IndexBlobPayload->hash != Key) {
-          continue;
-        }
-        CacheIndex.insert({IndexBlobPayload->hash, {this, IndexBlobPayload->cache_db_file_offset, IndexBlobPayload->size}});
-      } else {
+    const auto Parsed = DiskCacheIndexFile::Parse(Data, static_cast<uint64_t>(CacheFOZSize));
+    for (const auto& Record : Parsed.Records) {
+      if (Record.Metadata) {
         FoundMetadata = true;
+      } else {
+        CacheIndex.insert({Record.Hash, {this, Record.CacheFileOffset, Record.Size}});
       }
     }
-    // could truncate/delete index if we don't end up perfectly at end here
+
+    ObservedIndexFileSize = FOZ_REF_MAGIC_SIZE + Data.size();
+    if (!ReadOnly) {
+      if (Parsed.State == DiskCacheIndexFile::ParseState::IncompleteSuffix) {
+        IndexAppendOffset = FOZ_REF_MAGIC_SIZE + Parsed.ValidSize;
+      } else {
+        IndexAppendOffset.reset();
+      }
+    }
   }
 
   bool IndexedDB::ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob) {
@@ -234,9 +216,14 @@ namespace DiskCache {
       // shouldn't happen
       return false;
     }
-    uint64_t Hash;
+    uint64_t Hash {};
     if (Key.bytes[39] != 0xFF) {
-      std::from_chars(reinterpret_cast<const char*>(Key.bytes), reinterpret_cast<const char*>(&Key.bytes[16]), Hash, 16);
+      const auto* KeyBegin = reinterpret_cast<const char*>(Key.bytes);
+      const auto* KeyEnd = KeyBegin + 16;
+      const auto ParsedKey = std::from_chars(KeyBegin, KeyEnd, Hash, 16);
+      if (ParsedKey.ec != std::errc {} || ParsedKey.ptr != KeyEnd) {
+        return false;
+      }
     } else {
       Hash = ~0;
     }
@@ -252,6 +239,29 @@ namespace DiskCache {
       CacheFOZ.Unlock();
       IndexFOZ.Unlock();
       return false;
+    }
+
+    const ssize_t CurrentIndexFileSize = IndexFOZ.Size();
+    if (CurrentIndexFileSize < 0) {
+      CacheFOZ.Unlock();
+      IndexFOZ.Unlock();
+      return false;
+    }
+    if (IndexAppendOffset || static_cast<uint64_t>(CurrentIndexFileSize) != ObservedIndexFileSize) {
+      fextl::vector<uint8_t> IndexData;
+      const ssize_t CacheFileSize = CacheFOZ.Size();
+      if (CacheFileSize < 0 || !IndexFOZ.ReadAll(IndexData)) {
+        CacheFOZ.Unlock();
+        IndexFOZ.Unlock();
+        return false;
+      }
+      const auto Parsed = DiskCacheIndexFile::Parse(IndexData, static_cast<uint64_t>(CacheFileSize));
+      ObservedIndexFileSize = FOZ_REF_MAGIC_SIZE + IndexData.size();
+      if (Parsed.State == DiskCacheIndexFile::ParseState::IncompleteSuffix) {
+        IndexAppendOffset = FOZ_REF_MAGIC_SIZE + Parsed.ValidSize;
+      } else {
+        IndexAppendOffset.reset();
+      }
     }
 
     // write cache side first so we get offset for index
@@ -270,10 +280,24 @@ namespace DiskCache {
 
     std::span<const uint8_t> IndexBlobChunks[] = {{(const uint8_t*)&IndexEntry, sizeof(IndexEntry)}};
     uint64_t UnusedIndexBlobOffset = 0;
-    if (!IndexFOZ.WriteBlob(Key, IndexBlobChunks, UnusedIndexBlobOffset)) {
+    if (!IndexFOZ.WriteBlob(Key, IndexBlobChunks, UnusedIndexBlobOffset, IndexAppendOffset)) {
       CacheFOZ.Unlock();
       IndexFOZ.Unlock();
       return false;
+    }
+
+    const uint64_t IndexRecordEnd = UnusedIndexBlobOffset + sizeof(IndexEntry);
+    const ssize_t NewIndexFileSize = IndexFOZ.Size();
+    if (NewIndexFileSize < 0) {
+      CacheFOZ.Unlock();
+      IndexFOZ.Unlock();
+      return false;
+    }
+    ObservedIndexFileSize = static_cast<uint64_t>(NewIndexFileSize);
+    if (IndexRecordEnd < ObservedIndexFileSize) {
+      IndexAppendOffset = IndexRecordEnd;
+    } else {
+      IndexAppendOffset.reset();
     }
 
     CacheFOZ.Unlock();
