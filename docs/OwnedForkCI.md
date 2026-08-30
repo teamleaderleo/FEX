@@ -16,10 +16,11 @@ Two narrow exceptions cover product boundaries that benefit from a same-reposito
   compiles the three pure parser targets plus the one real `DiskCacheIndexRecovery` file-I/O owner,
   then runs only their discovered `*.CodeCacheFile.FEXCore_Tests`, `*.DiskCacheFile.FEXCore_Tests`,
   `*.DiskCacheIndexFile.FEXCore_Tests` and `*.DiskCacheIndexRecovery.FEXCore_Tests` cases with the
-  complete LLVM/Clang 18 development package on `ubuntu-24.04`. The integration owner links
-  FEXCore so a watched `DiskCache.cpp` or shared file primitive cannot receive a parser-only green
-  check without compiling. It does not run a guest, another FEXCore test executable or a broad
-  inherited matrix.
+  complete LLVM/Clang 18 development package on `ubuntu-24.04`. The recovery owner compiles the
+  production `DiskCacheStorage.cpp` and its file/index primitives directly, without the runtime/JIT
+  FEXCore graph. A storage edit therefore still exercises real files, locks and recovery behavior
+  without rebuilding unrelated translation machinery. It does not run a guest, another FEXCore
+  test executable or a broad inherited matrix.
 
 Both refuse external pull-request branches and may be dispatched manually. Neither runs a guest, a
 test family or an inherited matrix. The Clang 21 preview image changes weekly and carries no GA SLA,

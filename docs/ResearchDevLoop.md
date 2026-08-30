@@ -558,6 +558,16 @@ the whole raw Ninja listing equivalent. The result covers this exact toolchain a
 boundary; it does not justify incremental reuse after a profile mismatch, missing graph or explicit
 fresh-configure request.
 
+The block-cache recovery owner was then separated from runtime/JIT ownership at exact parent
+`667b61d3226b7858a934b304c5f39267731caeaf`. In fresh external lanes with the same warm compiler
+cache, its target graph fell from 363 to 125 Ninja steps (65.6%). One real comment edit in the
+production storage implementation changed from compile + `libFEXCore.a` archive + test relink in
+3.373 seconds to storage compile + test relink in 0.303 seconds (91.0%). A fresh focused target fell
+from 0.674 to 0.368 seconds (45.4%), while one sampled setup/configure cost did not improve (5.39
+versus 5.83 seconds). All four real-file recovery cases passed, and a separate `FEXCore` target
+build proved the new product-library ownership. These measurements justify the smaller edit/test
+owner; they do not claim faster CMake setup or broad product acceptance.
+
 ## Ubuntu development packages used on big-red
 
 The successful thunk-enabled x86 configure required the compiler/build tools plus Clang/LLVM

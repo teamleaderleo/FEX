@@ -1,9 +1,10 @@
 # Block-level Fossilize disk cache
 
 FEX has more than one persistent translated-code mechanism. This page covers the online,
-block-level Fossilize database implemented by `DiskCache.cpp`. It is not the offline whole-file
-cache described in [Whole-file code-cache identity](WholeFileCodeCacheIdentity.md), the live
-guest-to-host lookup tables, or compiler `ccache` used by developers.
+block-level Fossilize database. `DiskCache.cpp` owns runtime/JIT integration and
+`DiskCacheStorage.cpp` owns its files, locks, index and recovery behavior. This is not the offline
+whole-file cache described in [Whole-file code-cache identity](WholeFileCodeCacheIdentity.md), the
+live guest-to-host lookup tables, or compiler `ccache` used by developers.
 
 ## The shortest useful model
 
@@ -115,11 +116,12 @@ covers all 83 non-empty strict record prefixes, ordinary semantic skips, first-w
 monotonic salvage of an already-poisoned suffix. It proves an append boundary, not power-loss
 durability or transactionality. Do not turn either green parser into those claims.
 
-`FEXCore_Tests_DiskCacheIndexRecovery` is the more expensive acceptance owner. It links FEXCore and
-uses temporary real data/index files to prove read-only non-mutation, replacement of a 12-byte torn
-index suffix, reclamation of a complete trailing data-only record and size revalidation when a
-second handle appends first. Use the pure parser target for the ordinary edit loop; rerun the
-integration owner only when file/lock/recovery wiring changes.
+`FEXCore_Tests_DiskCacheIndexRecovery` is the file-I/O acceptance owner. It compiles the production
+`DiskCacheStorage.cpp` directly with the file/index primitives, without linking the runtime/JIT
+`FEXCore` graph. Temporary real data/index files prove read-only non-mutation, replacement of a
+12-byte torn index suffix, reclamation of a complete trailing data-only record and size
+revalidation when a second handle appends first. Use this owner when file/lock/recovery wiring
+changes; build `FEXCore` separately when the storage/runtime ownership boundary changes.
 
 The controlled ARM cache-shape profile additionally requires its new cold cache to be physically
 contiguous with zero unreferenced bytes before the warm immutable-cache check. A real user corpus
