@@ -5,18 +5,25 @@ on:
   pull_request:
     paths:
       - .github/workflows/focused-code-cache.yml
+      - FEXCore/include/FEXCore/Config/Config.h
+      - FEXCore/include/FEXCore/Core/CodeCache.h
+      - FEXCore/include/FEXCore/Core/CodeCacheConfig.h
       - FEXCore/include/FEXCore/Core/CodeCacheFile.h
       - FEXCore/include/FEXCore/Core/DiskCache.h
       - FEXCore/include/FEXCore/Core/DiskCacheFile.h
       - FEXCore/include/FEXCore/Core/DiskCacheIndexFile.h
       - FEXCore/include/FEXCore/Core/DiskCacheStorage.h
+      - FEXCore/include/FEXCore/Core/HostFeatures.h
       - FEXCore/include/FEXCore/Utils/File.h
+      - FEXCore/Source/Interface/Config/Config.cpp
+      - FEXCore/Source/Interface/Core/CodeCacheConfig.cpp
       - FEXCore/Source/Interface/Core/CodeCacheFile.cpp
       - FEXCore/Source/Interface/Core/DiskCache.cpp
       - FEXCore/Source/Interface/Core/DiskCacheFile.cpp
       - FEXCore/Source/Interface/Core/DiskCacheIndexFile.cpp
       - FEXCore/Source/Interface/Core/DiskCacheStorage.cpp
       - FEXCore/unittests/APITests/CMakeLists.txt
+      - FEXCore/unittests/APITests/CodeCacheConfig.cpp
       - FEXCore/unittests/APITests/CodeCacheFile.cpp
       - FEXCore/unittests/APITests/DiskCacheFile.cpp
       - FEXCore/unittests/APITests/DiskCacheIndexFile.cpp
@@ -26,11 +33,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: focused-cache-parsers-${{ github.event.pull_request.number || github.ref }}
+  group: focused-cache-owners-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  cache-parsers:
+  cache-owners:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -81,32 +88,35 @@ jobs:
           set -euo pipefail
           python3 Scripts/ResearchDevBuild.py submodules --jobs 8
 
-      - name: Build the pure parsers and one disk-I/O owner
+      - name: Build the identity, parser, and disk-I/O owners
         shell: bash
         run: |
           set -euo pipefail
           python3 Scripts/ResearchDevBuild.py \
-            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-owner \
+            build FEXCore_Tests_CodeCacheConfig --jobs 4
+          python3 Scripts/ResearchDevBuild.py \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-owner \
             build FEXCore_Tests_CodeCacheFile --jobs 4
           python3 Scripts/ResearchDevBuild.py \
-            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-owner \
             build FEXCore_Tests_DiskCacheFile --jobs 4
           python3 Scripts/ResearchDevBuild.py \
-            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-owner \
             build FEXCore_Tests_DiskCacheIndexFile --jobs 4
           python3 Scripts/ResearchDevBuild.py \
-            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-owner \
             build FEXCore_Tests_DiskCacheIndexRecovery --jobs 4
 
-      - name: Run only the cache-parser and disk-I/O owner cases
+      - name: Run only the identity, parser, and disk-I/O owner cases
         shell: bash
         run: |
           set -euo pipefail
           ctest \
-            --test-dir "${RUNNER_TEMP}/fex-dev/views/code-cache-parser/build" \
+            --test-dir "${RUNNER_TEMP}/fex-dev/views/code-cache-owner/build" \
             --output-on-failure \
             --no-tests=error \
-            -R '[.](CodeCacheFile|DiskCacheFile|DiskCacheIndexFile|DiskCacheIndexRecovery)[.]FEXCore_Tests$'
+            -R '[.](CodeCacheConfig|CodeCacheFile|DiskCacheFile|DiskCacheIndexFile|DiskCacheIndexRecovery)[.]FEXCore_Tests$'
 
       - name: Prove final source identity
         if: always()
