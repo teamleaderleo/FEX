@@ -9,6 +9,10 @@ test, see [Vulkan proc-address routing](VulkanProcAddressRouting.md).
 For the custom struct-repacking lifecycle, const-safe host cleanup, Vulkan `pNext` ownership, and
 its allocation-balance oracle, see [Custom thunk repacking](ThunkRepacking.md).
 
+For the escaped-code lifetime problem, the optional direction-aware generator output, and the
+boundary before any library can adopt a resident companion, see
+[Resident thunk bridges](ResidentThunkBridge.md).
+
 ## One target, not everything
 
 Explicitly initialize the pinned submodules once, then build only the target that owns the current

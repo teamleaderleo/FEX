@@ -6,6 +6,8 @@
 struct OutputFilenames {
   std::string host;
   std::string guest;
+  std::string guest_bridge;
+  std::string guest_bridge_accessors;
 };
 
 class AnalyzeDataLayoutActionFactory : public clang::tooling::FrontendActionFactory {

@@ -10,6 +10,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string_view>
 
 #include "common.h"
@@ -67,6 +68,12 @@ struct Fixture {
     SourceWithAST host;
   };
 
+  struct ResidentGenOutput {
+    std::string guest;
+    std::string bridge;
+    std::string accessors;
+  };
+
   /**
    * Runs the given given code through the thunk generator and verifies the output compiles.
    *
@@ -74,6 +81,7 @@ struct Fixture {
    * It will be prepended to "code" before processing and also to the generator output.
    */
   SourceWithAST run_thunkgen_guest(std::string_view prelude, std::string_view code, bool silent = false);
+  ResidentGenOutput run_thunkgen_guest_outputs(std::string_view prelude, std::string_view code, bool resident);
   SourceWithAST run_thunkgen_host(std::string_view prelude, std::string_view code, GuestABI = GuestABI::X86_64, bool silent = false);
   GenOutput run_thunkgen(std::string_view prelude, std::string_view code, bool silent = false);
 
@@ -243,6 +251,32 @@ SourceWithAST Fixture::run_thunkgen_guest(std::string_view prelude, std::string_
     file.read(result.data() + current_size, result.size());
   }
   return SourceWithAST {std::string {prelude} + result};
+}
+
+Fixture::ResidentGenOutput Fixture::run_thunkgen_guest_outputs(std::string_view prelude, std::string_view code, bool resident) {
+  const std::string full_code = std::string {prelude} + std::string {code};
+
+  auto data_layout_analysis_factory = std::make_unique<AnalyzeDataLayoutActionFactory>();
+  run_tool(*data_layout_analysis_factory, full_code, false);
+  auto& data_layout = data_layout_analysis_factory->GetDataLayout();
+
+  output_filenames.guest_bridge = resident ? tmpdir + "/thunkgen_guest_bridge" : "";
+  output_filenames.guest_bridge_accessors = resident ? tmpdir + "/thunkgen_guest_bridge_accessors" : "";
+  run_tool(std::make_unique<GenerateThunkLibsActionFactory>(libname, output_filenames, data_layout), full_code, false);
+
+  auto read_file = [](const std::string& filename) {
+    std::ifstream file {filename};
+    return std::string {std::istreambuf_iterator<char> {file}, std::istreambuf_iterator<char> {}};
+  };
+
+  ResidentGenOutput result {
+    .guest = read_file(output_filenames.guest),
+    .bridge = resident ? read_file(output_filenames.guest_bridge) : "",
+    .accessors = resident ? read_file(output_filenames.guest_bridge_accessors) : "",
+  };
+  output_filenames.guest_bridge.clear();
+  output_filenames.guest_bridge_accessors.clear();
+  return result;
 }
 
 /**
@@ -517,6 +551,83 @@ TEST_CASE_METHOD(Fixture, "FunctionPointerParameter") {
                              hasInitializer(hasDescendant(declRefExpr(to(cxxMethodDecl(hasName("Call"), ofClass(hasName("GuestWrapperForHos"
                                                                                                                         "tFunctio"
                                                                                                                         "n"))))))))));
+}
+
+TEST_CASE_METHOD(Fixture, "ResidentBridgeGeneration") {
+  auto count = [](std::string_view text, std::string_view needle) {
+    std::size_t result {};
+    for (std::size_t offset {}; (offset = text.find(needle, offset)) != std::string_view::npos; offset += needle.size()) {
+      ++result;
+    }
+    return result;
+  };
+  auto as_main_file = [](std::string generated_header) {
+    const std::string_view pragma_once = "#pragma once\n";
+    const auto position = generated_header.find(pragma_once);
+    REQUIRE(position != std::string::npos);
+    generated_header.erase(position, pragma_once.size());
+    return generated_header;
+  };
+  const std::string bridge_prelude =
+    "#include <cstdint>\n"
+    "template<typename> struct callback_thunk_defined;\n"
+    "#define MAKE_CALLBACK_THUNK(name, sig, hash) template<> struct callback_thunk_defined<sig> {};\n"
+    "template<typename Result, typename... Args> Result (*GetCallerForHostFunction(Result (*)(Args...)))(Args...);\n"
+    "template<typename> struct CallbackUnpack { static void Unpack(uintptr_t, void*); };\n";
+
+  const std::string type_only = "template<typename> struct fex_gen_type {};\n"
+                                "template<> struct fex_gen_type<int(char, char)> {};\n";
+  const auto type_control = run_thunkgen_guest_outputs("", type_only, false);
+  const auto type_resident = run_thunkgen_guest_outputs("", type_only, true);
+
+  SECTION("ordinary output is unchanged and pure invokers do not gain unpackers") {
+    CHECK(type_resident.guest == type_control.guest);
+    CHECK(count(type_resident.bridge, "MAKE_CALLBACK_THUNK(") == 1);
+    CHECK(count(type_resident.bridge, "_invoker_") == 1);
+    CHECK(count(type_resident.bridge, "_unpacker_") == 0);
+    CHECK(count(type_resident.accessors, "_invoker_") == 2);
+    CHECK(count(type_resident.accessors, "_unpacker_") == 0);
+    CHECK_NOTHROW(SourceWithAST {bridge_prelude + type_resident.bridge});
+
+    const auto use_invoker = as_main_file(type_resident.accessors) +
+      "\nauto resident_invoker = FEXGetResidentCallerForHostFunction(static_cast<int (*)(char, char)>(nullptr));\n";
+    CHECK_NOTHROW(SourceWithAST {use_invoker});
+
+    const auto reject_unproven_callback = as_main_file(type_resident.accessors) +
+      "\nauto resident_unpacker = FEXGetResidentCallbackUnpacker(static_cast<int (*)(char, char)>(nullptr));\n";
+    CHECK_THROWS(SourceWithAST {reject_unproven_callback, true});
+  }
+
+  const std::string callback = "void func(int (*funcptr)(char, char));\n"
+                               "template<auto> struct fex_gen_config {};\n"
+                               "template<> struct fex_gen_config<func> {};\n";
+  const auto callback_control = run_thunkgen_guest_outputs("", callback, false);
+  const auto callback_resident = run_thunkgen_guest_outputs("", callback, true);
+
+  SECTION("real callback direction emits exactly one matching unpacker") {
+    CHECK(callback_resident.guest == callback_control.guest);
+    CHECK(count(callback_resident.bridge, "MAKE_CALLBACK_THUNK(") == 1);
+    CHECK(count(callback_resident.bridge, "_invoker_") == 1);
+    CHECK(count(callback_resident.bridge, "_unpacker_") == 1);
+    CHECK(count(callback_resident.accessors, "_invoker_") == 2);
+    CHECK(count(callback_resident.accessors, "_unpacker_") == 2);
+    CHECK_NOTHROW(SourceWithAST {bridge_prelude + callback_resident.bridge});
+
+    const auto use_callback = as_main_file(callback_resident.accessors) +
+      "\nauto resident_unpacker = FEXGetResidentCallbackUnpacker(static_cast<int (*)(char, char)>(nullptr));\n";
+    CHECK_NOTHROW(SourceWithAST {use_callback});
+  }
+
+  SECTION("duplicate signatures retain one identity and deterministic output") {
+    const auto combined = run_thunkgen_guest_outputs(type_only, callback, true);
+    const auto repeated = run_thunkgen_guest_outputs(type_only, callback, true);
+    CHECK(count(combined.bridge, "MAKE_CALLBACK_THUNK(") == 1);
+    CHECK(count(combined.bridge, "_invoker_") == 1);
+    CHECK(count(combined.bridge, "_unpacker_") == 1);
+    CHECK(combined.guest == repeated.guest);
+    CHECK(combined.bridge == repeated.bridge);
+    CHECK(combined.accessors == repeated.accessors);
+  }
 }
 
 TEST_CASE_METHOD(Fixture, "MultipleParameters") {
