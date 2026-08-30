@@ -28,17 +28,37 @@ Each research PR should instead report:
 
 Reuse an existing exact-head result when code, toolchain, inputs, and relevant environment have not changed.
 
-## Focused self-hosted research lane
+## Shared profile carrier and platform adapters
+
+Both hosted ARM64 and self-hosted x86 experiments use
+`Scripts/ResearchProfileCarrier.py`. A profile is immutable product code; it owns setup, variants,
+controls, oracle and the small evidence files. The carrier binds the exact product and carrier
+commits, requires a clean pinned submodule graph, executes only committed `run.sh` bytes, enforces
+the declared timeout, terminates the profile process group on timeout and requires one bounded
+outcome document.
+
+GitHub must select a runner before it can read a product profile, so the repository retains two
+small scheduling adapters rather than one dynamic workflow:
+
+- `.github/workflows/focused-x86-research.yml` requires the exact
+  `self-hosted`, `X64`, `fex-research` labels and passes
+  `self-hosted-x86-fex-research` to the carrier;
+- `.github/workflows/focused-arm64-research.yml` uses GitHub's `ubuntu-24.04-arm` runner and passes
+  that exact platform to the carrier.
+
+A profile for one adapter is refused by the other. Neither adapter accepts a command, script body,
+target name, package list, branch-scoped product identity or arbitrary JSON. Add or refine a profile
+instead of registering another workflow.
+
+## Focused self-hosted x86 research carrier
 
 `.github/workflows/focused-x86-research.yml` is the default Actions escalation path for x86-host
-research. It is manual-only and accepts two bounded modes:
-
-- `build` compiles one exact CMake target with the `dev` profile;
-- `linux-test-build` builds `FEX`, `FEXServer`, and one exact 32- or 64-bit guest Linux-test binary.
-
-Both modes reuse `Scripts/ResearchDevBuild.py`, its stable external build path, CPU-bound ccache
-namespace, source-switch cleanup, lane lock, and exact-head receipt. They do not run a test suite or
-an x86 guest under FEX.
+research. Dispatch it only from the default branch carrier and provide one full immutable product
+SHA, one safe profile ID, one declared variant and bounded jobs. The checked-in
+`x86-codegen-snapshot-v1` profile is the first concrete contract: it composes three exact atomic
+snapshot/host-feature CTests and the `FEX`, `FEXServer`, and `FEXOfflineCompiler` affected targets in
+one retained external lane, then copies all six exact-head helper receipts into the carrier artifact.
+It runs no guest and is not broad FEX acceptance.
 
 The x86 workflow requires a repository runner carrying all three labels `self-hosted`, `X64`, and
 `fex-research`. Check runner availability before dispatch; a missing compatible runner means the job
@@ -50,15 +70,16 @@ gh api repos/teamleaderleo/FEX/actions/runners \
 
 gh workflow run focused-x86-research.yml \
   --repo teamleaderleo/FEX \
-  --ref MY_EXACT_BRANCH \
-  -f mode=build \
-  -f target=thunkgentest \
-  -f bitness=64 \
+  --ref main \
+  -f source_sha="$(git rev-parse HEAD)" \
+  -f profile=x86-codegen-snapshot-v1 \
+  -f variant=default \
   -f jobs=8
 ```
 
-The selected `--ref` is the product source revision. The emitted artifact is a convenience copy of
-the helper's receipt, not a broad acceptance badge.
+The selected `--ref` is the default-branch carrier, not a mutable product branch. The immutable
+`source_sha` owns the product and profile. The emitted artifact contains the carrier/submodule
+receipts plus profile-specific evidence; it is not a broad acceptance badge.
 
 An ARM64 profile must prove a small ordinary x86 control before its product-specific oracle. If the
 control traps in JIT code, a base and candidate that die at the same instruction are environment
@@ -95,10 +116,10 @@ Scripts/ResearchProfiles/<safe-id>/profile.json
 Scripts/ResearchProfiles/<safe-id>/run.sh
 ```
 
-The manifest declares the exact ID, fixed `ubuntu-24.04-arm` platform, timeout of at most 55
-minutes, and sorted allowed variants. `run.sh` owns setup, controls, oracle and profile-specific
-evidence. It receives fixed `FEX_RESEARCH_*` paths/identities and must write this file inside the
-private receipt directory on success:
+The manifest declares the exact ID, one supported platform adapter, timeout of at most 55 minutes,
+and sorted allowed variants. `run.sh` owns setup, controls, oracle and profile-specific evidence. It
+receives fixed `FEX_RESEARCH_*` paths/identities and must write this file inside the private receipt
+directory on success:
 
 ```json
 {"schemaVersion": 1, "status": "pass", "summary": "bounded factual result"}
@@ -142,10 +163,11 @@ Do this only after stating which unresolved risk needs that coverage. A queued s
 ## Disposable workflow lifecycle
 
 One-off experiment workflows remain registered in the Actions UI even when their branch is no
-longer active. Prefer a checked-in ARM64 profile so no new workflow registration is created. If the
-single carrier genuinely cannot express the required platform or permission boundary, record the
-one-off result receipt first, then retire its registration. The registry helper is dry-run by
-default and protects workflow paths present on the default branch or any open pull-request head:
+longer active. Prefer a checked-in profile so no new workflow registration is created. If the
+shared carrier and platform adapters genuinely cannot express the required platform or permission
+boundary, record the one-off result receipt first, then retire its registration. The registry
+helper is dry-run by default and protects workflow paths present on the default branch or any open
+pull-request head:
 
 ```bash
 python3 Scripts/ForkWorkflowRegistry.py \
@@ -155,7 +177,9 @@ python3 Scripts/ForkWorkflowRegistry.py \
 
 Inspect the plan and repeat the exact command with `--apply` to disable its candidates. Use `--keep-path .github/workflows/example.yml` for an additional explicit exception. Disabling is reversible and does not delete branches, workflow files, logs, artifacts, or recorded receipts.
 
-Prefer extending a reusable focused lane over creating another near-duplicate workflow. If a one-off workflow is still the clearest discriminator, give it a bounded question and retire it when that question is answered.
+Prefer adding a bounded checked-in profile over creating another near-duplicate workflow. If a
+one-off workflow is still the clearest platform or permission boundary, give it a bounded question
+and retire it when that question is answered.
 
 ## Relationship to upstream
 

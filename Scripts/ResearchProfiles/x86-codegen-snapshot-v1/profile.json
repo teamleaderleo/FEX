@@ -1,0 +1,11 @@
+{
+  "entrypoint": "run.sh",
+  "id": "x86-codegen-snapshot-v1",
+  "platform": "self-hosted-x86-fex-research",
+  "schemaVersion": 1,
+  "timeoutSeconds": 900,
+  "title": "x86 codegen snapshot parser and affected-product contract",
+  "variants": [
+    "default"
+  ]
+}

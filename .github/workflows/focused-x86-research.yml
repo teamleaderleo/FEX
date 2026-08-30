@@ -3,33 +3,28 @@ name: Focused x86 research
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: Build one host target or one guest Linux-test binary
+      source_sha:
+        description: Full immutable FEX commit SHA containing the product and checked-in profile
         required: true
-        default: build
-        type: choice
-        options:
-          - build
-          - linux-test-build
-      target:
-        description: Exact CMake target or guest test basename (for example thunkgentest or smc-2)
-        required: true
-        default: thunkgentest
         type: string
-      bitness:
-        description: Guest bitness; used only by linux-test-build
+      profile:
+        description: Safe ID under Scripts/ResearchProfiles
         required: true
-        default: "64"
-        type: choice
-        options:
-          - "64"
-          - "32"
+        default: x86-codegen-snapshot-v1
+        type: string
+      variant:
+        description: Variant declared by the selected profile
+        required: true
+        default: default
+        type: string
       jobs:
-        description: Bounded compile parallelism
+        description: Bounded profile parallelism
         required: true
         default: "8"
         type: choice
         options:
+          - "1"
+          - "2"
           - "4"
           - "8"
           - "12"
@@ -39,107 +34,78 @@ permissions:
   contents: read
 
 concurrency:
-  group: focused-x86-research
+  group: focused-x86-profile-${{ inputs.profile }}-${{ inputs.variant }}
   cancel-in-progress: false
 
 jobs:
-  focused-build:
+  exact-profile:
     runs-on: [self-hosted, X64, fex-research]
     timeout-minutes: 60
     env:
-      MODE: ${{ inputs.mode }}
-      TARGET: ${{ inputs.target }}
-      BITNESS: ${{ inputs.bitness }}
+      CARRIER_SHA: ${{ github.workflow_sha }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      PROFILE: ${{ inputs.profile }}
+      VARIANT: ${{ inputs.variant }}
       JOBS: ${{ inputs.jobs }}
-      DEV_LANE: actions-x86-dev
-      LINUX_LANE: actions-x86-linux-tests
 
     steps:
-      - name: Check out the exact requested revision
+      - name: Refuse a mutable or branch-scoped dispatch identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF}" = "refs/heads/${DEFAULT_BRANCH}"
+          [[ "${CARRIER_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${PROFILE}" =~ ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$ ]]
+          [[ "${VARIANT}" =~ ^[a-z0-9]([a-z0-9._-]{0,62}[a-z0-9])?$ ]]
+
+      - name: Check out the default-branch carrier
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          submodules: recursive
+          ref: ${{ github.workflow_sha }}
+          path: carrier
           fetch-depth: 1
+          persist-credentials: false
 
-      - name: Record scope and toolchain
-        run: |
-          set -euo pipefail
-          echo "scope=FOCUSED_${MODE}"
-          echo "head=$(git rev-parse HEAD)"
-          echo "dirty=$([[ -n $(git status --porcelain) ]] && echo true || echo false)"
-          echo "runner=${RUNNER_NAME} arch=${RUNNER_ARCH}"
-          cmake --version | head -1
-          clang --version | head -1
-          ninja --version
-          ccache --version | head -1
-
-      - name: Isolate the previous lane receipt
-        run: |
-          set -euo pipefail
-          if [[ "${MODE}" == "build" ]]; then
-            receipt_lane="${DEV_LANE}"
-          else
-            receipt_lane="${LINUX_LANE}"
-          fi
-          receipt="${HOME}/.cache/fex-dev/views/${receipt_lane}/last-receipt.json"
-          if [[ -f "${receipt}" ]]; then
-            mv "${receipt}" "${RUNNER_TEMP}/fex-previous-receipt.json"
-          fi
-
-      - name: Build only the requested scope
-        run: |
-          set -euo pipefail
-          case "${MODE}" in
-            build)
-              python3 Scripts/ResearchDevBuild.py \
-                --source "${GITHUB_WORKSPACE}" \
-                --lane "${DEV_LANE}" \
-                --profile dev \
-                build "${TARGET}" --jobs "${JOBS}"
-              ;;
-            linux-test-build)
-              python3 Scripts/ResearchDevBuild.py \
-                --source "${GITHUB_WORKSPACE}" \
-                --lane "${LINUX_LANE}" \
-                --profile linux-tests \
-                linux-test-build "${TARGET}" --bitness "${BITNESS}" --jobs "${JOBS}"
-              ;;
-            *)
-              echo "unsupported mode: ${MODE}" >&2
-              exit 2
-              ;;
-          esac
-
-      - name: Collect an exact-head receipt
-        if: ${{ always() }}
-        run: |
-          set -euo pipefail
-          if [[ "${MODE}" == "build" ]]; then
-            receipt_lane="${DEV_LANE}"
-          else
-            receipt_lane="${LINUX_LANE}"
-          fi
-          receipt="${HOME}/.cache/fex-dev/views/${receipt_lane}/last-receipt.json"
-          if [[ ! -s "${receipt}" ]]; then
-            echo "No new receipt was emitted for this attempt."
-            exit 0
-          fi
-          RECEIPT="${receipt}" python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          receipt = json.loads(Path(os.environ["RECEIPT"]).read_text(encoding="utf-8"))
-          if receipt.get("head") != os.environ["GITHUB_SHA"]:
-              raise SystemExit("refusing stale receipt from a different product head")
-          PY
-          cp "${receipt}" "${RUNNER_TEMP}/fex-focused-receipt.json"
-
-      - name: Publish the exact-head receipt
-        if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Check out the immutable product and profile
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          name: fex-focused-receipt-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/fex-focused-receipt.json
-          if-no-files-found: ignore
+          ref: ${{ inputs.source_sha }}
+          path: product
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Initialize the exact pinned source graph with bounded concurrency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 product/Scripts/ResearchDevBuild.py \
+            --source product \
+            submodules --jobs "${JOBS}" \
+            > "${RUNNER_TEMP}/fex-submodule-bootstrap.json"
+
+      - name: Run one checked-in bounded profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 carrier/Scripts/ResearchProfileCarrier.py run \
+            --source product \
+            --source-sha "${SOURCE_SHA}" \
+            --carrier-sha "${CARRIER_SHA}" \
+            --profile "${PROFILE}" \
+            --variant "${VARIANT}" \
+            --platform self-hosted-x86-fex-research \
+            --jobs "${JOBS}" \
+            --receipts "${RUNNER_TEMP}/fex-x86-receipts"
+
+      - name: Publish the exact-source profile receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fex-x86-${{ inputs.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/fex-x86-receipts
+            ${{ runner.temp }}/fex-submodule-bootstrap.json
+          if-no-files-found: warn
           retention-days: 14

@@ -91,6 +91,7 @@ jobs:
             --carrier-sha "${CARRIER_SHA}" \
             --profile "${PROFILE}" \
             --variant "${VARIANT}" \
+            --platform ubuntu-24.04-arm \
             --jobs "${JOBS}" \
             --receipts "${RUNNER_TEMP}/fex-arm64-receipts"
 

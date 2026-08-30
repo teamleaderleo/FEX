@@ -25,6 +25,7 @@ FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 MAX_JSON_BYTES = 64 * 1024
 MAX_JOBS = 16
 MAX_TIMEOUT_SECONDS = 55 * 60
+SUPPORTED_PLATFORMS = frozenset({"self-hosted-x86-fex-research", "ubuntu-24.04-arm"})
 MANIFEST_KEYS = {
     "schemaVersion",
     "id",
@@ -122,8 +123,8 @@ def resolve_profile(source: Path, profile_id: str, variant: str) -> dict[str, An
         raise ProfileError("profile manifest id does not match its directory")
     if manifest["entrypoint"] != "run.sh":
         raise ProfileError("profile entrypoint must be run.sh")
-    if manifest["platform"] != "ubuntu-24.04-arm":
-        raise ProfileError("profile platform must be ubuntu-24.04-arm")
+    if manifest["platform"] not in SUPPORTED_PLATFORMS:
+        raise ProfileError(f"unsupported profile platform: {manifest['platform']!r}")
     if not isinstance(manifest["title"], str) or not (1 <= len(manifest["title"]) <= 200):
         raise ProfileError("profile title must contain 1..200 characters")
     timeout = manifest["timeoutSeconds"]
@@ -310,6 +311,10 @@ def run_profile(args: argparse.Namespace) -> int:
         raise ProfileError(f"jobs must be within 1..{MAX_JOBS}")
     prepare_receipts(receipts)
     profile = resolve_profile(source, args.profile, args.variant)
+    if profile["manifest"]["platform"] != args.platform:
+        raise ProfileError(
+            f"profile platform {profile['manifest']['platform']!r} does not match runner adapter {args.platform!r}"
+        )
     before = exact_source_state(source, args.source_sha)
     profile_state = committed_profile_state(source, args.source_sha, profile)
 
@@ -421,6 +426,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--carrier-sha", required=True)
     run.add_argument("--profile", required=True)
     run.add_argument("--variant", default="default")
+    run.add_argument("--platform", choices=sorted(SUPPORTED_PLATFORMS), required=True)
     run.add_argument("--jobs", type=int, default=8)
     run.add_argument("--receipts", type=Path, required=True)
     run.set_defaults(handler=run_profile)
