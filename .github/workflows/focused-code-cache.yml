@@ -9,11 +9,13 @@ on:
       - FEXCore/include/FEXCore/Core/DiskCache.h
       - FEXCore/include/FEXCore/Core/DiskCacheFile.h
       - FEXCore/include/FEXCore/Core/DiskCacheIndexFile.h
+      - FEXCore/include/FEXCore/Core/DiskCacheStorage.h
       - FEXCore/include/FEXCore/Utils/File.h
       - FEXCore/Source/Interface/Core/CodeCacheFile.cpp
       - FEXCore/Source/Interface/Core/DiskCache.cpp
       - FEXCore/Source/Interface/Core/DiskCacheFile.cpp
       - FEXCore/Source/Interface/Core/DiskCacheIndexFile.cpp
+      - FEXCore/Source/Interface/Core/DiskCacheStorage.cpp
       - FEXCore/unittests/APITests/CMakeLists.txt
       - FEXCore/unittests/APITests/CodeCacheFile.cpp
       - FEXCore/unittests/APITests/DiskCacheFile.cpp

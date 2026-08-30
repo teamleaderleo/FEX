@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-#include <FEXCore/Core/DiskCache.h>
+#include <FEXCore/Core/DiskCacheFile.h>
+#include <FEXCore/Core/DiskCacheStorage.h>
 
 #include <catch2/catch_test_macros.hpp>
 #include <fmt/format.h>

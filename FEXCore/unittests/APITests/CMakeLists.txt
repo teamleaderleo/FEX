@@ -22,10 +22,23 @@ foreach(TEST ${TESTS})
     target_sources(FEXCore_Tests_${TEST_NAME} PRIVATE "../../Source/Interface/Core/DiskCacheIndexFile.cpp")
     target_link_libraries(FEXCore_Tests_${TEST_NAME} PRIVATE fmt::fmt Catch2::Catch2WithMain)
     target_include_directories(FEXCore_Tests_${TEST_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+  elseif (TEST_NAME STREQUAL "DiskCacheIndexRecovery")
+    # Compile the real Fossilize storage owner without pulling in the JIT and
+    # runtime object graph. This remains the file/lock/recovery acceptance test.
+    target_sources(FEXCore_Tests_${TEST_NAME} PRIVATE
+      "../../Source/Interface/Core/DiskCacheStorage.cpp"
+      "../../Source/Interface/Core/DiskCacheFile.cpp"
+      "../../Source/Interface/Core/DiskCacheIndexFile.cpp"
+      "../../Source/Utils/AllocatorHooks.cpp"
+      "../../Source/Utils/ForcedAssert.cpp"
+      "../../Source/Utils/LogManager.cpp")
+    target_link_libraries(FEXCore_Tests_${TEST_NAME} PRIVATE
+      fmt::fmt Catch2::Catch2WithMain unordered_dense::unordered_dense xxHash::xxhash)
+    target_include_directories(FEXCore_Tests_${TEST_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
   else()
     target_link_libraries(FEXCore_Tests_${TEST_NAME} PRIVATE ${LIBS})
   endif()
-  if (TEST_NAME STREQUAL "LookupCache" OR TEST_NAME STREQUAL "CodeCacheConfig" OR TEST_NAME STREQUAL "DiskCacheIndexRecovery")
+  if (TEST_NAME STREQUAL "LookupCache" OR TEST_NAME STREQUAL "CodeCacheConfig")
     target_link_libraries(FEXCore_Tests_${TEST_NAME} PRIVATE FEXCore)
   endif()
   target_include_directories(FEXCore_Tests_${TEST_NAME} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../Source/")
