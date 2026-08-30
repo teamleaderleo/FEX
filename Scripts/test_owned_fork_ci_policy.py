@@ -39,17 +39,24 @@ class OwnedForkCIPolicyTest(unittest.TestCase):
             (REPO_ROOT / ".github" / "workflows" / "pr-code-format.yml").exists()
         )
 
-    def test_focused_lane_is_manual_bounded_and_exact_head(self) -> None:
+    def test_x86_lane_is_manual_exact_sha_and_profile_only(self) -> None:
         workflow = self.workflow("focused-x86-research.yml")
         self.assertIn("workflow_dispatch:", workflow)
         self.assertNotIn("pull_request:", workflow)
         self.assertNotIn("\n  push:", workflow)
         self.assertIn("runs-on: [self-hosted, X64, fex-research]", workflow)
-        self.assertIn("Scripts/ResearchDevBuild.py", workflow)
-        self.assertIn("build \"${TARGET}\"", workflow)
-        self.assertIn("linux-test-build \"${TARGET}\"", workflow)
-        self.assertIn("fex-previous-receipt.json", workflow)
-        self.assertIn('receipt.get("head") != os.environ["GITHUB_SHA"]', workflow)
+        self.assertIn("source_sha:", workflow)
+        self.assertIn("profile:", workflow)
+        self.assertIn("variant:", workflow)
+        self.assertNotIn("command:", workflow)
+        self.assertNotIn("target:", workflow)
+        self.assertIn("ResearchProfileCarrier.py run", workflow)
+        self.assertIn("--platform self-hosted-x86-fex-research", workflow)
+        self.assertIn("github.workflow_sha", workflow)
+        self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
+        self.assertIn("ref: ${{ inputs.source_sha }}", workflow)
+        self.assertIn('test "${GITHUB_REF}" = "refs/heads/${DEFAULT_BRANCH}"', workflow)
+        self.assertIn("persist-credentials: false", workflow)
 
     def test_custom_runner_label_is_declared_for_static_lint(self) -> None:
         config = (REPO_ROOT / ".github" / "actionlint.yaml").read_text(encoding="utf-8")
@@ -102,7 +109,10 @@ class OwnedForkCIPolicyTest(unittest.TestCase):
         self.assertIn("variant:", workflow)
         self.assertNotIn("command:", workflow)
         self.assertIn("ResearchProfileCarrier.py run", workflow)
+        self.assertIn("--platform ubuntu-24.04-arm", workflow)
         self.assertIn("github.workflow_sha", workflow)
+        self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
+        self.assertIn("ref: ${{ inputs.source_sha }}", workflow)
         self.assertIn('test "${GITHUB_REF}" = "refs/heads/${DEFAULT_BRANCH}"', workflow)
         self.assertIn("persist-credentials: false", workflow)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused tests for the checked-in ARM64 research-profile carrier."""
+"""Focused tests for the checked-in research-profile carrier."""
 
 from __future__ import annotations
 
@@ -73,6 +73,7 @@ printf '%s\n' '{"schemaVersion":1,"status":"pass","summary":"focused synthetic p
             "carrier_sha": "1" * 40,
             "profile": "sample",
             "variant": "default",
+            "platform": "ubuntu-24.04-arm",
             "jobs": 4,
             "receipts": receipts or (self.root / "receipts"),
         }
@@ -97,6 +98,19 @@ printf '%s\n' '{"schemaVersion":1,"status":"pass","summary":"focused synthetic p
         self.assertEqual(result["carrierSha"], "1" * 40)
         self.assertEqual(result["sourceStateBefore"], result["sourceStateAfter"])
         self.assertEqual(result["profileOutcome"]["status"], "pass")
+
+    def test_x86_profile_passes_on_the_x86_runner_adapter(self) -> None:
+        self.write_manifest(platform="self-hosted-x86-fex-research")
+        self.recommit()
+        self.assertEqual(self.run_carrier(platform="self-hosted-x86-fex-research"), 0)
+
+    def test_profile_platform_mismatch_is_rejected(self) -> None:
+        self.assertEqual(self.run_carrier(platform="self-hosted-x86-fex-research"), 2)
+
+    def test_unsupported_manifest_platform_is_rejected(self) -> None:
+        self.write_manifest(platform="ubuntu-latest")
+        self.recommit()
+        self.assertEqual(self.run_carrier(), 2)
 
     def test_profile_and_variant_traversal_are_rejected(self) -> None:
         self.assertEqual(self.run_carrier(profile="../sample"), 2)
