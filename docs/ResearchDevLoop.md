@@ -208,8 +208,13 @@ finding a link target:
 path through the stable source view, and requires exactly one matching object output inside that
 lane's build tree. It then asks CMake/Ninja for only that object target. The receipt binds the exact
 head/dirty state, profile, source file, object target, compilation-database digest, jobs, timing and
-exit status. It means that one configured object compiled; no archive, shared library, executable,
-CTest, guest or runtime result is implied.
+exit status. Its action-private `cacheObservation` distinguishes a Ninja no-op (`not_invoked`),
+direct or preprocessed ccache hit, cache miss/real compiler invocation, compiler failure,
+uncacheable call, or an unexpected multiple invocation. The raw ccache stats log contains source
+paths, so the helper deletes it before writing the compact receipt. It never resets or subtracts
+shared global ccache counters. A successful no-op means the configured object was already current;
+it does not mean a compiler ran. No archive, shared library, executable, CTest, guest or runtime
+result is implied.
 
 The command deliberately refuses headers, paths outside the selected source tree, symlinks,
 missing mappings and sources compiled in more than one configuration.
