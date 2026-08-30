@@ -785,6 +785,22 @@ def atomic_source_view(source_view: Path, source: Path) -> None:
     os.replace(temporary, source_view)
 
 
+def retained_graph_clean_command(build: Path) -> list[str]:
+    """Clean a dead-source lane without asking CMake to regenerate its graph."""
+    manifest = build / "build.ninja"
+    try:
+        metadata = os.lstat(manifest)
+    except OSError as error:
+        raise RuntimeError(f"cannot inspect retained Ninja manifest: {manifest}") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_size > 64 * 1024 * 1024
+    ):
+        raise RuntimeError(f"unsafe retained Ninja manifest: {manifest}")
+    return [required_tool("ninja"), "-C", str(build), "-t", "clean"]
+
+
 def prepare_source_view(
     source: Path,
     source_view: Path,
@@ -800,16 +816,22 @@ def prepare_source_view(
     if current == source:
         return False
     if current is not None:
+        old_source_available = current.is_dir()
         for old_build in (*extra_builds, build):
             if (old_build / "build.ninja").is_file():
-                runner(
+                command = (
                     [
                         required_tool("cmake"),
                         "--build",
                         str(old_build),
                         "--target",
                         "clean",
-                    ],
+                    ]
+                    if old_source_available
+                    else retained_graph_clean_command(old_build)
+                )
+                runner(
+                    command,
                     check=True,
                     env=env,
                 )

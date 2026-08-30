@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -922,14 +923,130 @@ class ResearchDevBuildTest(unittest.TestCase):
                 calls.append((command, kwargs, source_view.resolve()))
                 return subprocess.CompletedProcess(command, 0)
 
-            with mock.patch.object(dev_build, "required_tool", return_value="/tool/cmake"):
+            with mock.patch.object(
+                dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"
+            ):
                 switched = dev_build.prepare_source_view(
                     new.resolve(), source_view, build, {}, runner=runner
                 )
 
             self.assertTrue(switched)
             self.assertEqual(calls[0][2], old.resolve())
+            self.assertEqual(calls[0][0][0], "/tool/cmake")
             self.assertEqual(calls[0][0][-1], "clean")
+            self.assertEqual(source_view.resolve(), new.resolve())
+
+    def test_dead_worktree_switch_cleans_retained_graph_without_cmake(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = root / "removed"
+            new = root / "new"
+            new.mkdir()
+            lane = root / "lane"
+            build = lane / "build"
+            build.mkdir(parents=True)
+            (build / "build.ninja").write_text("", encoding="utf-8")
+            source_view = lane / "src"
+            os.symlink(old, source_view, target_is_directory=True)
+            calls = []
+
+            def runner(command, **kwargs):
+                calls.append((command, kwargs, source_view.resolve()))
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(
+                dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"
+            ):
+                switched = dev_build.prepare_source_view(
+                    new.resolve(), source_view, build, {}, runner=runner
+                )
+
+            self.assertTrue(switched)
+            self.assertEqual(
+                calls[0][0],
+                ["/tool/ninja", "-C", str(build), "-t", "clean"],
+            )
+            self.assertEqual(calls[0][2], old.resolve())
+            self.assertEqual(source_view.resolve(), new.resolve())
+
+    def test_dead_worktree_clean_failure_does_not_repoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = root / "removed"
+            new = root / "new"
+            new.mkdir()
+            lane = root / "lane"
+            build = lane / "build"
+            build.mkdir(parents=True)
+            (build / "build.ninja").write_text("", encoding="utf-8")
+            source_view = lane / "src"
+            os.symlink(old, source_view, target_is_directory=True)
+
+            with mock.patch.object(dev_build, "required_tool", return_value="/tool/ninja"):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    dev_build.prepare_source_view(
+                        new.resolve(),
+                        source_view,
+                        build,
+                        {},
+                        runner=mock.Mock(
+                            side_effect=subprocess.CalledProcessError(1, ["ninja"])
+                        ),
+                    )
+
+            self.assertEqual(source_view.resolve(), old.resolve())
+
+    def test_dead_worktree_switch_refuses_symlinked_retained_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = root / "removed"
+            new = root / "new"
+            new.mkdir()
+            lane = root / "lane"
+            build = lane / "build"
+            build.mkdir(parents=True)
+            external = root / "external.ninja"
+            external.write_text("", encoding="utf-8")
+            (build / "build.ninja").symlink_to(external)
+            source_view = lane / "src"
+            os.symlink(old, source_view, target_is_directory=True)
+
+            with self.assertRaisesRegex(RuntimeError, "unsafe retained Ninja manifest"):
+                dev_build.prepare_source_view(
+                    new.resolve(), source_view, build, {}, runner=mock.Mock()
+                )
+
+            self.assertEqual(source_view.resolve(), old.resolve())
+
+    @unittest.skipUnless(shutil.which("ninja"), "Ninja is required for the real clean fixture")
+    def test_dead_worktree_real_ninja_clean_executes_no_graph_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = root / "removed"
+            new = root / "new"
+            new.mkdir()
+            lane = root / "lane"
+            build = lane / "build"
+            build.mkdir(parents=True)
+            (build / "build.ninja").write_text(
+                "rule forbidden\n"
+                "  command = false\n"
+                "build output.txt: forbidden\n"
+                "default output.txt\n",
+                encoding="utf-8",
+            )
+            output = build / "output.txt"
+            output.write_text("retained output\n", encoding="utf-8")
+            source_view = lane / "src"
+            os.symlink(old, source_view, target_is_directory=True)
+
+            switched = dev_build.prepare_source_view(
+                new.resolve(), source_view, build, os.environ.copy()
+            )
+
+            self.assertTrue(switched)
+            self.assertFalse(output.exists())
+            self.assertTrue((build / "build.ninja").is_file())
             self.assertEqual(source_view.resolve(), new.resolve())
 
     def test_worktree_switch_cleans_focused_guest_tree_before_outer_tree(self):
@@ -953,7 +1070,9 @@ class ResearchDevBuildTest(unittest.TestCase):
                 calls.append(command)
                 return subprocess.CompletedProcess(command, 0)
 
-            with mock.patch.object(dev_build, "required_tool", return_value="/tool/cmake"):
+            with mock.patch.object(
+                dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"
+            ):
                 dev_build.prepare_source_view(
                     new.resolve(),
                     source_view,

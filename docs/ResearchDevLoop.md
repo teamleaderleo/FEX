@@ -262,6 +262,13 @@ ccache reuse content across exact worktree switches. The cache namespace include
 because this host-development profile uses FEX's `-march=native` default. A versioned profile marker
 prevents a lane from silently adopting a CMake tree configured with different options.
 
+If the old worktree has already been retired, CMake cannot regenerate its graph before cleaning.
+In that one case the helper validates the retained `build.ninja` as a current-user, bounded regular
+file and invokes Ninja's built-in clean tool directly. Ninja tool mode removes recorded outputs
+without executing compiler, linker, generator, test or product commands. Only a successful clean
+permits the atomic source-view repoint; an unsafe manifest or clean failure leaves the lane pointing
+at the retired source for inspection. A live old source retains the ordinary CMake-mediated clean.
+
 After that clean repoint, a matching configured/profile-marked lane uses ordinary incremental CMake
 regeneration instead of deleting CMake's cache and compiler discovery. An explicit `configure`, a
 missing build graph or any profile-marker mismatch still selects `cmake --fresh`. The receipt names
