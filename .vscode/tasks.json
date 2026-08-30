@@ -73,6 +73,18 @@
         "${input:fexCTest}"
       ],
       "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "FEX: build target and run its exact CTest set",
+      "type": "process",
+      "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
+      "args": [
+        "--lane",
+        "editor",
+        "check-set",
+        "${input:fexCheckTarget}"
+      ],
+      "problemMatcher": ["$gcc"]
     }
   ],
   "inputs": [

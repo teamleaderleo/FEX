@@ -73,6 +73,7 @@ class ResearchDevBuildTest(unittest.TestCase):
                 "./Scripts/ResearchDevBuild.py --lane editor compile SOURCE.cpp",
                 "./Scripts/ResearchDevBuild.py --lane NAME build TARGET",
                 "./Scripts/ResearchDevBuild.py --lane NAME check TARGET EXACT_CTEST",
+                "./Scripts/ResearchDevBuild.py --lane NAME check-set TARGET",
                 "./Scripts/ResearchDevBuild.py --lane editor editor",
             ],
         )
@@ -977,6 +978,65 @@ class ResearchDevBuildTest(unittest.TestCase):
         for invalid in ("", " leading", "trailing ", "two\nlines", "nul\0byte"):
             with self.assertRaises(ValueError):
                 dev_build.validate_ctest_name(invalid)
+
+        check_set = dev_build.parser().parse_args(["check-set", "thunkgentest"])
+        self.assertEqual((check_set.action, check_set.target), ("check-set", "thunkgentest"))
+        for invalid in ("", "../tool", "/tool", "two targets", "all|other"):
+            with self.assertRaises(ValueError):
+                dev_build.validate_target(invalid)
+
+    def test_ninja_query_binds_one_exact_private_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary).resolve()
+            binary = build / "Bin" / "thunkgentest"
+            binary.parent.mkdir()
+            binary.write_bytes(b"binary")
+            binary.chmod(0o700)
+            payload = "thunkgentest:\n  input: phony\n    Bin/thunkgentest\n  outputs:\n"
+            artifact = dev_build.configured_target_artifact(
+                build, "thunkgentest", payload
+            )
+            self.assertEqual(artifact, binary)
+
+            for rejected in (
+                "thunkgentest:\n  input: phony\n  outputs:\n",
+                "thunkgentest:\n  input: phony\n    Bin/a\n    Bin/b\n  outputs:\n",
+                "thunkgentest:\n  input: CUSTOM_COMMAND\n    Bin/thunkgentest\n  outputs:\n",
+                "other:\n  input: phony\n    Bin/thunkgentest\n  outputs:\n",
+            ):
+                with self.assertRaises(RuntimeError):
+                    dev_build.configured_target_artifact(build, "thunkgentest", rejected)
+
+            binary.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "not a private executable"):
+                dev_build.configured_target_artifact(build, "thunkgentest", payload)
+            binary.unlink()
+            binary.symlink_to("other")
+            (binary.parent / "other").write_bytes(b"binary")
+            (binary.parent / "other").chmod(0o700)
+            with self.assertRaisesRegex(RuntimeError, "not a private executable"):
+                dev_build.configured_target_artifact(build, "thunkgentest", payload)
+
+    def test_ctest_set_selects_only_exact_command_head_and_is_bounded(self):
+        artifact = Path("/lane/build/Bin/thunkgentest")
+        payload = json.dumps(
+            {
+                "tests": [
+                    {"name": "B.Test", "command": [str(artifact), "B.Test"]},
+                    {"name": "A.Test", "command": [str(artifact), "A.Test"]},
+                    {"name": "Wrapped.Test", "command": ["/wrapper", str(artifact)]},
+                    {"name": "Other.Test", "command": ["/lane/build/Bin/other"]},
+                ]
+            }
+        )
+        selected = dev_build.configured_ctest_set(payload, artifact)
+        self.assertEqual(selected["selectedTests"], ["A.Test", "B.Test"])
+        self.assertEqual(selected["registeredTests"], 4)
+        self.assertRegex(selected["digest"], r"^[0-9a-f]{64}$")
+        with self.assertRaisesRegex(RuntimeError, "bounded limit"):
+            dev_build.configured_ctest_set(payload, artifact, limit=1)
+        with self.assertRaisesRegex(RuntimeError, "owns no exact"):
+            dev_build.configured_ctest_set(payload, Path("/other"))
 
     def test_ctest_command_uses_exact_name_file_and_no_tests_error(self):
         with mock.patch.object(dev_build, "required_tool", return_value="/tool/ctest"):
