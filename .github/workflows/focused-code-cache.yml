@@ -27,7 +27,6 @@ jobs:
     timeout-minutes: 20
     env:
       SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      CACHE_ROOT: ${{ runner.temp }}/fex-dev
 
     steps:
       - name: Check out the exact same-repository source revision
@@ -68,10 +67,10 @@ jobs:
         run: |
           set -euo pipefail
           python3 Scripts/ResearchDevBuild.py \
-            --cache-root "${CACHE_ROOT}" --lane code-cache-parser \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
             build FEXCore_Tests_CodeCacheFile --jobs 4
           python3 Scripts/ResearchDevBuild.py \
-            --cache-root "${CACHE_ROOT}" --lane code-cache-parser \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
             build FEXOfflineCompiler --jobs 4
 
       - name: Run only the whole-file parser cases
@@ -79,7 +78,7 @@ jobs:
         run: |
           set -euo pipefail
           ctest \
-            --test-dir "${CACHE_ROOT}/views/code-cache-parser/build" \
+            --test-dir "${RUNNER_TEMP}/fex-dev/views/code-cache-parser/build" \
             --output-on-failure \
             --no-tests=error \
             -R '[.]CodeCacheFile[.]FEXCore_Tests$'
