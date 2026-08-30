@@ -14,6 +14,7 @@ cache_root="${work_root}/cache"
 receipts="${FEX_RESEARCH_RECEIPTS}"
 guest_path="${rootfs}/opt/fex-ci/disk-cache-guest"
 active_pid=""
+ccache_stats_log="${work_root}/ccache-stats.log"
 
 cleanup() {
   if test -n "${active_pid}" && kill -0 "${active_pid}" 2>/dev/null; then
@@ -33,11 +34,28 @@ uname -a > "${receipts}/uname.txt"
 sudo apt-get update > "${receipts}/apt-update.log" 2>&1
 # shellcheck disable=SC2024
 sudo apt-get install -y --no-install-recommends \
-  cmake ninja-build clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
+  cmake ninja-build ccache clang-18 lld-18 libclang-18-dev llvm-18-dev pkg-config \
   gcc-x86-64-linux-gnu binutils libcap-dev \
   > "${receipts}/apt-install.log" 2>&1
 clang++-18 --version > "${receipts}/clang-version.txt"
 x86_64-linux-gnu-gcc --version > "${receipts}/guest-compiler-version.txt"
+ccache --version > "${receipts}/ccache-version.txt"
+
+export CCACHE_DIR="${CCACHE_DIR:-${work_root}/ccache}"
+export CCACHE_BASEDIR="${CCACHE_BASEDIR:-${source_root}}"
+export CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-content}"
+export CCACHE_COMPRESS="${CCACHE_COMPRESS:-true}"
+export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-1Gi}"
+export CCACHE_NAMESPACE="${CCACHE_NAMESPACE:-teamleaderleo-fex-arm64-research-v1}"
+export CCACHE_NOHASHDIR="${CCACHE_NOHASHDIR:-true}"
+export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS:-time_macros}"
+export CCACHE_STATSLOG="${ccache_stats_log}"
+mkdir -p "${CCACHE_DIR}"
+: > "${ccache_stats_log}"
+chmod 600 "${ccache_stats_log}"
+ccache --show-config > "${receipts}/ccache-config.txt"
+
+configure_started_ns="$(date +%s%N)"
 
 CC=clang-18 CXX=clang++-18 cmake -S "${source_root}" -B "${build_root}" -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_LINKER=lld \
@@ -46,11 +64,56 @@ CC=clang-18 CXX=clang++-18 cmake -S "${source_root}" -B "${build_root}" -G Ninja
   -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=ON -DBUILD_TESTING=OFF \
   -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DRANGES_NATIVE=OFF \
   -DTUNE_CPU=none -DX86_DEV_ROOTFS=/ > "${receipts}/cmake-host.log" 2>&1
+configure_finished_ns="$(date +%s%N)"
 cmake --build "${build_root}" --target FEX FEXServer -- \
   -j"${FEX_RESEARCH_JOBS}" -v > "${receipts}/build-host.log" 2>&1 || {
     tail -n 360 "${receipts}/build-host.log"
     exit 1
   }
+build_finished_ns="$(date +%s%N)"
+
+ccache --print-log-stats --format=json > "${receipts}/ccache-stats.json"
+rm -f "${ccache_stats_log}"
+unset CCACHE_STATSLOG
+python3 - "${receipts}/ccache-stats.json" "${receipts}/compiler-cache-observation.json" \
+  "${configure_started_ns}" "${configure_finished_ns}" "${build_finished_ns}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+stats_path, output_path = map(Path, sys.argv[1:3])
+configure_started_ns, configure_finished_ns, build_finished_ns = map(int, sys.argv[3:])
+stats = json.loads(stats_path.read_text(encoding="utf-8"))
+direct_hits = stats["direct_cache_hit"]
+preprocessed_hits = stats["preprocessed_cache_hit"]
+misses = stats["cache_miss"]
+cacheable_calls = direct_hits + preprocessed_hits + misses
+if cacheable_calls <= 0:
+    raise SystemExit("FEX host build made no cacheable compiler calls")
+if stats["max_cache_size_kibibyte"] > 1024 * 1024:
+    raise SystemExit("compiler cache exceeded the declared 1 GiB bound")
+output_path.write_text(
+    json.dumps(
+        {
+            "buildElapsedSeconds": round((build_finished_ns - configure_finished_ns) / 1e9, 6),
+            "cacheSizeKibibytes": stats["cache_size_kibibyte"],
+            "cacheableCalls": cacheable_calls,
+            "configureElapsedSeconds": round(
+                (configure_finished_ns - configure_started_ns) / 1e9, 6
+            ),
+            "directHits": direct_hits,
+            "maxCacheSizeKibibytes": stats["max_cache_size_kibibyte"],
+            "misses": misses,
+            "preprocessedHits": preprocessed_hits,
+            "schemaVersion": 1,
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
 
 x86_64-linux-gnu-gcc -nostdlib -static -fno-pie -no-pie -fno-stack-protector \
   -O2 -Wall -Wextra -Werror "${profile_root}/guest.c" -o "${guest_path}"

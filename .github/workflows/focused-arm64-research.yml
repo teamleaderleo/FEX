@@ -44,6 +44,14 @@ jobs:
       PROFILE: ${{ inputs.profile }}
       VARIANT: ${{ inputs.variant }}
       JOBS: ${{ inputs.jobs }}
+      CCACHE_DIR: ${{ runner.temp }}/fex-arm64-ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}/product
+      CCACHE_COMPILERCHECK: content
+      CCACHE_COMPRESS: "true"
+      CCACHE_MAXSIZE: 1Gi
+      CCACHE_NAMESPACE: teamleaderleo-fex-arm64-research-v1
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_SLOPPINESS: time_macros
 
     steps:
       - name: Refuse a mutable or branch-scoped dispatch identity
@@ -72,6 +80,48 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Restore the bounded ARM64 compiler cache
+        if: ${{ inputs.profile == 'arm64-disk-cache-shapes-v1' }}
+        id: arm64-ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: fex-arm64-ccache-v1-${{ runner.os }}-${{ runner.arch }}-clang18-${{ inputs.source_sha }}-${{ inputs.profile }}-${{ inputs.variant }}
+          restore-keys: |
+            fex-arm64-ccache-v1-${{ runner.os }}-${{ runner.arch }}-clang18-${{ inputs.source_sha }}-
+            fex-arm64-ccache-v1-${{ runner.os }}-${{ runner.arch }}-clang18-
+
+      - name: Record the compiler-cache restore boundary
+        if: ${{ inputs.profile == 'arm64-disk-cache-shapes-v1' }}
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.arm64-ccache.outputs.cache-hit }}
+          CACHE_MATCHED_KEY: ${{ steps.arm64-ccache.outputs.cache-matched-key }}
+          CACHE_PRIMARY_KEY: ${{ steps.arm64-ccache.outputs.cache-primary-key }}
+        run: |
+          set -euo pipefail
+          python3 - "${RUNNER_TEMP}/fex-arm64-ccache-restore.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          Path(sys.argv[1]).write_text(
+              json.dumps(
+                  {
+                      "cacheHit": os.environ.get("CACHE_HIT", ""),
+                      "matchedKey": os.environ.get("CACHE_MATCHED_KEY", ""),
+                      "primaryKey": os.environ.get("CACHE_PRIMARY_KEY", ""),
+                      "schemaVersion": 1,
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+
       - name: Initialize the exact pinned source graph with bounded concurrency
         shell: bash
         run: |
@@ -95,6 +145,13 @@ jobs:
             --jobs "${JOBS}" \
             --receipts "${RUNNER_TEMP}/fex-arm64-receipts"
 
+      - name: Save the bounded ARM64 compiler cache
+        if: ${{ success() && inputs.profile == 'arm64-disk-cache-shapes-v1' && steps.arm64-ccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.arm64-ccache.outputs.cache-primary-key }}
+
       - name: Publish the exact-source profile receipt
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -103,5 +160,6 @@ jobs:
           path: |
             ${{ runner.temp }}/fex-arm64-receipts
             ${{ runner.temp }}/fex-submodule-bootstrap.json
+            ${{ runner.temp }}/fex-arm64-ccache-restore.json
           if-no-files-found: warn
           retention-days: 14
