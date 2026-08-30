@@ -6,6 +6,14 @@ The upstream FEX workflows are designed for the upstream project's always-on sel
 
 Opening or updating a pull request does **not** enqueue the broad build, GLIBC fault, hostrunner, instruction-count, MinGW, Steam Runtime, Wine DLL, or VIXL matrices in `teamleaderleo/FEX`. Those matrices cover unrelated platforms and can consume many runner-hours even for a deterministic generator or documentation change. They also do not create skipped check-suite noise on ordinary research pull requests.
 
+One narrow exception is `.github/workflows/focused-compiler-compat.yml`. A same-repository pull
+request that changes the thunk generator, shared host layout helpers, GL thunk sources, their focused
+tests, or the lane itself runs two exact char-pointer return tests and builds only `GL-host-64` on
+GitHub's `ubuntu-26.04` preview image with Clang 21. External pull-request branches are refused.
+The job may also be dispatched manually. It does not run a guest, a test family, or any inherited
+matrix. The preview image changes weekly and carries no GA SLA, so its exact source SHA and printed
+toolchain identity are part of the result rather than an implicit stable environment claim.
+
 Each research PR should instead report:
 
 - the exact source commit and dirty state;

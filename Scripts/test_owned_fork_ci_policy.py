@@ -66,6 +66,29 @@ class OwnedForkCIPolicyTest(unittest.TestCase):
                 self.assertEqual(separator, "@")
                 self.assertRegex(revision, r"^[0-9a-f]{40}$")
 
+    def test_compiler_lane_is_same_repo_path_scoped_and_bounded(self) -> None:
+        workflow = self.workflow("focused-compiler-compat.yml")
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("pull_request:", workflow)
+        self.assertNotIn("\n  push:", workflow)
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", workflow)
+        self.assertIn("runs-on: ubuntu-26.04", workflow)
+        self.assertIn("clang-21", workflow)
+        self.assertIn("CharPointerHostToGuestConversionPreservesAddress.ThunkGen", workflow)
+        self.assertIn("CharPointerReturnsUseConvertibleGuestLayout.ThunkGen", workflow)
+        self.assertIn("build GL-host-64 --jobs 4", workflow)
+        self.assertNotIn("cmake --build build", workflow)
+
+    def test_compiler_lane_actions_are_commit_pinned(self) -> None:
+        workflow = self.workflow("focused-compiler-compat.yml")
+        actions = re.findall(r"^\s*uses:\s+([^\s#]+)", workflow, flags=re.MULTILINE)
+        self.assertTrue(actions)
+        for action in actions:
+            with self.subTest(action=action):
+                _, separator, revision = action.rpartition("@")
+                self.assertEqual(separator, "@")
+                self.assertRegex(revision, r"^[0-9a-f]{40}$")
+
     def test_arm64_lane_is_manual_exact_sha_and_profile_only(self) -> None:
         workflow = self.workflow("focused-arm64-research.yml")
         self.assertIn("workflow_dispatch:", workflow)
