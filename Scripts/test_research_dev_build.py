@@ -190,6 +190,96 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertIn("-n", command)
         self.assertEqual(command[-1], "vulkan-host-64")
 
+    def test_discovery_parser_is_literal_and_bounded(self):
+        args = dev_build.parser().parse_args(["discover", "Vulkan.*", "--limit", "4"])
+        self.assertEqual((args.action, args.query, args.limit), ("discover", "Vulkan.*", 4))
+        self.assertEqual(
+            dev_build.validate_discovery_query("regex.*stays-literal"),
+            "regex.*stays-literal",
+        )
+        self.assertEqual(dev_build.validate_discovery_limit(64), 64)
+        for invalid in ("", " padded", "padded ", "two\nlines", "nul\0byte", "x" * 129):
+            with self.assertRaises(ValueError):
+                dev_build.validate_discovery_query(invalid)
+        with self.assertRaises(ValueError):
+            dev_build.validate_discovery_limit(65)
+
+    def test_configured_target_registry_extracts_semantic_headings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = Path(temporary) / "build.ninja"
+            manifest.write_text(
+                "# Object build statements for EXECUTABLE target Tool\n"
+                "# Link build statements for EXECUTABLE target Tool\n"
+                "# Utility command for generated-assets\n"
+                "# Utility command for generated-assets\n"
+                "build object.o: CXX source.cpp\n",
+                encoding="utf-8",
+            )
+            registry = dev_build.configured_target_registry(manifest)
+
+        self.assertEqual(
+            registry["targets"],
+            [
+                {"name": "generated-assets", "type": "UTILITY"},
+                {"name": "Tool", "type": "EXECUTABLE"},
+            ],
+        )
+        self.assertRegex(registry["digest"], r"^[0-9a-f]{64}$")
+
+    def test_configured_target_registry_rejects_empty_and_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = Path(temporary) / "build.ninja"
+            manifest.write_text("build object.o: CXX source.cpp\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "registry is empty"):
+                dev_build.configured_target_registry(manifest)
+            manifest.write_text(
+                "# Utility command for same\n"
+                "# Object build statements for EXECUTABLE target same\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+                dev_build.configured_target_registry(manifest)
+
+    def test_configured_test_registry_and_literal_matches(self):
+        payload = json.dumps(
+            {
+                "tests": [
+                    {"name": "Vulkan.Inventory", "command": ["/usr/bin/python3", "test.py"]},
+                    {"name": "vulkan_NOT_BUILT", "command": None},
+                    {"name": "Other", "command": ["/bin/true"]},
+                ]
+            }
+        )
+        registry = dev_build.configured_test_registry(payload)
+        matches = dev_build.literal_matches(registry["tests"], "VULKAN", 1)
+
+        self.assertEqual(matches["totalMatches"], 2)
+        self.assertEqual(matches["returned"], 1)
+        self.assertTrue(matches["truncated"])
+        self.assertEqual(matches["results"][0]["commandHead"], "python3")
+        self.assertRegex(registry["digest"], r"^[0-9a-f]{64}$")
+
+    def test_configured_test_registry_rejects_malformed_duplicate_and_oversized(self):
+        for payload in (
+            "not-json",
+            json.dumps({"wrong": []}),
+            json.dumps(
+                {
+                    "tests": [
+                        {"name": "same", "command": None},
+                        {"name": "same", "command": None},
+                    ]
+                }
+            ),
+            json.dumps({"tests": [{"name": "bad", "command": []}]}),
+            json.dumps({"tests": [{"name": "bad", "command": [""]}]}),
+        ):
+            with self.assertRaises(RuntimeError):
+                dev_build.configured_test_registry(payload)
+        with mock.patch.object(dev_build, "DISCOVERY_REGISTRY_LIMIT", 4):
+            with self.assertRaisesRegex(RuntimeError, "bounded output"):
+                dev_build.configured_test_registry('{"tests": []}')
+
     def test_shadow_plan_manifest_removes_only_verify_edge_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as temporary:
             build = Path(temporary)
@@ -223,6 +313,44 @@ class ResearchDevBuildTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unsupported Ninja regeneration graph"):
                 with dev_build.shadow_plan_manifest(build):
                     self.fail("unsupported graph must not yield")
+
+    def test_discovery_graph_preflight_accepts_current_and_refuses_stale(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            (build / "CMakeFiles").mkdir()
+            (build / "CMakeFiles" / "VerifyGlobs.cmake").write_text("", encoding="utf-8")
+            (build / "build.ninja").write_text(
+                "rule VERIFY_GLOBS\n  command = cmake -P VerifyGlobs.cmake\n"
+                "rule RERUN_CMAKE\n  command = cmake --regenerate-during-build\n"
+                "build verify.force: phony\n"
+                "build verify.stamp: VERIFY_GLOBS | verify.force\n\n"
+                "build build.ninja: RERUN_CMAKE verify.stamp | CMakeLists.txt\n\n",
+                encoding="utf-8",
+            )
+
+            def runner_for(ninja_stdout):
+                def runner(command, **kwargs):
+                    if command[0] == "/tool/cmake":
+                        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                    return subprocess.CompletedProcess(command, 0, stdout=ninja_stdout, stderr="")
+                return runner
+
+            with mock.patch.object(dev_build, "required_tool", side_effect=lambda name: f"/tool/{name}"):
+                with mock.patch.object(
+                    dev_build.subprocess,
+                    "run",
+                    side_effect=runner_for("ninja: no work to do.\n"),
+                ):
+                    dev_build.require_current_discovery_graph(build, {})
+                with mock.patch.object(
+                    dev_build.subprocess,
+                    "run",
+                    side_effect=runner_for(
+                        f"[1/1] {dev_build.PLAN_REGEN_DESCRIPTION}\n"
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "regenerate the lane"):
+                        dev_build.require_current_discovery_graph(build, {})
 
     def test_parse_ninja_plan_counts_and_flags_cmake_regeneration(self):
         plan = dev_build.parse_ninja_plan(

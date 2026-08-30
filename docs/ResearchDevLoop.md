@@ -164,6 +164,27 @@ unrelated CMake errors. It does not update submodules automatically because doin
 worktree and can erase the provenance distinction between the requested source and the environment
 that happened to be present.
 
+### Discover the configured target and test names
+
+An established lane can search its configured CMake targets and CTest registry before you decide
+what to build:
+
+```sh
+./Scripts/ResearchDevBuild.py --lane editor discover Vulkan
+```
+
+The query is one case-insensitive literal, not a regular expression. The JSON result reports CMake
+targets and tests separately, with at most 32 results from each registry by default. Tests whose
+executables have not been built are labelled `not_built`; a registered Python or binary command is
+only a registry fact, not proof that the test is ready or that a similarly named target owns it.
+Use `--limit N` to request up to 64 results.
+
+`discover` requires an existing lane at the requested source and exact profile. It verifies CMake's
+glob sentinel and refuses pending regeneration, then reads semantic target headings from the
+generated Ninja graph and uses CTest's JSON show-only mode. It does not configure, build a target,
+run a test, write a receipt, persist an index or infer target/test ownership. The same query is
+available as the VS Code task **FEX: discover configured targets and tests**.
+
 The helper configures Clang, Ninja, lld, ccache, `RelWithDebInfo`, assertions, thunks and tests,
 without LTO or the GUI. It prints and stores a receipt containing the exact source head, dirty bit,
 target, worker count, configuration mode, setup and target durations, result, cache namespace and
