@@ -96,6 +96,14 @@ consumption in exact format order before `Lookup` constructs any span. It also r
 code sizing, a zero-relative primary guest entrypoint and host offsets within the code buffer.
 Trailing stored guest bytes remain allowed.
 
+The bounded read-only analyzer also validates the physical relationship between the two files. For
+every accepted index entry, the payload offset must be preceded by the same 40-byte key and the
+exact 16-byte uncompressed data header written by `FOZFile::WriteBlob`. Referenced data records are
+then sorted and required not to overlap. Its topology receipt accounts every data-file byte as the
+16-byte magic, a referenced record envelope/payload, an interior unreferenced extent or a trailing
+unreferenced extent. These are physical byte observations, not proof that an unreferenced range is
+a complete record, safe to compact, old, unused or deletable.
+
 The pure `FEXCore_Tests_DiskCacheFile` target covers the exact offsets, every strict required-prefix
 truncation, count overflow, host-code alignment, missing primary entrypoint and out-of-range host
 offsets. It compiles only the parser plus Catch2; it does not initialize a context, open a database,
@@ -112,6 +120,12 @@ uses temporary real data/index files to prove read-only non-mutation, replacemen
 index suffix, reclamation of a complete trailing data-only record and size revalidation when a
 second handle appends first. Use the pure parser target for the ordinary edit loop; rerun the
 integration owner only when file/lock/recovery wiring changes.
+
+The controlled ARM cache-shape profile additionally requires its new cold cache to be physically
+contiguous with zero unreferenced bytes before the warm immutable-cache check. A real user corpus
+may legitimately report gaps left by failed historical writes; inventory those shapes without
+mutation before proposing general compaction. The zero `last_access_time` field still provides no
+retention or eviction evidence.
 
 ## Compare with the whole-file cache
 
