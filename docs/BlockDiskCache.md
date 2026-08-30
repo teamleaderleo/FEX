@@ -36,6 +36,21 @@ One writable database uses `RWCacheDB.foz` plus `RWCacheDB_idx.foz`. Optional na
 databases share the same in-memory index. Writes append the data blob first and the index record
 second under file locks, then publish the new in-process index entry. The worker thread makes store
 latency asynchronous; it does not make publication transactional across both files after a crash.
+A data-only append is therefore an unreferenced orphan rather than a readable entry.
+
+The Fossilize stream format permits its final record to be truncated. On writable open, FEX keeps
+the byte offset after the last complete index record. Before a later write reuses that offset, it
+rechecks the index under the existing data/index file locks; another process changing the physical
+index size also forces that recheck. The next complete fixed-size record overwrites the torn suffix
+instead of being appended behind it. Read-only databases stop at the same valid prefix but are never
+modified.
+
+This matches the append boundary in
+[ValveSoftware/Fossilize's stream archive](https://github.com/ValveSoftware/Fossilize/blob/d91d5228dfc9316ad7eda24ece9d02836eae31d8/fossilize_db.cpp):
+the primary format documentation says a truncated final entry is acceptable, and append mode seeks
+back to the first invalid record before its next write. FEX retains no resynchronization guess past
+corrupt bytes. Records already appended behind that boundary were never discoverable; recovery may
+overwrite their index bytes, while their data blobs remain unreferenced orphans.
 
 The index field named `last_access_time` is currently written as zero. It is not last-use evidence
 and grants no eviction authority. The implementation has no prune, compaction, quota or deletion
@@ -74,8 +89,16 @@ truncation, count overflow, host-code alignment, missing primary entrypoint and 
 offsets. It compiles only the parser plus Catch2; it does not initialize a context, open a database,
 compile guest code, load ARM64 host code or prove a performance benefit.
 
-Relocation value/type semantics, two-file crash recovery, real lookup allocation counts and cache
-retention remain separate questions. Do not turn a green layout parser into any of those claims.
+Relocation value/type semantics, fsync ordering, orphan reclamation, real lookup allocation counts
+and cache retention remain separate questions. The pure `FEXCore_Tests_DiskCacheIndexFile` target
+covers all 83 non-empty strict record prefixes, ordinary semantic skips, first-write recovery and
+monotonic salvage of an already-poisoned suffix. It proves an append boundary, not power-loss
+durability or transactionality. Do not turn either green parser into those claims.
+
+`FEXCore_Tests_DiskCacheIndexRecovery` is the more expensive acceptance owner. It links FEXCore and
+uses temporary real data/index files to prove read-only non-mutation, replacement of a 12-byte torn
+suffix and size revalidation when a second handle appends first. Use the pure parser target for the
+ordinary edit loop; rerun the integration owner only when file/lock/recovery wiring changes.
 
 ## Compare with the whole-file cache
 
