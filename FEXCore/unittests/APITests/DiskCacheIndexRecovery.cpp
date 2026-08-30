@@ -162,3 +162,67 @@ TEST_CASE("DiskCacheIndexRecovery - a stale writer rechecks another handle's com
     REQUIRE(IndexHashes(FinalIndex) == std::vector<uint64_t> {0xA, 0xB, 0xC});
   }
 }
+
+TEST_CASE("DiskCacheIndexRecovery - a minimal block blob retains nonzero guest identity") {
+  const auto Unique = std::chrono::steady_clock::now().time_since_epoch().count();
+  TempTree Temp {.Path = std::filesystem::temp_directory_path() / fmt::format("fex-minimal-block-blob-{}", Unique)};
+  REQUIRE(std::filesystem::create_directory(Temp.Path));
+
+  const auto BasePath = Temp.Path / "RWCacheDB";
+  const auto BasePathString = BasePath.string();
+  const fextl::string FEXBasePath {BasePathString.c_str()};
+  const auto CachePath = BasePathString + ".foz";
+
+  constexpr uint32_t GuestSize = 37;
+  constexpr uint32_t HostSize = 16;
+  constexpr size_t RequiredSize =
+    sizeof(DiskCache::BlobFixedHeader) + HostSize + sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t);
+  std::array<uint8_t, RequiredSize> Blob {};
+  const DiskCache::BlobFixedHeader Header {
+    .GuestSize = GuestSize,
+    .HostSize = HostSize,
+    .EntryPointCount = 1,
+    .SmallRelocCount = 0,
+    .ThunkRelocCount = 0,
+    .TouchedGuestPagesCount = 1,
+    .GuestHash = {.low64 = 0x0123'4567'89ab'cdef, .high64 = 0xfedc'ba98'7654'3210},
+  };
+  std::memcpy(Blob.data(), &Header, sizeof(Header));
+  const size_t EntryPointRIPOffset = sizeof(Header) + HostSize + sizeof(uint64_t);
+  const uint64_t PrimaryEntryPoint = 0;
+  const uint32_t PrimaryHostOffset = 0;
+  std::memcpy(Blob.data() + EntryPointRIPOffset, &PrimaryEntryPoint, sizeof(PrimaryEntryPoint));
+  std::memcpy(Blob.data() + EntryPointRIPOffset + sizeof(PrimaryEntryPoint), &PrimaryHostOffset, sizeof(PrimaryHostOffset));
+
+  const auto Validation = DiskCacheFile::Validate(std::as_bytes(std::span {Blob}));
+  REQUIRE(Validation.Parsed);
+  REQUIRE(Validation.Parsed->Header.GuestSize == GuestSize);
+  REQUIRE(Validation.Parsed->RequiredSize == Blob.size());
+
+  constexpr uint64_t Hash = 0x1234'5678'9abc'def0;
+  {
+    DiskCache::Index Index;
+    std::mutex IndexMutex;
+    DiskCache::IndexedDB DB;
+    REQUIRE(DB.Open(FEXBasePath, false));
+    REQUIRE(DB.StoreCacheBlob(MakeKey(Hash), Blob, Index, IndexMutex));
+    REQUIRE(Index.at(Hash).Size == Blob.size());
+  }
+
+  constexpr uintmax_t MagicSize = 16;
+  constexpr uintmax_t DataRecordOverhead =
+    sizeof(DiskCache::MesaFOZ::foz_payload_key) + sizeof(DiskCache::MesaFOZ::foz_payload_header);
+  REQUIRE(std::filesystem::file_size(CachePath) == MagicSize + DataRecordOverhead + Blob.size());
+
+  DiskCache::Index RestartedIndex;
+  bool FoundMetadata = false;
+  DiskCache::IndexedDB Restarted;
+  REQUIRE(Restarted.Open(FEXBasePath, true));
+  Restarted.PopulateIndex(RestartedIndex, FoundMetadata);
+  REQUIRE_FALSE(FoundMetadata);
+  REQUIRE(RestartedIndex.contains(Hash));
+  REQUIRE(RestartedIndex.at(Hash).Size == Blob.size());
+  std::array<uint8_t, RequiredSize> Readback {};
+  REQUIRE(Restarted.ReadCacheBlob(RestartedIndex.at(Hash).Offset, Readback));
+  REQUIRE(Readback == Blob);
+}
