@@ -2,6 +2,7 @@
 #pragma once
 #include "FEXCore/Core/CodeCache.h"
 #include "FEXCore/Core/Context.h"
+#include "FEXCore/Core/DiskCacheFile.h"
 #include "Interface/Core/JIT/Relocations.h"
 #include "Interface/Core/Frontend.h"
 #include "Interface/Core/CPUBackend.h"
@@ -50,41 +51,6 @@ namespace DiskCache {
     IndexedDB* DB;
     uint64_t Offset;
     uint32_t Size;
-  };
-
-  struct __attribute__((packed)) BlobFixedHeader {
-    uint32_t GuestSize;
-    uint32_t HostSize;
-    uint32_t EntryPointCount;
-    uint32_t SmallRelocCount;
-    uint32_t ThunkRelocCount;
-    uint32_t TouchedGuestPagesCount;
-    XXH128_hash_t GuestHash;
-  };
-
-  // packed struct for types 0, 2 and 3. type 1 is bigger and separate below
-  struct __attribute__((packed)) BlobSmallRelocation {
-    uint32_t Offset;
-    uint8_t Type;
-    union {
-      struct __attribute__((packed)) {
-        uint32_t Symbol;
-      } Named;
-      struct __attribute__((packed)) {
-        uint64_t GuestRIP;
-      } RIPLiteral;
-      struct __attribute__((packed)) {
-        uint8_t RegisterIndex;
-        uint64_t GuestRIP;
-      } RIPMove;
-    };
-  };
-
-  // type 1, implicit
-  struct __attribute__((packed)) BlobThunkRelocation {
-    uint32_t Offset;
-    uint8_t RegisterIndex;
-    uint8_t SymbolHash[32]; // sha256sum in the real RelocNamedThunkMove
   };
 
   struct CodeHitData {

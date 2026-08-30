@@ -1,4 +1,4 @@
-name: Focused code-cache parser
+name: Focused code-cache parsers
 
 on:
   workflow_dispatch:
@@ -6,19 +6,22 @@ on:
     paths:
       - .github/workflows/focused-code-cache.yml
       - FEXCore/include/FEXCore/Core/CodeCacheFile.h
+      - FEXCore/include/FEXCore/Core/DiskCacheFile.h
       - FEXCore/Source/Interface/Core/CodeCacheFile.cpp
+      - FEXCore/Source/Interface/Core/DiskCacheFile.cpp
       - FEXCore/unittests/APITests/CMakeLists.txt
       - FEXCore/unittests/APITests/CodeCacheFile.cpp
+      - FEXCore/unittests/APITests/DiskCacheFile.cpp
 
 permissions:
   contents: read
 
 concurrency:
-  group: focused-code-cache-${{ github.event.pull_request.number || github.ref }}
+  group: focused-cache-parsers-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  whole-file-parser:
+  cache-parsers:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -69,15 +72,18 @@ jobs:
           set -euo pipefail
           python3 Scripts/ResearchDevBuild.py submodules --jobs 8
 
-      - name: Build only the whole-file parser test
+      - name: Build only the pure cache-parser tests
         shell: bash
         run: |
           set -euo pipefail
           python3 Scripts/ResearchDevBuild.py \
             --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
             build FEXCore_Tests_CodeCacheFile --jobs 4
+          python3 Scripts/ResearchDevBuild.py \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
+            build FEXCore_Tests_DiskCacheFile --jobs 4
 
-      - name: Run only the whole-file parser cases
+      - name: Run only the pure cache-parser cases
         shell: bash
         run: |
           set -euo pipefail
@@ -85,7 +91,7 @@ jobs:
             --test-dir "${RUNNER_TEMP}/fex-dev/views/code-cache-parser/build" \
             --output-on-failure \
             --no-tests=error \
-            -R '[.]CodeCacheFile[.]FEXCore_Tests$'
+            -R '[.](CodeCacheFile|DiskCacheFile)[.]FEXCore_Tests$'
 
       - name: Prove final source identity
         if: always()

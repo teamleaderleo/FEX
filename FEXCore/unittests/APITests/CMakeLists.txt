@@ -10,6 +10,12 @@ foreach(TEST ${TESTS})
     target_sources(FEXCore_Tests_${TEST_NAME} PRIVATE "../../Source/Interface/Core/CodeCacheFile.cpp")
     target_link_libraries(FEXCore_Tests_${TEST_NAME} PRIVATE fmt::fmt Catch2::Catch2WithMain)
     target_include_directories(FEXCore_Tests_${TEST_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+  elseif (TEST_NAME STREQUAL "DiskCacheFile")
+    # The block-cache layout parser is deliberately pure. Compile its one
+    # implementation directly without the JIT, runtime, or Fossilize I/O.
+    target_sources(FEXCore_Tests_${TEST_NAME} PRIVATE "../../Source/Interface/Core/DiskCacheFile.cpp")
+    target_link_libraries(FEXCore_Tests_${TEST_NAME} PRIVATE Catch2::Catch2WithMain xxHash::xxhash)
+    target_include_directories(FEXCore_Tests_${TEST_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
   else()
     target_link_libraries(FEXCore_Tests_${TEST_NAME} PRIVATE ${LIBS})
   endif()

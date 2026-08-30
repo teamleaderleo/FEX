@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <charconv>
+#include <span>
 
 namespace FEXCore {
 
@@ -420,11 +421,13 @@ namespace DiskCache {
       return std::nullopt;
     }
 
-    if (Entry.Size < sizeof(BlobFixedHeader)) {
+    const std::span<const uint8_t> BlobBytes {HitData.Blob.data(), HitData.Blob.size()};
+    const auto Validation = DiskCacheFile::Validate(std::as_bytes(BlobBytes));
+    if (!Validation.Parsed) {
       return std::nullopt;
     }
-    BlobFixedHeader Header;
-    memcpy(&Header, HitData.Blob.data(), sizeof(Header));
+    const auto& Layout = *Validation.Parsed;
+    const auto& Header = Layout.Header;
 
     // do we have enough room in our live code to even hash GuestSize worth?
     auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
@@ -443,28 +446,15 @@ namespace DiskCache {
     }
     // LogMan::Msg::IFmt("hash ok! length {:d}", Header.GuestSize);
 
-    // this seems to be a full hit, lastly, check the entry is big enough to have everything (except maybe GuestCode)
-    uint32_t SizeNeeded = sizeof(Header) + Header.HostSize + Header.EntryPointCount * (sizeof(uint64_t) + sizeof(uint32_t));
-    SizeNeeded += Header.SmallRelocCount * sizeof(BlobSmallRelocation) + Header.ThunkRelocCount * sizeof(BlobThunkRelocation) +
-                  Header.TouchedGuestPagesCount * sizeof(uint64_t);
-    if (Entry.Size < SizeNeeded) {
-      return std::nullopt;
-    }
-
-    uint32_t BlobOffset = sizeof(Header);
-
-    HitData.HostCode = {HitData.Blob.data() + BlobOffset, Header.HostSize};
-    BlobOffset += Header.HostSize;
-    HitData.GuestPages = {reinterpret_cast<uint64_t*>(HitData.Blob.data() + BlobOffset), Header.TouchedGuestPagesCount};
-    BlobOffset += Header.TouchedGuestPagesCount * sizeof(uint64_t);
-    HitData.EntryPointRIPs = {reinterpret_cast<uint64_t*>(HitData.Blob.data() + BlobOffset), Header.EntryPointCount};
-    BlobOffset += Header.EntryPointCount * sizeof(uint64_t);
-    HitData.EntryPointHostOffsets = {reinterpret_cast<const uint32_t*>(HitData.Blob.data() + BlobOffset), Header.EntryPointCount};
-    BlobOffset += Header.EntryPointCount * sizeof(uint32_t);
-    HitData.SmallRelocs = {reinterpret_cast<const BlobSmallRelocation*>(HitData.Blob.data() + BlobOffset), Header.SmallRelocCount};
-    BlobOffset += Header.SmallRelocCount * sizeof(BlobSmallRelocation);
-    HitData.ThunkRelocs = {reinterpret_cast<const BlobThunkRelocation*>(HitData.Blob.data() + BlobOffset), Header.ThunkRelocCount};
-    BlobOffset += Header.ThunkRelocCount * sizeof(BlobThunkRelocation);
+    HitData.HostCode = {HitData.Blob.data() + Layout.HostCodeOffset, Header.HostSize};
+    HitData.GuestPages = {reinterpret_cast<uint64_t*>(HitData.Blob.data() + Layout.GuestPagesOffset), Header.TouchedGuestPagesCount};
+    HitData.EntryPointRIPs = {reinterpret_cast<uint64_t*>(HitData.Blob.data() + Layout.EntryPointRIPsOffset), Header.EntryPointCount};
+    HitData.EntryPointHostOffsets = {
+      reinterpret_cast<const uint32_t*>(HitData.Blob.data() + Layout.EntryPointHostOffsetsOffset), Header.EntryPointCount};
+    HitData.SmallRelocs = {
+      reinterpret_cast<const BlobSmallRelocation*>(HitData.Blob.data() + Layout.SmallRelocationsOffset), Header.SmallRelocCount};
+    HitData.ThunkRelocs = {
+      reinterpret_cast<const BlobThunkRelocation*>(HitData.Blob.data() + Layout.ThunkRelocationsOffset), Header.ThunkRelocCount};
 
     for (auto& PageOffset : HitData.GuestPages) {
       PageOffset += GuestRIP;
