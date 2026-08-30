@@ -888,8 +888,17 @@ def doctor_receipt(
         if host_machine in {"aarch64", "arm64"}
         else "escalate_to_checked_in_arm64_profile"
     )
+    focused_next_commands = (
+        [
+            "./Scripts/ResearchDevBuild.py --lane NAME build TARGET",
+            "./Scripts/ResearchDevBuild.py --lane NAME check TARGET EXACT_CTEST",
+            "./Scripts/ResearchDevBuild.py --lane editor editor",
+        ]
+        if local_preflight_ready
+        else []
+    )
     return {
-        "format": "teamleaderleo-fex-experiment-doctor-v1",
+        "format": "teamleaderleo-fex-experiment-doctor-v2",
         "status": "preflight_ready" if local_preflight_ready else "blocked",
         "source": source_receipt,
         "submodules": submodules,
@@ -901,18 +910,24 @@ def doctor_receipt(
         "capabilities": {
             "focusedX86HostBuildAndCTest": {
                 "state": "preflight_ready" if local_preflight_ready else "blocked",
-                "ready": False,
+                "preflightReady": local_preflight_ready,
+                "executionState": "not_run",
+                "evidenceState": "not_established",
                 "blockers": local_blockers,
+                "nextCommands": focused_next_commands,
                 "scope": "one named x86-host target or one exact host-side CTest",
                 "proof": "required command paths and pinned submodules only; configure/build/test did not run",
             },
             "reusableExactHeadEvidence": {
                 "state": exact_head_state,
+                "established": False,
                 "reason": exact_head_reason,
             },
             "arm64ProductRuntime": {
                 "state": arm_state,
-                "ready": False,
+                "preflightReady": False,
+                "executionState": "not_run",
+                "evidenceState": "not_established",
                 "scope": "requires an exact-SHA checked-in ARM64 profile and its own runtime oracle",
             },
         },

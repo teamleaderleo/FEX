@@ -33,6 +33,12 @@ submodule digest, required tool paths, host architecture, and three deliberately
 focused x86-host build/CTest preflight, whether a dirty tree limits the result to developer
 feedback, and whether an ARM64 product-runtime question must move to a checked-in profile. A green
 preflight still says that configure/build/test did not run, and it is not an ARM runtime result.
+The v2 capability receipt makes that distinction machine-readable: `preflightReady` says only that
+the bounded command may start, `executionState` remains `not_run`, and `evidenceState` remains
+`not_established`. A ready focused capability includes literal placeholder command forms for one
+target, one target plus exact CTest, or the editor lane. Replace `NAME`, `TARGET`, and `EXACT_CTEST`;
+do not paste the placeholders unchanged. A blocked capability emits no next command and reports its
+exact blocker/remediation instead.
 Missing or drifted submodules include the
 bounded recovery command, but `doctor` never runs it, configures CMake, writes a cache, builds a
 target, runs a test, or installs a package. VS Code exposes the same check as **FEX: diagnose
