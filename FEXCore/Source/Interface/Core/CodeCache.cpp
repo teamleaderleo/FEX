@@ -15,6 +15,7 @@
 #include <Interface/Core/OpcodeDispatcher.h>
 #include <Interface/IR/PassManager.h>
 
+#include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/HLE/SourcecodeResolver.h>
 #include <FEXCore/HLE/SyscallHandler.h>
@@ -32,6 +33,30 @@
 #include <fstream>
 
 namespace FEXCore {
+
+uint64_t CodeCacheConfig::ComputeId(std::string_view SerializedConfig, uint64_t HostFeaturesHash, bool Is64BitMode) {
+  struct FEX_PACKED IdentityHeader {
+    std::array<char, 8> Domain = {'F', 'X', 'C', 'C', 'I', 'D', '\0', '\0'};
+    uint8_t Version = 1;
+    uint8_t Is64BitMode;
+    std::array<uint8_t, 6> Reserved {};
+    uint64_t HostFeaturesHash;
+  };
+  static_assert(sizeof(IdentityHeader) == 24);
+
+  const IdentityHeader Header {
+    .Is64BitMode = Is64BitMode,
+    .HostFeaturesHash = HostFeaturesHash,
+  };
+  fextl::vector<uint8_t> Bytes(sizeof(Header) + SerializedConfig.size());
+  memcpy(Bytes.data(), &Header, sizeof(Header));
+  memcpy(Bytes.data() + sizeof(Header), SerializedConfig.data(), SerializedConfig.size());
+  return XXH3_64bits(Bytes.data(), Bytes.size());
+}
+
+uint64_t CodeCacheConfig::ComputeId(const HostFeatures& HostFeatures, bool Is64BitMode) {
+  return ComputeId(Config::SerializeForCache(), HostFeatures.HashForCaching(), Is64BitMode);
+}
 
 #if __clang_major__ < 16
 ExecutableFileInfo::ExecutableFileInfo(fextl::unique_ptr<HLE::SourcecodeMap> Map, uint64_t FileId, fextl::string Filename)
@@ -272,6 +297,10 @@ CodeCache::CodeCache(ContextImpl& CTX_)
   : CTX(CTX_) {}
 CodeCache::~CodeCache() = default;
 
+uint64_t CodeCache::GetConfigId() const {
+  return CodeCacheConfig::ComputeId(CTX.HostFeatures, CTX.Config.Is64BitMode());
+}
+
 uint64_t CodeCache::ComputeCodeMapId(std::string_view Filename, int FD) {
   if (Filename.empty()) {
     return 0xffff'ffff'ffff'ffff;
@@ -287,8 +316,10 @@ struct CodeCacheHeader {
   // Version history:
   // 1: Initial version
   // 2: Padding code buffer data to enable direct mapping
-  uint32_t FormatVersion = 2;
+  // 3: Bind contents to the effective code-generation configuration
+  uint32_t FormatVersion = ExpectedFormatVersion;
   uint8_t FEXVersion[20] = {};
+  uint64_t ConfigId;
   uint32_t NumBlocks;
   uint32_t NumCodePages;
   uint32_t CodeBufferSize;
@@ -298,6 +329,7 @@ struct CodeCacheHeader {
   // TODO: Consider including information from LookupCache.BlockLinks
 
   static constexpr std::array<char, 4> ExpectedMagic = {'F', 'X', 'C', 'C'};
+  static constexpr uint32_t ExpectedFormatVersion = 3;
 };
 
 template<typename T>
@@ -312,6 +344,7 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
   CodeCacheHeader header {};
   static_assert(GIT_HASH.size() == sizeof(header.FEXVersion));
   std::ranges::copy(GIT_HASH, header.FEXVersion);
+  header.ConfigId = GetConfigId();
   header.NumBlocks = LookupCache.BlockList.size();
   header.NumCodePages = LookupCache.CodePages.size();
   header.CodeBufferSize = FEXCore::AlignUp(CodeBuffer->AllocatedSpaceUsed(), Utils::FEX_PAGE_SIZE);
@@ -623,9 +656,19 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
     return nullptr;
   }
 
+  if (header.FormatVersion != header.ExpectedFormatVersion) {
+    LogMan::Msg::IFmt("Unsupported code cache format {}; expected {}", header.FormatVersion, header.ExpectedFormatVersion);
+    return nullptr;
+  }
+
   if (!std::ranges::equal(header.FEXVersion, GIT_HASH)) {
     LogMan::Msg::IFmt("Cache generated from old FEX version {:02x}, current is {:02x}; skipping", fmt::join(header.FEXVersion, ""),
                       fmt::join(GIT_HASH, ""));
+    return nullptr;
+  }
+
+  if (header.ConfigId != GetConfigId()) {
+    LogMan::Msg::IFmt("Code cache configuration mismatch; skipping");
     return nullptr;
   }
 

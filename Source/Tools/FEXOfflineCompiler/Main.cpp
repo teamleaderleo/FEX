@@ -29,6 +29,7 @@
 #include <fmt/printf.h>
 #include <libgen.h>
 
+#include <charconv>
 #include <fcntl.h>
 #include <fstream>
 #include <optional>
@@ -395,8 +396,19 @@ struct winsize {
 };
 #endif
 
+static FEXCore::HostFeatures FetchOfflineCompilerHostFeatures(bool Is64Bit) {
+#ifndef _WIN32
+  return FEX::FetchHostFeatures();
+#else
+  const auto NtDll = GetModuleHandleW(L"ntdll.dll");
+  const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
+  return FEX::Windows::CPUFeatures::FetchHostFeatures(
+    IsWine, Is64Bit ? FEXCore::HostFeatures::HostTypeEnum::Arm64ec : FEXCore::HostFeatures::HostTypeEnum::Wow64);
+#endif
+}
+
 // Returns filename of generated cache on success
-static std::optional<std::string> GenerateSingleCache(FEXCore::ExecutableFileInfo& Binary, uint64_t CodeCacheConfigId,
+static std::optional<std::string> GenerateSingleCache(FEXCore::ExecutableFileInfo& Binary, std::optional<uint64_t> ExpectedConfigId,
                                                       fextl::set<uintptr_t> BlockList, std::string_view OutDir) {
 #ifndef _WIN32
   ELFCodeLoader Loader(Binary.Filename.c_str(), -1, "", fextl::vector<fextl::string> {Binary.Filename.c_str()},
@@ -411,17 +423,15 @@ static std::optional<std::string> GenerateSingleCache(FEXCore::ExecutableFileInf
 #endif
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, Is64Bit ? "1" : "0");
 
-  // Load HostFeatures
-#ifndef _WIN32
-  auto HostFeatures = FEX::FetchHostFeatures();
-#else
-  const auto NtDll = GetModuleHandleW(L"ntdll.dll");
-  const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
-  auto HostFeatures = FEX::Windows::CPUFeatures::FetchHostFeatures(
-    IsWine, Is64Bit ? FEXCore::HostFeatures::HostTypeEnum::Arm64ec : FEXCore::HostFeatures::HostTypeEnum::Wow64);
-#endif
+  auto HostFeatures = FetchOfflineCompilerHostFeatures(Is64Bit);
 
   auto CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
+  const uint64_t CodeCacheConfigId = CTX->GetCodeCache().GetConfigId();
+  if (ExpectedConfigId && *ExpectedConfigId != CodeCacheConfigId) {
+    fmt::print(stderr, "Refusing cache generation: requested configuration {:016x}, compiler configuration is {:016x}\n", *ExpectedConfigId,
+               CodeCacheConfigId);
+    return std::nullopt;
+  }
   CTX->GetCodeCache().InitiateCacheGeneration();
 
 #ifdef _WIN32
@@ -552,6 +562,7 @@ static int GenerateCache(int argc, const char** argv) {
   optparse::OptionParser Parser {};
   Parser.add_option("--outdir").set_default(FEX::Config::GetCacheDirectory() + "cache").help("Output directory for generated cache files");
   Parser.add_option("--fileid").help("Select binary to generate cache for");
+  Parser.add_option("--config-id").set_default("").help("Require an exact 16-digit code-generation configuration identity");
 
   optparse::Values Options = Parser.parse_args(argc, argv);
   if (Parser.args().size() != 1) {
@@ -559,6 +570,19 @@ static int GenerateCache(int argc, const char** argv) {
     return 1;
   }
   const fextl::string CodeMapPath = Parser.args()[0];
+
+  std::optional<uint64_t> ExpectedConfigId;
+  auto ConfigIdValue = Options.get("config_id");
+  const fextl::string ConfigIdArgument {static_cast<const char*>(ConfigIdValue)};
+  if (!ConfigIdArgument.empty()) {
+    uint64_t ParsedConfigId {};
+    const auto Result = std::from_chars(ConfigIdArgument.data(), ConfigIdArgument.data() + ConfigIdArgument.size(), ParsedConfigId, 16);
+    if (ConfigIdArgument.size() != 16 || Result.ec != std::errc {} || Result.ptr != ConfigIdArgument.data() + ConfigIdArgument.size()) {
+      fmt::print(stderr, "Invalid --config-id: expected exactly 16 hexadecimal digits\n");
+      return 1;
+    }
+    ExpectedConfigId = ParsedConfigId;
+  }
 
   std::ifstream Codemap(CodeMapPath.c_str(), std::ios_base::binary);
   if (!Codemap) {
@@ -617,7 +641,7 @@ static int GenerateCache(int argc, const char** argv) {
   FEX::Config::LoadConfig("", envp, PortableInfo);
 
   auto NumBlocks = Data.at(ProgramName).size();
-  auto GeneratedCache = GenerateSingleCache(ProgramName, 0 /* TODO: Config id */, Data.at(ProgramName), OutDir);
+  auto GeneratedCache = GenerateSingleCache(ProgramName, ExpectedConfigId, Data.at(ProgramName), OutDir);
   if (GeneratedCache) {
     fmt::print("Successfully populated cache {} ({} blocks) via {}\n\n", GeneratedCache.value(), NumBlocks,
                std::filesystem::path {CodeMapPath}.filename().string());
@@ -758,6 +782,11 @@ static void AggregateCodeMaps(const std::string& NewCodeMapDirectory, const std:
 }
 
 static int ProcessAll() {
+  const auto PortableInfo = FEX::ReadPortabilityInformation();
+  char* envp[] = {nullptr};
+  FEXCore::Config::Shutdown();
+  FEX::Config::LoadConfig("", envp, PortableInfo);
+
   const auto CacheDirectory = FEX::Config::GetCacheDirectory();
   const std::string NewCodeMapDirectory = fmt::format("{}codemap/new", CacheDirectory);
   const std::string ReadyCodeMapDirectory = fmt::format("{}codemap/ready", CacheDirectory);
@@ -793,8 +822,10 @@ static int ProcessAll() {
 
     fmt::println("\nChecking caches for executable {}", ExecutableIt->second.Filename);
 
-    // TODO: Compute the cache config id from the active FEX configuration
-    uint64_t CodeCacheConfigId = 0;
+    const bool Is64Bit = ExecutableIt->second.ExecutableBitness.value() == 64;
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, Is64Bit ? "1" : "0");
+    const auto HostFeatures = FetchOfflineCompilerHostFeatures(Is64Bit);
+    const uint64_t CodeCacheConfigId = FEXCore::CodeCacheConfig::ComputeId(HostFeatures, Is64Bit);
 
     auto GetCacheFilename = [&](const FEXCore::ExecutableFileInfo& File) {
       return fmt::format("{}{}-{:016x}", OutDir, FEXCore::CodeMap::GetBaseFilename(File, false), CodeCacheConfigId);

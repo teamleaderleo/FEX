@@ -617,7 +617,8 @@ int main(int argc, char** argv, char** const envp) {
 
   if (FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
     // Request code cache generation
-    FEXServerClient::PopulateCodeCache(FEXServerClient::GetServerFD(), Loader.GetMainElfFD(), FEXCore::Config::Get_MULTIBLOCK());
+    FEXServerClient::PopulateCodeCache(FEXServerClient::GetServerFD(), Loader.GetMainElfFD(), FEXCore::Config::Get_MULTIBLOCK(),
+                                       CTX->GetCodeCache().GetConfigId());
 
     if (VDSOMapping) {
       // Finalize code cache for libVDSO-guest.so. This needs to be done explicitly since VDSO doesn't use LoadLib.

@@ -50,7 +50,7 @@ int RequestPIDFDPacket(int ServerSocket, PacketType Type) {
 
   // Send request
   fasio::error ec;
-  write(Socket, fasio::mutable_buffer {std::as_writable_bytes(std::span {&Req, 1})}, ec);
+  write(Socket, fasio::mutable_buffer {std::as_writable_bytes(std::span {&Req.BasicRequest, 1})}, ec);
   if (ec != fasio::error::success) {
     return -1;
   }
@@ -419,15 +419,20 @@ int RequestPIDFD(int ServerSocket) {
   return RequestPIDFDPacket(ServerSocket, PacketType::TYPE_GET_PID_FD);
 }
 
-void PopulateCodeCache(int ServerSocket, int ProgramFD, bool HasMultiblock) {
+void PopulateCodeCache(int ServerSocket, int ProgramFD, bool HasMultiblock, uint64_t ConfigId) {
   fasio::error ec;
   fasio::tcp_socket Socket {ServerSocket};
 
   // Send request
   FEXServerRequestPacket Req {
-    .Header {.Type = HasMultiblock ? PacketType::TYPE_POPULATE_CODE_CACHE : PacketType::TYPE_POPULATE_CODE_CACHE_NO_MULTIBLOCK}};
+    .CodeCacheRequest {
+      .Header {.Type = HasMultiblock ? PacketType::TYPE_POPULATE_CODE_CACHE : PacketType::TYPE_POPULATE_CODE_CACHE_NO_MULTIBLOCK},
+      .Reserved = 0,
+      .ConfigId = ConfigId,
+    },
+  };
 
-  fasio::mutable_buffer WriteBuffer {std::as_writable_bytes(std::span {&Req, 1})};
+  fasio::mutable_buffer WriteBuffer {std::as_writable_bytes(std::span {&Req.CodeCacheRequest, 1})};
   WriteBuffer.FD = &ProgramFD;
   write(Socket, WriteBuffer, ec);
   if (ec != fasio::error::success) {
@@ -453,7 +458,7 @@ int RequestCodeMapFD(int ServerSocket, int ProgramFD, bool HasMultiblock) {
   // Send request
   fasio::error ec;
   {
-    fasio::mutable_buffer WriteBuffer {std::as_writable_bytes(std::span {&Req, 1})};
+    fasio::mutable_buffer WriteBuffer {std::as_writable_bytes(std::span {&Req.BasicRequest, 1})};
     WriteBuffer.FD = &ProgramFD;
     write(Socket, WriteBuffer, ec);
     if (ec != fasio::error::success) {
