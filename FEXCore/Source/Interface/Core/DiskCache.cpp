@@ -88,6 +88,10 @@ namespace DiskCache {
     return FD ? FD->Size() : -1;
   }
 
+  bool FOZFile::Truncate(uint64_t Size) {
+    return FD && FD->Truncate(Size);
+  }
+
   bool FOZFile::ReadAll(fextl::vector<uint8_t>& Out) {
     ssize_t FileSize = Size();
     if (FileSize < FOZ_REF_MAGIC_SIZE) {
@@ -168,6 +172,17 @@ namespace DiskCache {
     return true;
   }
 
+  static uint64_t ReferencedCacheFileEnd(const DiskCacheIndexFile::ParseResult& Parsed) {
+    uint64_t End = FOZ_REF_MAGIC_SIZE;
+    for (const auto& Record : Parsed.Records) {
+      const uint64_t RecordEnd = Record.CacheFileOffset + Record.Size;
+      if (RecordEnd > End) {
+        End = RecordEnd;
+      }
+    }
+    return End;
+  }
+
   void IndexedDB::PopulateIndex(Index& CacheIndex, bool& FoundMetadata) {
     fextl::vector<uint8_t> Data;
     if (!IndexFOZ.ReadAll(Data)) {
@@ -189,11 +204,18 @@ namespace DiskCache {
     }
 
     ObservedIndexFileSize = FOZ_REF_MAGIC_SIZE + Data.size();
+    CacheFileSize = static_cast<uint64_t>(CacheFOZSize);
     if (!ReadOnly) {
       if (Parsed.State == DiskCacheIndexFile::ParseState::IncompleteSuffix) {
         IndexAppendOffset = FOZ_REF_MAGIC_SIZE + Parsed.ValidSize;
       } else {
         IndexAppendOffset.reset();
+      }
+      const uint64_t ReferencedEnd = ReferencedCacheFileEnd(Parsed);
+      if (ReferencedEnd < static_cast<uint64_t>(CacheFOZSize)) {
+        CacheAppendOffset = ReferencedEnd;
+      } else {
+        CacheAppendOffset.reset();
       }
     }
   }
@@ -242,26 +264,43 @@ namespace DiskCache {
     }
 
     const ssize_t CurrentIndexFileSize = IndexFOZ.Size();
-    if (CurrentIndexFileSize < 0) {
+    const ssize_t CurrentCacheFileSize = CacheFOZ.Size();
+    if (CurrentIndexFileSize < 0 || CurrentCacheFileSize < 0) {
       CacheFOZ.Unlock();
       IndexFOZ.Unlock();
       return false;
     }
-    if (IndexAppendOffset || static_cast<uint64_t>(CurrentIndexFileSize) != ObservedIndexFileSize) {
+    if (IndexAppendOffset || CacheAppendOffset || static_cast<uint64_t>(CurrentIndexFileSize) != ObservedIndexFileSize ||
+        static_cast<uint64_t>(CurrentCacheFileSize) != CacheFileSize) {
       fextl::vector<uint8_t> IndexData;
-      const ssize_t CacheFileSize = CacheFOZ.Size();
-      if (CacheFileSize < 0 || !IndexFOZ.ReadAll(IndexData)) {
+      if (!IndexFOZ.ReadAll(IndexData)) {
         CacheFOZ.Unlock();
         IndexFOZ.Unlock();
         return false;
       }
-      const auto Parsed = DiskCacheIndexFile::Parse(IndexData, static_cast<uint64_t>(CacheFileSize));
+      const auto Parsed = DiskCacheIndexFile::Parse(IndexData, static_cast<uint64_t>(CurrentCacheFileSize));
       ObservedIndexFileSize = FOZ_REF_MAGIC_SIZE + IndexData.size();
       if (Parsed.State == DiskCacheIndexFile::ParseState::IncompleteSuffix) {
         IndexAppendOffset = FOZ_REF_MAGIC_SIZE + Parsed.ValidSize;
       } else {
         IndexAppendOffset.reset();
       }
+      const uint64_t ReferencedEnd = ReferencedCacheFileEnd(Parsed);
+      if (ReferencedEnd < static_cast<uint64_t>(CurrentCacheFileSize)) {
+        CacheAppendOffset = ReferencedEnd;
+      } else {
+        CacheAppendOffset.reset();
+      }
+    }
+
+    if (CacheAppendOffset) {
+      if (!CacheFOZ.Truncate(*CacheAppendOffset)) {
+        CacheFOZ.Unlock();
+        IndexFOZ.Unlock();
+        return false;
+      }
+      CacheFileSize = *CacheAppendOffset;
+      CacheAppendOffset.reset();
     }
 
     // write cache side first so we get offset for index

@@ -1,4 +1,4 @@
-name: Focused code-cache parsers
+name: Focused code-cache validation
 
 on:
   workflow_dispatch:
@@ -9,6 +9,7 @@ on:
       - FEXCore/include/FEXCore/Core/DiskCache.h
       - FEXCore/include/FEXCore/Core/DiskCacheFile.h
       - FEXCore/include/FEXCore/Core/DiskCacheIndexFile.h
+      - FEXCore/include/FEXCore/Utils/File.h
       - FEXCore/Source/Interface/Core/CodeCacheFile.cpp
       - FEXCore/Source/Interface/Core/DiskCache.cpp
       - FEXCore/Source/Interface/Core/DiskCacheFile.cpp
@@ -17,6 +18,7 @@ on:
       - FEXCore/unittests/APITests/CodeCacheFile.cpp
       - FEXCore/unittests/APITests/DiskCacheFile.cpp
       - FEXCore/unittests/APITests/DiskCacheIndexFile.cpp
+      - FEXCore/unittests/APITests/DiskCacheIndexRecovery.cpp
 
 permissions:
   contents: read
@@ -77,7 +79,7 @@ jobs:
           set -euo pipefail
           python3 Scripts/ResearchDevBuild.py submodules --jobs 8
 
-      - name: Build only the pure cache-parser tests
+      - name: Build the pure parsers and one disk-I/O owner
         shell: bash
         run: |
           set -euo pipefail
@@ -90,8 +92,11 @@ jobs:
           python3 Scripts/ResearchDevBuild.py \
             --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
             build FEXCore_Tests_DiskCacheIndexFile --jobs 4
+          python3 Scripts/ResearchDevBuild.py \
+            --cache-root "${RUNNER_TEMP}/fex-dev" --lane code-cache-parser \
+            build FEXCore_Tests_DiskCacheIndexRecovery --jobs 4
 
-      - name: Run only the pure cache-parser cases
+      - name: Run only the cache-parser and disk-I/O owner cases
         shell: bash
         run: |
           set -euo pipefail
@@ -99,7 +104,7 @@ jobs:
             --test-dir "${RUNNER_TEMP}/fex-dev/views/code-cache-parser/build" \
             --output-on-failure \
             --no-tests=error \
-            -R '[.](CodeCacheFile|DiskCacheFile|DiskCacheIndexFile)[.]FEXCore_Tests$'
+            -R '[.](CodeCacheFile|DiskCacheFile|DiskCacheIndexFile|DiskCacheIndexRecovery)[.]FEXCore_Tests$'
 
       - name: Prove final source identity
         if: always()

@@ -13,11 +13,13 @@ Two narrow exceptions cover product boundaries that benefit from a same-reposito
   return tests and builds only `GL-host-64` on GitHub's `ubuntu-26.04` preview image with Clang 21.
 - `.github/workflows/focused-code-cache.yml` watches the format-3 whole-file parser, the block-blob
   layout parser, the Fossilize index parser and their focused registration/integration paths. It
-  compiles the three pure parser targets directly rather than linking the full JIT library, then
-  runs only their discovered `*.CodeCacheFile.FEXCore_Tests`, `*.DiskCacheFile.FEXCore_Tests` and
-  `*.DiskCacheIndexFile.FEXCore_Tests` cases with the complete LLVM/Clang 18 development package on
-  `ubuntu-24.04`. A producer change still gets an explicit affected-source/target build in its
-  research receipt; it does not make every parser-only PR compile the Linux emulation stack.
+  compiles the three pure parser targets plus the one real `DiskCacheIndexRecovery` file-I/O owner,
+  then runs only their discovered `*.CodeCacheFile.FEXCore_Tests`, `*.DiskCacheFile.FEXCore_Tests`,
+  `*.DiskCacheIndexFile.FEXCore_Tests` and `*.DiskCacheIndexRecovery.FEXCore_Tests` cases with the
+  complete LLVM/Clang 18 development package on `ubuntu-24.04`. The integration owner links
+  FEXCore so a watched `DiskCache.cpp` or shared file primitive cannot receive a parser-only green
+  check without compiling. It does not run a guest, another FEXCore test executable or a broad
+  inherited matrix.
 
 Both refuse external pull-request branches and may be dispatched manually. Neither runs a guest, a
 test family or an inherited matrix. The Clang 21 preview image changes weekly and carries no GA SLA,

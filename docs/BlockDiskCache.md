@@ -50,11 +50,19 @@ This matches the append boundary in
 the primary format documentation says a truncated final entry is acceptable, and append mode seeks
 back to the first invalid record before its next write. FEX retains no resynchronization guess past
 corrupt bytes. Records already appended behind that boundary were never discoverable; recovery may
-overwrite their index bytes, while their data blobs remain unreferenced orphans.
+overwrite their index bytes.
+
+The next writable store also repairs only an unreferenced physical data-file tail. While holding
+both existing database locks, it reparses the current index whenever either physical file changed
+or startup found a candidate tail. The greatest payload end referenced by the valid index prefix is
+the conservative append boundary. If the data file is longer, FEX truncates exactly those trailing
+bytes before appending the new data record. A read-only open never truncates. A valid record from a
+second writer extends the referenced boundary and is retained; an unreferenced gap before a later
+valid record remains an interior orphan and requires a separate compaction design.
 
 The index field named `last_access_time` is currently written as zero. It is not last-use evidence
-and grants no eviction authority. The implementation has no prune, compaction, quota or deletion
-policy.
+and grants no eviction authority. The implementation has no general prune, compaction, quota or
+eviction policy. Tail repair is crash/failure recovery at the next write, not a retention policy.
 
 ## Format-3 blob shape
 
@@ -93,16 +101,17 @@ truncation, count overflow, host-code alignment, missing primary entrypoint and 
 offsets. It compiles only the parser plus Catch2; it does not initialize a context, open a database,
 compile guest code, load ARM64 host code or prove a performance benefit.
 
-Relocation value/type semantics, fsync ordering, orphan reclamation, real lookup allocation counts
-and cache retention remain separate questions. The pure `FEXCore_Tests_DiskCacheIndexFile` target
+Relocation value/type semantics, fsync ordering, interior-orphan compaction, real lookup allocation
+counts and cache retention remain separate questions. The pure `FEXCore_Tests_DiskCacheIndexFile` target
 covers all 83 non-empty strict record prefixes, ordinary semantic skips, first-write recovery and
 monotonic salvage of an already-poisoned suffix. It proves an append boundary, not power-loss
 durability or transactionality. Do not turn either green parser into those claims.
 
 `FEXCore_Tests_DiskCacheIndexRecovery` is the more expensive acceptance owner. It links FEXCore and
 uses temporary real data/index files to prove read-only non-mutation, replacement of a 12-byte torn
-suffix and size revalidation when a second handle appends first. Use the pure parser target for the
-ordinary edit loop; rerun the integration owner only when file/lock/recovery wiring changes.
+index suffix, reclamation of a complete trailing data-only record and size revalidation when a
+second handle appends first. Use the pure parser target for the ordinary edit loop; rerun the
+integration owner only when file/lock/recovery wiring changes.
 
 ## Compare with the whole-file cache
 

@@ -75,6 +75,7 @@ namespace DiskCache {
       return FD ? FD->GetHandle() : (File::File::FileHandleType)-1;
     }
     ssize_t Size();
+    bool Truncate(uint64_t Size);
     bool ReadAll(fextl::vector<uint8_t>& Out); // from first blob
     bool ReadBlob(uint64_t Offset, std::span<uint8_t> OutBlob);
     bool WriteBlob(const MesaFOZ::foz_payload_key& Key, std::span<const std::span<const uint8_t>> BlobChunks, uint64_t& OutBlobOffset,
@@ -103,6 +104,7 @@ namespace DiskCache {
     FOZFile CacheFOZ;
     uint8_t* CacheFileMapping = nullptr;
     std::atomic<uint64_t> CacheFileSize;
+    std::optional<uint64_t> CacheAppendOffset;
     FOZFile IndexFOZ;
     uint64_t ObservedIndexFileSize {};
     std::optional<uint64_t> IndexAppendOffset;

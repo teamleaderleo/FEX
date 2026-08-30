@@ -98,6 +98,21 @@ class OwnedForkCIPolicyTest(unittest.TestCase):
                 self.assertEqual(separator, "@")
                 self.assertRegex(revision, r"^[0-9a-f]{40}$")
 
+    def test_code_cache_lane_compiles_watched_disk_io_wiring(self) -> None:
+        workflow = self.workflow("focused-code-cache.yml")
+        pull_request_scope = workflow.split("permissions:", 1)[0]
+        self.assertIn("pull_request:", workflow)
+        self.assertNotIn("\n  push:", workflow)
+        self.assertIn("- FEXCore/Source/Interface/Core/DiskCache.cpp", pull_request_scope)
+        self.assertIn("- FEXCore/include/FEXCore/Utils/File.h", pull_request_scope)
+        self.assertIn(
+            "- FEXCore/unittests/APITests/DiskCacheIndexRecovery.cpp",
+            pull_request_scope,
+        )
+        self.assertIn("build FEXCore_Tests_DiskCacheIndexRecovery --jobs 4", workflow)
+        self.assertIn("DiskCacheIndexRecovery", workflow)
+        self.assertNotIn("cmake --build", workflow)
+
     def test_research_tooling_lane_is_path_scoped_and_product_free(self) -> None:
         workflow = self.workflow("research-tooling.yml")
         pull_request_scope = workflow.split("permissions:", 1)[0]
