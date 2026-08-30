@@ -38,6 +38,35 @@ This 64-bit ID is a disposable cache namespace, not source or evidence authority
 still requires the exact FEX Git identity, the expected format, a matching ID inside the file
 header and structurally usable contents.
 
+## The format is one bounded layout
+
+Format 3 is not a bag of independently trusted counts. It is one contiguous file:
+
+1. a fixed 72-byte header;
+2. `NumBlocks` variable records containing guest offset, host-code offset and guest code pages;
+3. `NumRelocations` fixed 48-byte relocation records;
+4. zero padding to a 4 KiB boundary;
+5. one page-sized-multiple host-code region; and
+6. `NumCodePages` variable guest-page-to-entrypoint records ending at logical EOF.
+
+The runtime now parses that layout with checked file-relative offsets before allocating executable
+state. It rejects a truncated header or region, an unsupported identity, unsorted producer indexes,
+host-code offsets outside the code region, unknown/unsorted/out-of-range relocations, a zero or
+unaligned code region, malformed page records and nonzero/oversized trailing data. A Windows mapped
+view may include the zero-filled remainder of its final page; that bounded padding is accepted but
+never enters a parsed span. This matches the platform mapping contracts: Windows rounds a section
+view size up to `PAGE_SIZE`, while POSIX zero-fills the partial page at an object's end
+([Microsoft `ZwMapViewOfSection`](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwmapviewofsection),
+[POSIX `mmap`](https://man7.org/linux/man-pages/man3/mmap.3p.html)). Every accepted span used by
+`LoadCache` therefore comes from the one validated layout instead of fresh header-controlled pointer
+arithmetic. A stale interrupted `.new` file is truncated before regeneration so old tail bytes
+cannot be published behind a fresh header.
+
+This is structural validation, not authentication. A same-user process can still replace a cache
+with a different structurally valid file, and changing or truncating an already mapped file remains
+a separate concurrent-mutation problem. The loader skips invalid files; it does not delete them or
+choose a retention/eviction policy.
+
 ## Fail-closed generation flow
 
 ```text
