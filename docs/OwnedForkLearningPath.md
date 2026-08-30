@@ -1,8 +1,8 @@
 # Owned-fork FEX learning path
 
 Reviewed against owned-fork main
-[`66f88dd3a`](https://github.com/teamleaderleo/FEX/commit/66f88dd3ac323ceb7890cae92b27c09b7338a0fb)
-on 2026-08-30. This page answers “which fork PRs do I actually need to understand?” for a C++
+[`16dbe0b2d`](https://github.com/teamleaderleo/FEX/commit/16dbe0b2d9f0e0abdaf35a9cdc65da9609458ea2)
+on 2026-08-31. This page answers “which fork PRs do I actually need to understand?” for a C++
 newcomer. It is a curriculum and history index, not an upstream contribution plan.
 
 Use [the research map](OwnedForkResearchMap.md) when starting from a symptom. Use this page when
@@ -12,7 +12,7 @@ implementation.
 
 ## The short answer
 
-Do not read 56 PRs in number order. Learn these six arcs:
+Do not read 62 merged PRs in number order. Learn these six arcs:
 
 1. **Guest/host thunk ownership:** PRs #5, #12 and #14 explain why guest pointers, host copies and
    copyback/cleanup are different ownership decisions.
@@ -21,16 +21,20 @@ Do not read 56 PRs in number order. Learn these six arcs:
 3. **Already-escaped executable lifetime:** PR #23 creates the generator primitive; PRs #24 and #31
    give GL and Vulkan their own process-resident bridge owners.
 4. **Whole-file cache identity:** PRs #36/#37 bind offline code generation to complete effective
-   configuration; PR #43 validates the mapped file before constructing views.
+   configuration; PR #43 validates the mapped file before constructing views; PR #63 gives the
+   identity algorithm its lightweight production/test owner.
 5. **Online block cache layout:** PRs #49/#50/#51 bound the blob, recover a torn final index suffix
-   and stop writing a guest-byte tail no reader consumes.
+   and stop writing a guest-byte tail no reader consumes; PR #59 reclaims only an unindexed physical
+   tail; PR #61 observes physical topology; PR #62 isolates the file/lock/recovery owner.
 6. **Fast experiment loop:** PRs #4/#39/#40 make one stable C++ object and its compiler-cache result
    easy to request; PRs #46/#47 select one target's authoritative CTest set; PR #57 only plans
-   retirement of a reconstructible dead lane.
+   retirement of a reconstructible dead lane; PR #60 validates richer check-set receipts before
+   retirement; PRs #62/#63 make two cache edit loops pay only for their semantic owners.
 
 Read the remaining PRs when you need their tooling or historical discriminator. In particular,
 PRs #52-#56 are the bounded ARM disk-cache/ccache experiment and its carrier corrections, not five
-new cache semantics.
+new cache semantics. PRs #59/#61/#62 are respectively writer recovery, physical observation and
+developer ownership; do not collapse all three into an “eviction” feature.
 
 ## Thirty-second C++/FEX vocabulary
 
@@ -101,31 +105,36 @@ intentional; equal-looking signatures do not prove equal ABI and lifetime policy
 
 Read [Whole-file code-cache identity](WholeFileCodeCacheIdentity.md), then:
 
-1. [`CodeCache.h`](../FEXCore/include/FEXCore/Core/CodeCache.h) for the identity/header contract;
-2. [`CodeCache.cpp`](../FEXCore/Source/Interface/Core/CodeCache.cpp) for producer/consumer flow;
-3. [`CodeCacheFile.cpp`](../FEXCore/Source/Interface/Core/CodeCacheFile.cpp) for bounded parsing;
-4. [`CodeCacheConfig.cpp`](../FEXCore/unittests/APITests/CodeCacheConfig.cpp) for configuration
-   identity; and
-5. [`CodeCacheFile.cpp`](../FEXCore/unittests/APITests/CodeCacheFile.cpp) for structural prefixes.
+1. [`CodeCacheConfig.h`](../FEXCore/include/FEXCore/Core/CodeCacheConfig.h) for the identity API;
+2. [`CodeCacheConfig.cpp`](../FEXCore/Source/Interface/Core/CodeCacheConfig.cpp) for production
+   identity construction;
+3. [`CodeCache.cpp`](../FEXCore/Source/Interface/Core/CodeCache.cpp) for producer/consumer flow;
+4. [`CodeCacheFile.cpp`](../FEXCore/Source/Interface/Core/CodeCacheFile.cpp) for bounded parsing; and
+5. the focused [`CodeCacheConfig`](../FEXCore/unittests/APITests/CodeCacheConfig.cpp) identity and
+   [`CodeCacheFile`](../FEXCore/unittests/APITests/CodeCacheFile.cpp) structural-prefix owners.
 
 PR #36 creates the identity. PR #37 transports the exact app-specific snapshot to the offline
 compiler. PR #43 makes the mapped disk layout total before any span/view is constructed. None is an
-eviction policy.
+eviction policy. PR #63 changes production/test ownership, not the identity algorithm.
 
 ### 5. Online block-level Fossilize storage
 
 Read [Block-level Fossilize disk cache](BlockDiskCache.md), then:
 
 1. [`DiskCache.cpp`](../FEXCore/Source/Interface/Core/DiskCache.cpp) for Init/Lookup/Store;
-2. [`DiskCacheFile.cpp`](../FEXCore/Source/Interface/Core/DiskCacheFile.cpp) for blob validation;
-3. [`DiskCacheIndexFile.cpp`](../FEXCore/Source/Interface/Core/DiskCacheIndexFile.cpp) for the valid
+2. [`DiskCacheStorage.cpp`](../FEXCore/Source/Interface/Core/DiskCacheStorage.cpp) for files, locks,
+   index publication and physical-tail recovery;
+3. [`DiskCacheFile.cpp`](../FEXCore/Source/Interface/Core/DiskCacheFile.cpp) for blob validation;
+4. [`DiskCacheIndexFile.cpp`](../FEXCore/Source/Interface/Core/DiskCacheIndexFile.cpp) for the valid
    index prefix; and
-4. the corresponding [`DiskCacheFile`](../FEXCore/unittests/APITests/DiskCacheFile.cpp),
+5. the corresponding [`DiskCacheFile`](../FEXCore/unittests/APITests/DiskCacheFile.cpp),
    [`DiskCacheIndexFile`](../FEXCore/unittests/APITests/DiskCacheIndexFile.cpp) and
    [`DiskCacheIndexRecovery`](../FEXCore/unittests/APITests/DiskCacheIndexRecovery.cpp) owners.
 
 PRs #49/#50/#51 are format/safety/storage changes. PR #52 is the real ARM producer/analyzer profile
-that measured their tiny current corpus; it is evidence infrastructure, not another writer format.
+that measured their tiny current corpus. PR #59 adds bounded physical-tail recovery; PR #61 adds
+read-only physical-topology evidence; PR #62 changes production/test ownership without changing the
+format or recovery behavior. Evidence infrastructure and edit-loop ownership are not writer formats.
 
 ### 6. Developer and experiment machinery
 
@@ -139,9 +148,9 @@ Read [the development loop](ResearchDevLoop.md). The two central owners are:
 Use `doctor`, then compile one current file or check one exact owner. Do not infer ARM runtime from
 an x86 host build, and do not run a broad suite to learn a static ownership boundary.
 
-## Complete merged-PR atlas through #57
+## Complete merged-PR atlas through #63
 
-Every merged owned-fork PR from #1 through #57 appears exactly once below. [PR
+Every merged owned-fork PR from #1 through #63 appears exactly once below. [PR
 #3](https://github.com/teamleaderleo/FEX/pull/3) was a closed, unmerged diagnostic carrier and is not
 current source.
 
@@ -166,7 +175,8 @@ current source.
   [#43](https://github.com/teamleaderleo/FEX/pull/43).
 - **Online block-cache product semantics:** [#49](https://github.com/teamleaderleo/FEX/pull/49),
   [#50](https://github.com/teamleaderleo/FEX/pull/50), and
-  [#51](https://github.com/teamleaderleo/FEX/pull/51).
+  [#51](https://github.com/teamleaderleo/FEX/pull/51), and
+  [#59](https://github.com/teamleaderleo/FEX/pull/59).
 - **Local development, dependency storage and receipts:**
   [#4](https://github.com/teamleaderleo/FEX/pull/4),
   [#9](https://github.com/teamleaderleo/FEX/pull/9),
@@ -183,8 +193,11 @@ current source.
   [#35](https://github.com/teamleaderleo/FEX/pull/35),
   [#39](https://github.com/teamleaderleo/FEX/pull/39),
   [#40](https://github.com/teamleaderleo/FEX/pull/40),
-  [#41](https://github.com/teamleaderleo/FEX/pull/41), and
-  [#57](https://github.com/teamleaderleo/FEX/pull/57).
+  [#41](https://github.com/teamleaderleo/FEX/pull/41),
+  [#57](https://github.com/teamleaderleo/FEX/pull/57),
+  [#60](https://github.com/teamleaderleo/FEX/pull/60),
+  [#62](https://github.com/teamleaderleo/FEX/pull/62), and
+  [#63](https://github.com/teamleaderleo/FEX/pull/63).
 - **Focused verification, CI carriers and result documentation:**
   [#7](https://github.com/teamleaderleo/FEX/pull/7),
   [#10](https://github.com/teamleaderleo/FEX/pull/10),
@@ -201,10 +214,13 @@ current source.
   [#52](https://github.com/teamleaderleo/FEX/pull/52),
   [#53](https://github.com/teamleaderleo/FEX/pull/53),
   [#54](https://github.com/teamleaderleo/FEX/pull/54),
-  [#55](https://github.com/teamleaderleo/FEX/pull/55), and
-  [#56](https://github.com/teamleaderleo/FEX/pull/56).
+  [#55](https://github.com/teamleaderleo/FEX/pull/55),
+  [#56](https://github.com/teamleaderleo/FEX/pull/56), and
+  [#61](https://github.com/teamleaderleo/FEX/pull/61).
 - **Upstream product sync and overlap review:**
   [#48](https://github.com/teamleaderleo/FEX/pull/48).
+- **Current research and newcomer routing:**
+  [#58](https://github.com/teamleaderleo/FEX/pull/58).
 <!-- merged-pr-atlas-end -->
 
 ## How to inspect a PR without getting lost
