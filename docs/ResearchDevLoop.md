@@ -425,6 +425,14 @@ device, inode, mode, ownership, size, modification/change time and symlink text 
 revalidation token. The current source-repository HEAD also participates, so a later repository or
 lane change requires a fresh plan. Two unchanged plans are byte-identical.
 
+A check-set v2 receipt is recognized only when its full bounded-test evidence still agrees: the
+target name is safe, its current-user executable is a regular no-follow file beneath that lane's
+build directory, the sorted unique selected-test list/count/limit agree, registry and independent
+cross-check counts and digests have the expected shape, and the receipt's profile/cache fields
+match the lane profile. Missing, stale, linked or contradictory evidence refuses retirement. The
+planner does not rerun those deterministic tests; it verifies the retained evidence needed to
+decide whether the disposable build lane is reconstructible.
+
 A refused plan exits 2, names every observed blocker and emits no retirement token. A ready token is
 still only evidence for later exact-state review: this action has no `--apply`, never creates a lock,
 never moves or removes a lane and grants no process, mount, ownership, quarantine, deletion or

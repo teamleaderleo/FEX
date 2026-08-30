@@ -47,6 +47,7 @@ SHA1_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 RETIREMENT_RECEIPT_FORMATS = frozenset(
     {
         "teamleaderleo-fex-x86-host-check-receipt-v1",
+        "teamleaderleo-fex-x86-host-check-set-receipt-v2",
         "teamleaderleo-fex-x86-host-compile-receipt-v1",
         "teamleaderleo-fex-x86-host-dev-receipt-v1",
         "teamleaderleo-fex-x86-host-linux-test-build-receipt-v1",
@@ -2513,7 +2514,7 @@ def lane_metadata_identity_no_follow(root: Path) -> dict[str, object]:
 
 def lane_retirement_metadata(
     root: Path, identity: dict[str, object]
-) -> tuple[str, object | None, str, str]:
+) -> tuple[str, object | None, str, object | None, str, str]:
     descriptor = os.open(
         root,
         os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -2525,6 +2526,9 @@ def lane_retirement_metadata(
             identity["rootInode"],
         ):
             raise RuntimeError("lane root changed before metadata read")
+        receipt_state, receipt = read_small_json(
+            Path("last-receipt.json"), directory_fd=descriptor
+        )
         profile_state, profile = read_small_json(
             Path("profile.json"), directory_fd=descriptor
         )
@@ -2536,7 +2540,164 @@ def lane_retirement_metadata(
         )
     finally:
         os.close(descriptor)
-    return profile_state, profile, receipt_digest, profile_digest
+    return (
+        receipt_state,
+        receipt,
+        profile_state,
+        profile,
+        receipt_digest,
+        profile_digest,
+    )
+
+
+def regular_executable_beneath_no_follow(root: Path, candidate: object) -> bool:
+    if not isinstance(candidate, str) or not candidate or "\0" in candidate:
+        return False
+    path = Path(candidate)
+    if not path.is_absolute():
+        return False
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        return False
+
+    descriptors = []
+    try:
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        descriptors.append(descriptor)
+        for part in relative.parts[:-1]:
+            descriptor = os.open(
+                part,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            descriptors.append(descriptor)
+        artifact = os.open(
+            relative.parts[-1],
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=descriptor,
+        )
+        descriptors.append(artifact)
+        metadata = os.fstat(artifact)
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == os.getuid()
+            and metadata.st_size > 0
+            and bool(metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+        )
+    except OSError:
+        return False
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def check_set_retirement_blockers(
+    receipt: object, lane_root: Path, profile: object
+) -> list[str]:
+    if not isinstance(receipt, dict):
+        return ["receipt_check_set_schema_invalid"]
+
+    blockers = []
+    if (
+        receipt.get("format")
+        != "teamleaderleo-fex-x86-host-check-set-receipt-v2"
+        or receipt.get("lane") != lane_root.name
+    ):
+        blockers.append("receipt_check_set_schema_invalid")
+    target = receipt.get("target")
+    try:
+        if not isinstance(target, str):
+            raise ValueError
+        validate_target(target)
+    except ValueError:
+        blockers.append("receipt_check_set_target_invalid")
+
+    artifact = receipt.get("targetArtifact")
+    build = lane_root / "build"
+    if not regular_executable_beneath_no_follow(build, artifact):
+        blockers.append("receipt_check_set_artifact_unsafe")
+
+    selected = receipt.get("selectedTests")
+    count = receipt.get("selectedTestCount")
+    valid_selection = (
+        isinstance(selected, list)
+        and 0 < len(selected) <= EXACT_CTEST_SET_LIMIT
+        and all(isinstance(name, str) for name in selected)
+        and type(count) is int
+        and count == len(selected)
+        and len(selected) == len(set(selected))
+    )
+    if valid_selection:
+        try:
+            validated = [validate_ctest_name(name) for name in selected]
+        except (TypeError, ValueError):
+            valid_selection = False
+        else:
+            valid_selection = validated == sorted(
+                validated, key=lambda name: (name.casefold(), name)
+            )
+    if not valid_selection or receipt.get("selectionLimit") != EXACT_CTEST_SET_LIMIT:
+        blockers.append("receipt_check_set_selection_invalid")
+
+    registry = receipt.get("targetTestRegistry")
+    registry_valid = isinstance(registry, dict)
+    if registry_valid:
+        artifact_output = registry.get("artifactOutput")
+        try:
+            expected_output = Path(str(artifact)).relative_to(build).as_posix()
+        except ValueError:
+            expected_output = None
+        registry_valid = (
+            isinstance(artifact_output, str)
+            and artifact_output == expected_output
+            and isinstance(registry.get("buildManifestDigest"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", registry["buildManifestDigest"])
+            is not None
+            and isinstance(registry.get("digest"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", registry["digest"]) is not None
+            and type(registry.get("registrationFiles")) is int
+            and registry["registrationFiles"] > 0
+            and type(registry.get("registrationBytes")) is int
+            and registry["registrationBytes"] > 0
+        )
+    if not registry_valid:
+        blockers.append("receipt_check_set_registry_invalid")
+
+    crosscheck = receipt.get("selectedTestCrosscheck")
+    crosscheck_valid = isinstance(crosscheck, dict) and valid_selection
+    if crosscheck_valid:
+        crosscheck_valid = (
+            isinstance(crosscheck.get("digest"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", crosscheck["digest"]) is not None
+            and type(crosscheck.get("matchingDefinitions")) is int
+            and crosscheck["matchingDefinitions"] == count
+            and type(crosscheck.get("matchingFiles")) is int
+            and 0 < crosscheck["matchingFiles"] <= crosscheck["matchingDefinitions"]
+            and type(crosscheck.get("scannedFiles")) is int
+            and crosscheck["scannedFiles"] >= crosscheck["matchingFiles"]
+            and type(crosscheck.get("scannedBytes")) is int
+            and crosscheck["scannedBytes"] > 0
+        )
+    if not crosscheck_valid:
+        blockers.append("receipt_check_set_crosscheck_invalid")
+
+    profile_valid = isinstance(profile, dict)
+    if profile_valid:
+        profile_valid = (
+            receipt.get("profile") == profile.get("profile")
+            and receipt.get("cacheNamespace") == profile.get("cacheNamespace")
+            and receipt.get("ccacheSloppiness") == profile.get("ccacheSloppiness")
+        )
+    if not profile_valid:
+        blockers.append("receipt_check_set_profile_invalid")
+
+    return blockers
 
 
 def git_commit_reachable(source: Path, head: str, runner=subprocess.run) -> bool:
@@ -2611,6 +2772,8 @@ def lane_retirement_plan(cache_root: Path, lane: str, source: Path) -> dict[str,
         blockers.append("receipt_head_unreachable")
 
     identity = None
+    full_receipt_state = "unsafe"
+    full_receipt = None
     receipt_digest = None
     profile_digest = None
     lane_root = cache_root / "views" / lane
@@ -2627,16 +2790,25 @@ def lane_retirement_plan(cache_root: Path, lane: str, source: Path) -> dict[str,
     if before["laneState"] == "valid":
         try:
             identity = lane_metadata_identity_no_follow(lane_root)
-            profile_state, profile, receipt_digest, profile_digest = (
-                lane_retirement_metadata(lane_root, identity)
-            )
+            (
+                full_receipt_state,
+                full_receipt,
+                profile_state,
+                profile,
+                receipt_digest,
+                profile_digest,
+            ) = lane_retirement_metadata(lane_root, identity)
         except (OSError, RuntimeError):
             blockers.append("lane_identity_unavailable")
+    if full_receipt_state != "valid":
+        blockers.append(f"receipt_{full_receipt_state}")
     profile_contract = (
         "known" if profile_state == "valid" and profile in known_profiles else "unknown"
     )
     if profile_contract != "known":
         blockers.append("profile_contract_unknown")
+    if receipt_format == "teamleaderleo-fex-x86-host-check-set-receipt-v2":
+        blockers.extend(check_set_retirement_blockers(full_receipt, lane_root, profile))
 
     after = select(lane_inventory(cache_root))
     source_head_after = git_output(source, "rev-parse", "HEAD")
@@ -2647,11 +2819,28 @@ def lane_retirement_plan(cache_root: Path, lane: str, source: Path) -> dict[str,
     if identity is not None:
         try:
             identity_after = lane_metadata_identity_no_follow(lane_root)
-            _, _, receipt_digest_after, profile_digest_after = lane_retirement_metadata(
-                lane_root, identity_after
-            )
-            if (identity_after, receipt_digest_after, profile_digest_after) != (
+            (
+                full_receipt_state_after,
+                full_receipt_after,
+                profile_state_after,
+                profile_after,
+                receipt_digest_after,
+                profile_digest_after,
+            ) = lane_retirement_metadata(lane_root, identity_after)
+            if (
+                identity_after,
+                full_receipt_state_after,
+                full_receipt_after,
+                profile_state_after,
+                profile_after,
+                receipt_digest_after,
+                profile_digest_after,
+            ) != (
                 identity,
+                full_receipt_state,
+                full_receipt,
+                profile_state,
+                profile,
                 receipt_digest,
                 profile_digest,
             ):
