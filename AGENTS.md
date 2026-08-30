@@ -13,6 +13,10 @@ Before local C++ work, read `docs/ResearchDevLoop.md` and run
 host preflight from ARM64 product-runtime evidence; it does not configure, build, test, install, or
 initialize submodules.
 
+For the current owned-fork fixes, source-reading order and merged-versus-hypothesis boundary, read
+`docs/OwnedForkResearchMap.md` before treating similar Vulkan, callback, cache or unload symptoms as
+one bug.
+
 Agents may create disposable workflow branches, add or edit workflow files, trigger workflows by authorized pushes or dispatches, rerun failed jobs, iterate on harnesses, download and inspect artifacts/logs, and delete or abandon temporary CI machinery when it has served its purpose. This includes ARM64 runners and other owned-fork CI used to reproduce, instrument, or discriminate bugs.
 
 Read `docs/OwnedForkCI.md` before scheduling validation. Broad inherited matrices are opt-in in this fork; prefer the smallest exact-head target or runtime discriminator that answers the open question, and record its scope and receipt.

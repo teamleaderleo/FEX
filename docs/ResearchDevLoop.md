@@ -3,6 +3,9 @@
 This is an internal research profile for `teamleaderleo/FEX`. It is not an upstream contribution
 recipe and it is not ARM runtime acceptance.
 
+For a current symptom-to-owner map of the merged research fixes and the remaining hypotheses, start
+with [the owned-fork research map](OwnedForkResearchMap.md).
+
 For a beginner-oriented map of Vulkan GIPA/GDPA, custom host wrappers, and the focused inventory
 test, see [Vulkan proc-address routing](VulkanProcAddressRouting.md).
 
