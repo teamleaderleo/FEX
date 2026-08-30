@@ -181,6 +181,20 @@ source afterward. Do not add another profile to this cache merely because it com
 that its toolchain and cache namespace are compatible and that reuse saves more time than archive
 transfer.
 
+The first exact-input measurement kept this design. At source/carrier
+`bf73345e4ed14216bfecef0e93ee6d5504d8cc6a`, cold run
+[`33317914792`](https://github.com/teamleaderleo/FEX/actions/runs/33317914792) made 303 cacheable
+compiler calls, all misses, and spent 6.062819 seconds configuring plus 159.944987 seconds building.
+It published one 24,557,266-byte Actions archive. Warm run
+[`33318354316`](https://github.com/teamleaderleo/FEX/actions/runs/33318354316) restored that exact key,
+served all 303 calls as direct hits with zero misses, and spent 5.905036 seconds configuring plus
+1.018591 seconds building. Complete profile time fell from 203.541785 to 38.240500 seconds, saving
+165.301285 seconds / 81.21% (5.32x); both runs independently passed the unchanged ARM runtime and
+disk-cache-shape oracle. This is one exact-source cold/warm pair, not a distribution or a claim
+about source deltas, another compiler/profile, package installation, submodule setup or cache
+retention beyond GitHub's policy. The warm cache did not skip configuration, linking, the guest
+control or the product oracle.
+
 ## Requesting inherited broad CI deliberately
 
 The inherited broad workflows are manual-only in this fork. Dispatch one relevant workflow from
