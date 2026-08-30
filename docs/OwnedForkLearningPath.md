@@ -1,7 +1,7 @@
 # Owned-fork FEX learning path
 
 Reviewed against owned-fork main
-[`16dbe0b2d`](https://github.com/teamleaderleo/FEX/commit/16dbe0b2d9f0e0abdaf35a9cdc65da9609458ea2)
+[`fb3f5325f`](https://github.com/teamleaderleo/FEX/commit/fb3f5325f9b87bd83709d968b6a6926fd38a8d3a)
 on 2026-08-31. This page answers “which fork PRs do I actually need to understand?” for a C++
 newcomer. It is a curriculum and history index, not an upstream contribution plan.
 
@@ -12,7 +12,7 @@ implementation.
 
 ## The short answer
 
-Do not read 62 merged PRs in number order. Learn these six arcs:
+Do not read 65 merged PRs in number order. Learn these six arcs:
 
 1. **Guest/host thunk ownership:** PRs #5, #12 and #14 explain why guest pointers, host copies and
    copyback/cleanup are different ownership decisions.
@@ -29,7 +29,9 @@ Do not read 62 merged PRs in number order. Learn these six arcs:
 6. **Fast experiment loop:** PRs #4/#39/#40 make one stable C++ object and its compiler-cache result
    easy to request; PRs #46/#47 select one target's authoritative CTest set; PR #57 only plans
    retirement of a reconstructible dead lane; PR #60 validates richer check-set receipts before
-   retirement; PRs #62/#63 make two cache edit loops pay only for their semantic owners.
+   retirement; PRs #62/#63 make two cache edit loops pay only for their semantic owners; PR #65
+   makes linked-worktree cleanup preserve shared submodule registration; and PR #66 gives one real
+   focused owner a checked-in VS Code debugger launch.
 
 Read the remaining PRs when you need their tooling or historical discriminator. In particular,
 PRs #52-#56 are the bounded ARM disk-cache/ccache experiment and its carrier corrections, not five
@@ -145,12 +147,17 @@ Read [the development loop](ResearchDevLoop.md). The two central owners are:
 - [`ResearchProfileCarrier.py`](../Scripts/ResearchProfileCarrier.py): checked-in immutable profile
   dispatch and strict outcome framing for longer hosted work.
 
-Use `doctor`, then compile one current file or check one exact owner. Do not infer ARM runtime from
-an x86 host build, and do not run a broad suite to learn a static ownership boundary.
+Use `doctor`, then compile one current file or check one exact owner. For an actual debugging loop,
+PR #66's checked-in launch builds only `FEXCore_Tests_CodeCacheConfig`, maps the stable lane source
+view back to the current worktree, and stops in current production/test frames. If a different owner
+is needed, first add its own exact pre-launch task and executable mapping rather than widening this
+launch. Do not infer ARM runtime from an x86 host build, and do not run a broad suite to learn a
+static ownership boundary. When removing a linked worktree, follow PR #65's cleanup boundary: never
+run `git submodule deinit`, and require a fresh canonical `doctor` afterward.
 
-## Complete merged-PR atlas through #63
+## Complete merged-PR atlas through #66
 
-Every merged owned-fork PR from #1 through #63 appears exactly once below. [PR
+Every merged owned-fork PR from #1 through #66 appears exactly once below. [PR
 #3](https://github.com/teamleaderleo/FEX/pull/3) was a closed, unmerged diagnostic carrier and is not
 current source.
 
@@ -174,7 +181,7 @@ current source.
   [#37](https://github.com/teamleaderleo/FEX/pull/37), and
   [#43](https://github.com/teamleaderleo/FEX/pull/43).
 - **Online block-cache product semantics:** [#49](https://github.com/teamleaderleo/FEX/pull/49),
-  [#50](https://github.com/teamleaderleo/FEX/pull/50), and
+  [#50](https://github.com/teamleaderleo/FEX/pull/50),
   [#51](https://github.com/teamleaderleo/FEX/pull/51), and
   [#59](https://github.com/teamleaderleo/FEX/pull/59).
 - **Local development, dependency storage and receipts:**
@@ -196,8 +203,9 @@ current source.
   [#41](https://github.com/teamleaderleo/FEX/pull/41),
   [#57](https://github.com/teamleaderleo/FEX/pull/57),
   [#60](https://github.com/teamleaderleo/FEX/pull/60),
-  [#62](https://github.com/teamleaderleo/FEX/pull/62), and
-  [#63](https://github.com/teamleaderleo/FEX/pull/63).
+  [#62](https://github.com/teamleaderleo/FEX/pull/62),
+  [#63](https://github.com/teamleaderleo/FEX/pull/63), and
+  [#65](https://github.com/teamleaderleo/FEX/pull/65).
 - **Focused verification, CI carriers and result documentation:**
   [#7](https://github.com/teamleaderleo/FEX/pull/7),
   [#10](https://github.com/teamleaderleo/FEX/pull/10),
@@ -215,12 +223,14 @@ current source.
   [#53](https://github.com/teamleaderleo/FEX/pull/53),
   [#54](https://github.com/teamleaderleo/FEX/pull/54),
   [#55](https://github.com/teamleaderleo/FEX/pull/55),
-  [#56](https://github.com/teamleaderleo/FEX/pull/56), and
-  [#61](https://github.com/teamleaderleo/FEX/pull/61).
+  [#56](https://github.com/teamleaderleo/FEX/pull/56),
+  [#61](https://github.com/teamleaderleo/FEX/pull/61), and
+  [#66](https://github.com/teamleaderleo/FEX/pull/66).
 - **Upstream product sync and overlap review:**
   [#48](https://github.com/teamleaderleo/FEX/pull/48).
 - **Current research and newcomer routing:**
-  [#58](https://github.com/teamleaderleo/FEX/pull/58).
+  [#58](https://github.com/teamleaderleo/FEX/pull/58) and
+  [#64](https://github.com/teamleaderleo/FEX/pull/64).
 <!-- merged-pr-atlas-end -->
 
 ## How to inspect a PR without getting lost

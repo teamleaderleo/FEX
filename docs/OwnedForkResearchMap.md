@@ -1,7 +1,7 @@
 # Owned-fork FEX research map
 
 Reviewed against owned-fork main
-[`16dbe0b2d`](https://github.com/teamleaderleo/FEX/commit/16dbe0b2d9f0e0abdaf35a9cdc65da9609458ea2)
+[`fb3f5325f`](https://github.com/teamleaderleo/FEX/commit/fb3f5325f9b87bd83709d968b6a6926fd38a8d3a)
 on 2026-08-31. This is a reading and experiment router for `teamleaderleo/FEX`, not an upstream
 submission plan and not a claim that every thunk or Vulkan lifetime problem is solved.
 
@@ -23,7 +23,7 @@ boundaries. Identify that boundary before changing code or choosing an oracle.
 | A whole-file code cache was generated under different JIT settings or host features | cache namespace and offline-compiler configuration agreement | owned-fork configuration identity, canonical snapshot transport, fail-closed compiler reconstruction and a lightweight seven-case owner | [Whole-file code-cache identity](WholeFileCodeCacheIdentity.md) |
 | A block-level Fossilize cache lookup is corrupt, slow or confused with whole-file caching | per-block bucket/key identity, bounded blob/index layout and live publication | format-3 blobs are bounded before spans, torn writable index suffixes resume at the valid prefix, the next writer reclaims only an unreferenced physical data tail and a read-only analyzer accounts physical extents; the real recovery owner is lightweight, while interior compaction and allocation/runtime measurement remain separate | [Block-level Fossilize disk cache](BlockDiskCache.md) |
 | GLX string-return thunks fail to compile under Clang 21 | fixed-width guest layout versus signed host character pointer conversion | merged shared host-layout conversion and two focused generator guards | [PR #25](https://github.com/teamleaderleo/FEX/pull/25) |
-| A new chat needs to configure, build or test something | environment, exact source and smallest owner | `doctor`, stable external lanes, one target or one producer-owned CTest set, and lightweight cache identity/recovery owners are merged | [Owned-fork development loop](ResearchDevLoop.md) |
+| A new chat needs to configure, build, test or debug something | environment, exact source and smallest owner | `doctor`, stable external lanes, one target or one producer-owned CTest set, lightweight cache identity/recovery owners and one focused VS Code debugger launch are merged | [Owned-fork development loop](ResearchDevLoop.md) |
 
 Do not begin with a broad FEX build or suite merely because the symptom is unfamiliar. Most rows
 have a static inventory, generator case, one host target or one ARM profile that answers the first
@@ -163,6 +163,7 @@ for a reason to widen a thunk/cache experiment.
 | fixed-remap destination semantics | exact `smc-2.64` ARM case |
 | whole-file cache identity/snapshot | focused `FEXCore_Tests_CodeCacheConfig` check-set |
 | block-cache blob/index layout | focused parser owner; use `FEXCore_Tests_DiskCacheIndexRecovery` only for file/lock/recovery behavior |
+| CodeCacheConfig source-level debugging | checked-in **FEX: debug CodeCacheConfig owner** launch after its exact pre-launch task |
 
 Use the command forms and evidence boundaries in [ResearchDevLoop.md](ResearchDevLoop.md). Reuse an
 accepted exact-head result when source, toolchain, inputs and relevant environment are unchanged.
