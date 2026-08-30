@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strictly summarize the shapes of ordinary records in a FEX disk cache."""
+"""Strictly summarize record shapes and physical extents in a FEX disk cache."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from typing import Sequence
 
 MAGIC_PREFIX = b"\x81FOSSILIZEDB\x00\x00\x00"
 MAGIC_BYTES = 16
+KEY_BYTES = 40
+DATA_RECORD_OVERHEAD = KEY_BYTES + 16
 INDEX_RECORD_BYTES = 84
 FOZ_HEADER = struct.Struct("<IIII")
 INDEX_ENTRY = struct.Struct("<QIQQ")
@@ -26,6 +28,81 @@ DEFAULT_MAX_RECORDS = 4096
 
 class CacheFormatError(RuntimeError):
     """The cache cannot be interpreted safely by this bounded analyzer."""
+
+
+def _referenced_extent(
+    data: bytes,
+    key: bytes,
+    stored_bytes: int,
+    cache_offset: int,
+    position: int,
+    kind: str,
+) -> dict[str, int | str]:
+    if cache_offset < MAGIC_BYTES + DATA_RECORD_OVERHEAD:
+        raise CacheFormatError(f"record {position} payload lacks a complete data envelope")
+    start = cache_offset - DATA_RECORD_OVERHEAD
+    if data[start : start + KEY_BYTES] != key:
+        raise CacheFormatError(f"index/data key disagreement at record {position}")
+    header = FOZ_HEADER.unpack_from(data, start + KEY_BYTES)
+    if header != (stored_bytes, 1, 0, stored_bytes):
+        raise CacheFormatError(f"invalid data record header at record {position}")
+    return {
+        "bytes": DATA_RECORD_OVERHEAD + stored_bytes,
+        "kind": kind,
+        "offset": start,
+        "payloadBytes": stored_bytes,
+        "payloadOffset": cache_offset,
+        "record": position,
+    }
+
+
+def _data_topology(
+    data: bytes, extents: list[dict[str, int | str]]
+) -> dict[str, object]:
+    ordered = sorted(extents, key=lambda extent: int(extent["offset"]))
+    cursor = MAGIC_BYTES
+    interior: list[dict[str, int | str]] = []
+    for extent in ordered:
+        start = int(extent["offset"])
+        end = start + int(extent["bytes"])
+        if start < cursor:
+            raise CacheFormatError(
+                f"referenced data records overlap at index record {extent['record']}"
+            )
+        if start > cursor:
+            interior.append(
+                {"bytes": start - cursor, "kind": "interior", "offset": cursor}
+            )
+        cursor = end
+
+    unreferenced = interior
+    trailing_bytes = len(data) - cursor
+    if trailing_bytes:
+        unreferenced = [
+            *interior,
+            {"bytes": trailing_bytes, "kind": "trailing", "offset": cursor},
+        ]
+    interior_bytes = sum(int(extent["bytes"]) for extent in interior)
+    referenced_bytes = sum(int(extent["bytes"]) for extent in ordered)
+    unreferenced_bytes = interior_bytes + trailing_bytes
+    if MAGIC_BYTES + referenced_bytes + unreferenced_bytes != len(data):
+        raise CacheFormatError("physical data extent accounting disagrees with file size")
+    return {
+        "allBytesAccounted": True,
+        "interiorUnreferencedBytes": interior_bytes,
+        "magicBytes": MAGIC_BYTES,
+        "physicallyContiguous": unreferenced_bytes == 0,
+        "recordEnvelopeBytes": len(ordered) * DATA_RECORD_OVERHEAD,
+        "referencedBytes": referenced_bytes,
+        "referencedEnd": cursor,
+        "referencedExtents": ordered,
+        "referencedPayloadBytes": sum(
+            int(extent["payloadBytes"]) for extent in ordered
+        ),
+        "trailingUnreferencedBytes": trailing_bytes,
+        "unreferencedBytes": unreferenced_bytes,
+        "unreferencedExtents": unreferenced,
+    }
 
 
 def _read_regular(path: Path, max_bytes: int) -> bytes:
@@ -91,6 +168,7 @@ def analyze(
 
     metadata_count = 0
     ordinary: list[dict[str, int | str]] = []
+    referenced_extents: list[dict[str, int | str]] = []
     seen_hashes: set[int] = set()
     for position in range(record_count):
         start = MAGIC_BYTES + position * INDEX_RECORD_BYTES
@@ -103,7 +181,18 @@ def analyze(
         )
         if cache_offset > len(data) or stored_bytes > len(data) - cache_offset:
             raise CacheFormatError(f"record {position} points outside the data file")
-        if key[39] == 0xFF:
+        metadata = key[39] == 0xFF
+        referenced_extents.append(
+            _referenced_extent(
+                data,
+                key,
+                stored_bytes,
+                cache_offset,
+                position,
+                "metadata" if metadata else "ordinary",
+            )
+        )
+        if metadata:
             metadata_count += 1
             continue
         try:
@@ -165,14 +254,16 @@ def analyze(
         "storedBlobBytes": sum(int(item["storedBytes"]) for item in ordinary),
         "trailingBytes": sum(int(item["trailingBytes"]) for item in ordinary),
     }
+    topology = _data_topology(data, referenced_extents)
     return {
-        "format": "teamleaderleo-fex-disk-cache-shape-v1",
+        "format": "teamleaderleo-fex-disk-cache-shape-v2",
         "dataFile": {
             "bytes": len(data),
             "name": data_path.name,
             "sha256": hashlib.sha256(data).hexdigest(),
             "version": data_version,
         },
+        "dataTopology": topology,
         "indexFile": {
             "bytes": len(index),
             "name": index_path.name,

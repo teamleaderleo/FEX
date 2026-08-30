@@ -231,12 +231,19 @@ import json
 import sys
 
 result = json.load(open(sys.argv[1], encoding="utf-8"))
+if result["format"] != "teamleaderleo-fex-disk-cache-shape-v2":
+    raise SystemExit("disk-cache analyzer did not emit the physical-topology schema")
 if result["ordinaryRecordCount"] <= 0:
     raise SystemExit("cold producer created no ordinary disk-cache records")
 if not result["minimalPayloads"]:
     raise SystemExit("current producer unexpectedly stored trailing blob bytes")
 if any(record["storedBytes"] != record["requiredBytes"] for record in result["records"]):
     raise SystemExit("stored and reader-required blob sizes disagree")
+topology = result["dataTopology"]
+if not topology["allBytesAccounted"]:
+    raise SystemExit("disk-cache physical byte accounting is incomplete")
+if not topology["physicallyContiguous"] or topology["unreferencedBytes"] != 0:
+    raise SystemExit("fresh controlled disk-cache producer left unreferenced physical bytes")
 PY
 stat -c '%n %s' "${cache_root}/RWCacheDB.foz" "${cache_root}/RWCacheDB_idx.foz" \
   > "${receipts}/cache-before-warm.sizes"
@@ -261,7 +268,7 @@ Path(sys.argv[1]).write_text(
         {
             "schemaVersion": 1,
             "status": "pass",
-            "summary": "cache-disabled control, positive cold JIT/misses, strict minimal-blob parsing, positive fresh-process warm hits, and immutable warm cache passed",
+            "summary": "cache-disabled control, positive cold JIT/misses, strict minimal-blob and physical-topology accounting, positive fresh-process warm hits, and immutable warm cache passed",
         },
         indent=2,
         sort_keys=True,
