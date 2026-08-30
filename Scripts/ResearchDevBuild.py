@@ -44,6 +44,15 @@ SUBMODULE_GITFILE_LIMIT = 4096
 SUBMODULE_HEAD_LIMIT = 256
 MAX_SUBMODULE_REPOSITORIES = 128
 SHA1_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
+RETIREMENT_RECEIPT_FORMATS = frozenset(
+    {
+        "teamleaderleo-fex-x86-host-check-receipt-v1",
+        "teamleaderleo-fex-x86-host-compile-receipt-v1",
+        "teamleaderleo-fex-x86-host-dev-receipt-v1",
+        "teamleaderleo-fex-x86-host-linux-test-build-receipt-v1",
+    }
+)
+RETIREMENT_TREE_ENTRY_LIMIT = 1_000_000
 CCACHE_CORE_COUNTERS = (
     "cache_miss",
     "compile_failed",
@@ -158,6 +167,10 @@ def parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "lanes",
         help="inventory stable build lanes without mutating them",
+    )
+    subparsers.add_parser(
+        "retire-plan",
+        help="prove whether one dead lane is reconstructible without changing it",
     )
     subparsers.add_parser(
         "doctor",
@@ -2133,9 +2146,18 @@ def profile_matches(path: Path, expected: dict[str, object]) -> bool:
         return False
 
 
-def read_small_json(path: Path, limit: int = 1024 * 1024) -> tuple[str, object | None]:
+def read_small_json(
+    path: Path,
+    limit: int = 1024 * 1024,
+    *,
+    directory_fd: int | None = None,
+) -> tuple[str, object | None]:
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
     except FileNotFoundError:
         return "missing", None
     except OSError:
@@ -2164,6 +2186,59 @@ def read_small_json(path: Path, limit: int = 1024 * 1024) -> tuple[str, object |
     if not isinstance(value, dict):
         return "invalid", None
     return "valid", value
+
+
+def small_file_digest_no_follow(
+    path: Path,
+    limit: int = 1024 * 1024,
+    *,
+    directory_fd: int | None = None,
+) -> str:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_size > limit
+        ):
+            raise RuntimeError(f"unsafe retirement metadata file: {path}")
+        digest = hashlib.sha256()
+        remaining = limit + 1
+        total = 0
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if total > limit:
+        raise RuntimeError(f"oversized retirement metadata file: {path}")
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity or total != after.st_size:
+        raise RuntimeError(f"retirement metadata changed while reading: {path}")
+    return digest.hexdigest()
 
 
 def allocated_bytes_no_follow(root: Path) -> int:
@@ -2339,6 +2414,293 @@ def lane_inventory(cache_root: Path) -> dict[str, object]:
     }
 
 
+def lane_metadata_identity_no_follow(root: Path) -> dict[str, object]:
+    """Bind one lane's names and metadata without reading build outputs or following links."""
+    root_descriptor = os.open(
+        root,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    root_metadata = os.fstat(root_descriptor)
+    root_device = root_metadata.st_dev
+    pending = [(root_descriptor, PurePosixPath("."))]
+    rows: list[bytes] = []
+    entries = 0
+    allocated_bytes = 0
+
+    def add_row(relative: PurePosixPath, metadata: os.stat_result, link_target: str) -> None:
+        nonlocal entries, allocated_bytes
+        if metadata.st_dev != root_device:
+            raise RuntimeError(f"lane crosses a filesystem boundary: {relative}")
+        entries += 1
+        if entries > RETIREMENT_TREE_ENTRY_LIMIT:
+            raise RuntimeError("lane metadata inventory exceeded its entry limit")
+        allocated_bytes += metadata.st_blocks * 512
+        rows.append(
+            "\0".join(
+                (
+                    relative.as_posix(),
+                    str(metadata.st_dev),
+                    str(metadata.st_ino),
+                    str(metadata.st_mode),
+                    str(metadata.st_uid),
+                    str(metadata.st_gid),
+                    str(metadata.st_size),
+                    str(metadata.st_mtime_ns),
+                    str(metadata.st_ctime_ns),
+                    link_target,
+                )
+            ).encode("utf-8", errors="surrogateescape")
+        )
+
+    add_row(PurePosixPath("."), root_metadata, "")
+    try:
+        while pending:
+            directory_descriptor, relative = pending.pop()
+            try:
+                with os.scandir(directory_descriptor) as children:
+                    child_rows = []
+                    for child in children:
+                        metadata = child.stat(follow_symlinks=False)
+                        link_target = (
+                            os.readlink(child.name, dir_fd=directory_descriptor)
+                            if stat.S_ISLNK(metadata.st_mode)
+                            else ""
+                        )
+                        child_rows.append((child.name, metadata, link_target))
+                for name, metadata, link_target in sorted(
+                    child_rows, key=lambda row: row[0], reverse=True
+                ):
+                    child_relative = relative / name
+                    add_row(child_relative, metadata, link_target)
+                    if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                        child_descriptor = os.open(
+                            name,
+                            os.O_RDONLY
+                            | os.O_CLOEXEC
+                            | os.O_DIRECTORY
+                            | os.O_NOFOLLOW,
+                            dir_fd=directory_descriptor,
+                        )
+                        actual = os.fstat(child_descriptor)
+                        if (
+                            actual.st_dev,
+                            actual.st_ino,
+                            actual.st_mode,
+                        ) != (
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            metadata.st_mode,
+                        ):
+                            os.close(child_descriptor)
+                            raise RuntimeError(
+                                f"lane entry changed while opening: {child_relative}"
+                            )
+                        pending.append((child_descriptor, child_relative))
+            finally:
+                os.close(directory_descriptor)
+    except BaseException:
+        for descriptor, _ in pending:
+            os.close(descriptor)
+        raise
+    return {
+        "allocatedBytes": allocated_bytes,
+        "entries": entries,
+        "metadataDigest": hashlib.sha256(b"\n".join(sorted(rows))).hexdigest(),
+        "rootDevice": root_metadata.st_dev,
+        "rootInode": root_metadata.st_ino,
+    }
+
+
+def lane_retirement_metadata(
+    root: Path, identity: dict[str, object]
+) -> tuple[str, object | None, str, str]:
+    descriptor = os.open(
+        root,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) != (
+            identity["rootDevice"],
+            identity["rootInode"],
+        ):
+            raise RuntimeError("lane root changed before metadata read")
+        profile_state, profile = read_small_json(
+            Path("profile.json"), directory_fd=descriptor
+        )
+        receipt_digest = small_file_digest_no_follow(
+            Path("last-receipt.json"), directory_fd=descriptor
+        )
+        profile_digest = small_file_digest_no_follow(
+            Path("profile.json"), directory_fd=descriptor
+        )
+    finally:
+        os.close(descriptor)
+    return profile_state, profile, receipt_digest, profile_digest
+
+
+def git_commit_reachable(source: Path, head: str, runner=subprocess.run) -> bool:
+    if not SHA1_PATTERN.fullmatch(head):
+        return False
+    completed = runner(
+        [required_tool("git"), "-C", str(source), "cat-file", "-e", f"{head}^{{commit}}"],
+        check=False,
+        capture_output=True,
+    )
+    if (
+        len(completed.stdout) > SUBMODULE_HEAD_LIMIT
+        or len(completed.stderr) > SUBMODULE_HEAD_LIMIT
+    ):
+        raise RuntimeError("Git reachability output exceeded its bounded size limit")
+    return completed.returncode == 0
+
+
+def lane_retirement_plan(cache_root: Path, lane: str, source: Path) -> dict[str, object]:
+    """Produce a revalidation token for one lane; never create, move, or remove state."""
+
+    def select(inventory: dict[str, object]) -> dict[str, object] | None:
+        return next(
+            (record for record in inventory["lanes"] if record["lane"] == lane),
+            None,
+        )
+
+    before = select(lane_inventory(cache_root))
+    if before is None:
+        return {
+            "format": "teamleaderleo-fex-dev-lane-retirement-plan-v1",
+            "status": "refused",
+            "authority": "read_only_plan",
+            "lane": lane,
+            "blockers": ["lane_missing"],
+            "retirementToken": None,
+        }
+
+    blockers = []
+    if before["laneState"] != "valid":
+        blockers.append("lane_unsafe")
+    if before["sourceState"] != "dead":
+        blockers.append(f"source_view_{before['sourceState']}")
+    if before["lockState"] not in {"inactive", "missing"}:
+        blockers.append(f"lane_lock_{before['lockState']}")
+    if before["receiptState"] != "valid":
+        blockers.append(f"receipt_{before['receiptState']}")
+    if before["profileState"] != "valid":
+        blockers.append(f"profile_{before['profileState']}")
+    if before["buildState"] == "unsafe":
+        blockers.append("build_unsafe")
+
+    receipt = before["receipt"] if isinstance(before["receipt"], dict) else {}
+    receipt_format = receipt.get("format")
+    receipt_head = receipt.get("head")
+    if receipt_format not in RETIREMENT_RECEIPT_FORMATS:
+        blockers.append("receipt_format_unknown")
+    if receipt.get("dirty") is not False:
+        blockers.append("receipt_dirty_or_unknown")
+    if type(receipt.get("exitCode")) is not int or receipt.get("exitCode") != 0:
+        blockers.append("receipt_unsuccessful_or_unknown")
+    if not isinstance(receipt_head, str) or not SHA1_PATTERN.fullmatch(receipt_head):
+        blockers.append("receipt_head_invalid")
+
+    source_head_before = git_output(source, "rev-parse", "HEAD")
+    reachable = bool(
+        isinstance(receipt_head, str)
+        and SHA1_PATTERN.fullmatch(receipt_head)
+        and git_commit_reachable(source, receipt_head)
+    )
+    if not reachable:
+        blockers.append("receipt_head_unreachable")
+
+    identity = None
+    receipt_digest = None
+    profile_digest = None
+    lane_root = cache_root / "views" / lane
+    profile_state = "unsafe"
+    profile = None
+    known_profiles = [
+        expected_profile(
+            cpu_namespace(str(configuration["id"])),
+            str(configuration["id"]),
+            list(configuration["options"]),
+        )
+        for configuration in CONFIGURE_PROFILES.values()
+    ]
+    if before["laneState"] == "valid":
+        try:
+            identity = lane_metadata_identity_no_follow(lane_root)
+            profile_state, profile, receipt_digest, profile_digest = (
+                lane_retirement_metadata(lane_root, identity)
+            )
+        except (OSError, RuntimeError):
+            blockers.append("lane_identity_unavailable")
+    profile_contract = (
+        "known" if profile_state == "valid" and profile in known_profiles else "unknown"
+    )
+    if profile_contract != "known":
+        blockers.append("profile_contract_unknown")
+
+    after = select(lane_inventory(cache_root))
+    source_head_after = git_output(source, "rev-parse", "HEAD")
+    if after != before:
+        blockers.append("lane_changed_during_plan")
+    if source_head_after != source_head_before:
+        blockers.append("source_repository_changed_during_plan")
+    if identity is not None:
+        try:
+            identity_after = lane_metadata_identity_no_follow(lane_root)
+            _, _, receipt_digest_after, profile_digest_after = lane_retirement_metadata(
+                lane_root, identity_after
+            )
+            if (identity_after, receipt_digest_after, profile_digest_after) != (
+                identity,
+                receipt_digest,
+                profile_digest,
+            ):
+                blockers.append("lane_changed_during_plan")
+        except (OSError, RuntimeError):
+            blockers.append("lane_changed_during_plan")
+
+    observation_token = None
+    if identity is not None:
+        token_basis = {
+            "format": "teamleaderleo-fex-dev-lane-retirement-token-v1",
+            "lane": lane,
+            "laneRecord": before,
+            "laneIdentity": identity,
+            "receiptDigest": receipt_digest,
+            "profileDigest": profile_digest,
+            "receiptHeadReachable": reachable,
+            "sourceRepositoryHead": source_head_before,
+        }
+        observation_token = hashlib.sha256(
+            json.dumps(
+                token_basis, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+
+    blockers = sorted(set(blockers))
+    token = observation_token if not blockers else None
+    return {
+        "format": "teamleaderleo-fex-dev-lane-retirement-plan-v1",
+        "status": "ready" if not blockers else "refused",
+        "authority": "read_only_plan",
+        "lane": lane,
+        "sourceState": before["sourceState"],
+        "lockState": before["lockState"],
+        "allocatedBytes": before["allocatedBytes"],
+        "receipt": receipt,
+        "profileState": before["profileState"],
+        "profileContract": profile_contract,
+        "buildState": before["buildState"],
+        "receiptHeadReachable": reachable,
+        "sourceRepositoryHead": source_head_before,
+        "laneIdentity": identity,
+        "receiptDigest": receipt_digest,
+        "profileDigest": profile_digest,
+        "blockers": blockers,
+        "retirementToken": token,
+    }
+
+
 def configuration_mode(
     action: str,
     switched: bool,
@@ -2390,6 +2752,10 @@ def main(argv: list[str] | None = None) -> int:
             receipt = doctor_receipt(source)
             print(json.dumps(receipt, indent=2, sort_keys=True))
             return 0 if receipt["status"] == "preflight_ready" else 2
+        if args.action == "retire-plan":
+            plan = lane_retirement_plan(cache_root, lane, source)
+            print(json.dumps(plan, indent=2, sort_keys=True))
+            return 0 if plan["status"] == "ready" else 2
         lane_root = cache_root / "views" / lane
         source_view = lane_root / "src"
         build = lane_root / "build"
