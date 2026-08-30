@@ -1728,6 +1728,54 @@ class ResearchDevBuildTest(unittest.TestCase):
         )
         return lane_root
 
+    @classmethod
+    def check_set_retirement_lane(
+        cls, cache: Path, root: Path, lane: str, head: str
+    ) -> tuple[Path, dict[str, object]]:
+        lane_root = cls.retirement_lane(
+            cache,
+            root,
+            lane,
+            head,
+            receipt_format="teamleaderleo-fex-x86-host-check-set-receipt-v2",
+        )
+        artifact = lane_root / "build" / "FEXCore_Tests" / "RetirementFixture"
+        artifact.parent.mkdir()
+        artifact.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        artifact.chmod(0o755)
+        profile = json.loads((lane_root / "profile.json").read_text(encoding="utf-8"))
+        receipt = {
+            "format": "teamleaderleo-fex-x86-host-check-set-receipt-v2",
+            "profile": profile["profile"],
+            "lane": lane,
+            "target": "RetirementFixture",
+            "targetArtifact": str(artifact),
+            "selectedTests": ["Alpha.Case", "Beta.Case"],
+            "selectedTestCount": 2,
+            "targetTestRegistry": {
+                "artifactOutput": "FEXCore_Tests/RetirementFixture",
+                "buildManifestDigest": "a" * 64,
+                "digest": "b" * 64,
+                "registrationFiles": 1,
+                "registrationBytes": 256,
+            },
+            "selectedTestCrosscheck": {
+                "digest": "c" * 64,
+                "matchingFiles": 1,
+                "matchingDefinitions": 2,
+                "scannedFiles": 4,
+                "scannedBytes": 4096,
+            },
+            "selectionLimit": dev_build.EXACT_CTEST_SET_LIMIT,
+            "head": head,
+            "dirty": False,
+            "exitCode": 0,
+            "cacheNamespace": profile["cacheNamespace"],
+            "ccacheSloppiness": profile["ccacheSloppiness"],
+        }
+        dev_build.write_receipt(lane_root / "last-receipt.json", receipt)
+        return lane_root, receipt
+
     def test_retirement_plan_is_deterministic_read_only_and_commit_bound(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1756,12 +1804,82 @@ class ResearchDevBuildTest(unittest.TestCase):
         self.assertRegex(first["retirementToken"], r"^[0-9a-f]{64}$")
         self.assertGreater(first["laneIdentity"]["entries"], 1)
 
+    def test_retirement_plan_accepts_complete_check_set_v2_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            source, head = self.retirement_source(root)
+            lane_root, _ = self.check_set_retirement_lane(
+                cache, root, "check-set", head
+            )
+            before = (lane_root / "last-receipt.json").read_bytes()
+
+            plan = dev_build.lane_retirement_plan(cache, "check-set", source)
+
+            after = (lane_root / "last-receipt.json").read_bytes()
+
+        self.assertEqual(plan["status"], "ready")
+        self.assertEqual(plan["blockers"], [])
+        self.assertRegex(plan["retirementToken"], r"^[0-9a-f]{64}$")
+        self.assertEqual(before, after)
+
+    def test_retirement_plan_refuses_incomplete_or_unsafe_check_set_v2_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            source, head = self.retirement_source(root)
+            plans = {}
+            expected_blockers = {
+                "bad-lane": "receipt_check_set_schema_invalid",
+                "bad-target": "receipt_check_set_target_invalid",
+                "bad-selection": "receipt_check_set_selection_invalid",
+                "bad-selection-type": "receipt_check_set_selection_invalid",
+                "bad-registry": "receipt_check_set_registry_invalid",
+                "bad-crosscheck": "receipt_check_set_crosscheck_invalid",
+                "bad-profile": "receipt_check_set_profile_invalid",
+                "linked-artifact": "receipt_check_set_artifact_unsafe",
+            }
+            for lane, blocker in expected_blockers.items():
+                lane_root, receipt = self.check_set_retirement_lane(
+                    cache, root, lane, head
+                )
+                if lane == "bad-lane":
+                    receipt["lane"] = "some-other-lane"
+                elif lane == "bad-target":
+                    receipt["target"] = "../RetirementFixture"
+                elif lane == "bad-selection":
+                    receipt["selectedTestCount"] = 1
+                elif lane == "bad-selection-type":
+                    receipt["selectedTests"] = [{"not": "a test name"}]
+                elif lane == "bad-registry":
+                    receipt["targetTestRegistry"]["digest"] = "not-a-digest"
+                elif lane == "bad-crosscheck":
+                    receipt["selectedTestCrosscheck"]["matchingDefinitions"] = 1
+                elif lane == "bad-profile":
+                    receipt["cacheNamespace"] = "foreign-cache"
+                elif lane == "linked-artifact":
+                    artifact = Path(receipt["targetArtifact"])
+                    artifact.unlink()
+                    outside = root / "outside-artifact"
+                    outside.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    outside.chmod(0o755)
+                    artifact.symlink_to(outside)
+                dev_build.write_receipt(lane_root / "last-receipt.json", receipt)
+                plans[lane] = dev_build.lane_retirement_plan(cache, lane, source)
+
+        for lane, blocker in expected_blockers.items():
+            with self.subTest(lane=lane):
+                self.assertEqual(plans[lane]["status"], "refused")
+                self.assertIn(blocker, plans[lane]["blockers"])
+                self.assertIsNone(plans[lane]["retirementToken"])
+
     def test_retirement_plan_names_dirty_live_active_unreachable_and_unsafe_vetoes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             cache = root / "cache"
             source, head = self.retirement_source(root)
             self.retirement_lane(cache, root, "dirty", head, dirty=True)
+            self.retirement_lane(cache, root, "failed", head, exit_code=1)
             self.retirement_lane(cache, root, "live", head, live=True)
             self.retirement_lane(cache, root, "active", head)
             self.retirement_lane(cache, root, "unreachable", "f" * 40)
@@ -1784,6 +1902,7 @@ class ResearchDevBuildTest(unittest.TestCase):
                 lane: dev_build.lane_retirement_plan(cache, lane, source)
                 for lane in (
                     "dirty",
+                    "failed",
                     "live",
                     "active",
                     "unreachable",
@@ -1797,6 +1916,7 @@ class ResearchDevBuildTest(unittest.TestCase):
 
         self.assertIn("receipt_dirty_or_unknown", plans["dirty"]["blockers"])
         self.assertIsNone(plans["dirty"]["retirementToken"])
+        self.assertIn("receipt_unsuccessful_or_unknown", plans["failed"]["blockers"])
         self.assertIn("source_view_live", plans["live"]["blockers"])
         self.assertIn("lane_lock_active", plans["active"]["blockers"])
         self.assertIn("receipt_head_unreachable", plans["unreachable"]["blockers"])
