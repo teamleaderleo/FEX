@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -27,6 +28,7 @@ LINUX_TEST_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 PROFILE = "x86-host-dev-v1"
 CCACHE_SLOPPINESS = "time_macros"
 DEFAULT_SUBMODULE_JOBS = min(os.cpu_count() or 1, 16)
+PLAN_REGEN_DESCRIPTION = "FEX plan requires CMake regeneration"
 DOCTOR_TOOLS = (
     "git",
     "cmake",
@@ -63,7 +65,9 @@ CONFIGURE_PROFILES = {
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Initialize sources, build one exact FEX target, or run one exact CTest."
+        description=(
+            "Initialize sources, plan or build one exact FEX target, or run one exact CTest."
+        )
     )
     result.add_argument("--lane", default="dev", help="isolated stable-path lane name")
     result.add_argument("--source", type=Path, default=REPO_ROOT, help="FEX worktree to expose")
@@ -117,6 +121,11 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--jobs", type=positive_int, default=min(os.cpu_count() or 1, 16), help="build workers"
     )
+    plan = subparsers.add_parser(
+        "plan",
+        help="explain pending work for one target without executing target commands",
+    )
+    plan.add_argument("target", help="exact target, for example vulkan-host-64")
     check = subparsers.add_parser(
         "check",
         help="build one named target and run one exact CTest",
@@ -257,6 +266,140 @@ def build_command(build: Path, target: str, jobs: int) -> list[str]:
         "--parallel",
         str(jobs),
     ]
+
+
+def ninja_plan_command(build: Path, manifest: Path, target: str) -> list[str]:
+    if not target or target.startswith("-"):
+        raise ValueError("target must be an explicit CMake target name")
+    return [
+        required_tool("ninja"),
+        "-C",
+        str(build),
+        "-f",
+        str(manifest),
+        "-n",
+        "-d",
+        "explain",
+        target,
+    ]
+
+
+@contextlib.contextmanager
+def shadow_plan_manifest(build: Path):
+    """Hide only CMake's already-checked, always-dirty glob edge from Ninja dry-run."""
+    manifest = build / "build.ninja"
+    try:
+        metadata = manifest.stat(follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 64 * 1024 * 1024:
+            raise RuntimeError(f"unsafe Ninja manifest: {manifest}")
+        lines = manifest.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError as error:
+        raise RuntimeError(f"cannot read Ninja manifest: {manifest}") from error
+
+    descriptor, name = tempfile.mkstemp(prefix=".fex-plan-", suffix=".ninja", dir=build)
+    temporary = Path(name)
+    try:
+        filtered: list[str] = []
+        removed_verify_edges = 0
+        rerun_edges = 0
+        skip_bindings = False
+        for line in lines:
+            if skip_bindings and line.startswith((" ", "\t")):
+                continue
+            if skip_bindings:
+                skip_bindings = False
+            if line.startswith("build ") and ": VERIFY_GLOBS " in line:
+                removed_verify_edges += 1
+                skip_bindings = True
+                continue
+            if re.match(r"^build build\.ninja(?=[: ])", line) and ": RERUN_CMAKE " in line:
+                rerun_edges += 1
+                line = re.sub(
+                    r"^build build\.ninja(?=[: ])", f"build {temporary}", line, count=1
+                )
+                line = line.replace(": RERUN_CMAKE ", ": FEX_PLAN_RERUN_CMAKE ", 1)
+            filtered.append(line)
+        if removed_verify_edges != 1 or rerun_edges != 1:
+            raise RuntimeError(
+                "unsupported Ninja regeneration graph: "
+                f"verify={removed_verify_edges} rerun={rerun_edges}"
+            )
+
+        output = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with output:
+            output.write(
+                "rule FEX_PLAN_RERUN_CMAKE\n"
+                "  command = false\n"
+                f"  description = {PLAN_REGEN_DESCRIPTION}\n"
+                "  generator = 1\n\n"
+            )
+            output.writelines(filtered)
+        os.utime(temporary, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+        yield temporary
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def parse_ninja_plan(stdout: str, stderr: str, sample_limit: int = 64) -> dict[str, object]:
+    steps = []
+    reasons = []
+    for line in stdout.splitlines():
+        match = re.match(r"^\[\d+/\d+\]\s+(.*)$", line)
+        if match is not None:
+            steps.append(match.group(1))
+    for line in stderr.splitlines():
+        if line.startswith("ninja explain: "):
+            reasons.append(line.removeprefix("ninja explain: "))
+    return {
+        "plannedSteps": len(steps),
+        "stepSample": steps[:sample_limit],
+        "stepSampleTruncated": len(steps) > sample_limit,
+        "reasons": len(reasons),
+        "reasonSample": reasons[:sample_limit],
+        "reasonSampleTruncated": len(reasons) > sample_limit,
+        "requiresCMakeRegeneration": PLAN_REGEN_DESCRIPTION in steps,
+    }
+
+
+def require_plan_lane(
+    source: Path,
+    source_view: Path,
+    build: Path,
+    profile_path: Path,
+    expected: dict[str, object],
+) -> None:
+    if not source_view.is_symlink():
+        raise RuntimeError("plan requires an existing configured lane")
+    try:
+        current_source = source_view.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("plan lane source is unavailable") from error
+    if current_source != source:
+        raise RuntimeError("plan refuses to switch or clean a lane; choose its current source")
+    if not (build / "build.ninja").is_file():
+        raise RuntimeError("plan requires an existing configured Ninja graph")
+    if not profile_matches(profile_path, expected):
+        raise RuntimeError("plan requires the lane's exact configured profile")
+
+
+def protected_plan_state(paths: tuple[Path, ...]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for path in paths:
+        try:
+            metadata = path.stat(follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 64 * 1024 * 1024:
+                raise RuntimeError(f"unsafe protected plan state: {path}")
+            result[path.name] = {
+                "bytes": metadata.st_size,
+                "mtimeNs": metadata.st_mtime_ns,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        except FileNotFoundError:
+            result[path.name] = None
+    return result
 
 
 def ctest_command(build: Path, names: Path) -> list[str]:
@@ -1017,6 +1160,84 @@ def main(argv: list[str] | None = None) -> int:
         build.mkdir(parents=True, exist_ok=True)
         env = environment(cache_root, lane_root, profile_id)
         with locked_lane(cache_root, lane):
+            profile_marker = expected_profile(
+                env["CCACHE_NAMESPACE"], profile_id, configure_options
+            )
+            if args.action == "plan":
+                require_plan_lane(source, source_view, build, profile_path, profile_marker)
+                identity = source_identity(source)
+                protected_paths = (
+                    build / ".ninja_log",
+                    build / ".ninja_deps",
+                    receipt_path,
+                )
+                protected_before = protected_plan_state(protected_paths)
+                verify_script = build / "CMakeFiles" / "VerifyGlobs.cmake"
+                try:
+                    verify_metadata = verify_script.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise RuntimeError("plan requires CMake's generated glob verifier") from error
+                if (
+                    not stat.S_ISREG(verify_metadata.st_mode)
+                    or verify_metadata.st_size > 16 * 1024 * 1024
+                ):
+                    raise RuntimeError("plan requires CMake's generated glob verifier")
+                glob_started = time.monotonic()
+                subprocess.run(
+                    [required_tool("cmake"), "-P", str(verify_script)],
+                    check=True,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                glob_elapsed = time.monotonic() - glob_started
+                plan_started = time.monotonic()
+                with shadow_plan_manifest(build) as manifest:
+                    completed = subprocess.run(
+                        ninja_plan_command(build, manifest, args.target),
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                    )
+                plan_elapsed = time.monotonic() - plan_started
+                protected_after = protected_plan_state(protected_paths)
+                if protected_after != protected_before:
+                    raise RuntimeError("target plan changed Ninja or last-receipt state")
+                post_identity = source_identity(source)
+                if post_identity != identity:
+                    raise RuntimeError("source identity changed while planning")
+                if len(completed.stdout) + len(completed.stderr) > 8 * 1024 * 1024:
+                    raise RuntimeError("Ninja target plan output exceeded the bounded receipt limit")
+                if completed.returncode != 0:
+                    detail = (completed.stderr or completed.stdout).strip().splitlines()
+                    raise RuntimeError(
+                        f"Ninja target plan failed: {detail[-1] if detail else completed.returncode}"
+                    )
+                plan = parse_ninja_plan(completed.stdout, completed.stderr)
+                if plan["requiresCMakeRegeneration"]:
+                    raise RuntimeError(
+                        "CMake inputs or configured globs changed; regenerate the lane before planning"
+                    )
+                normalized_plan = replace_path(plan, str(source_view), "$SOURCE")
+                normalized_plan = replace_path(normalized_plan, str(build), "$BUILD")
+                receipt = {
+                    "format": "teamleaderleo-fex-x86-host-plan-receipt-v1",
+                    "profile": profile_id,
+                    "requestedProfile": args.profile,
+                    "lane": lane,
+                    "target": args.target,
+                    "head": identity["head"],
+                    "dirty": identity["dirty"],
+                    "configurationMode": "reuse",
+                    "globCheckElapsedSeconds": round(glob_elapsed, 6),
+                    "planElapsedSeconds": round(plan_elapsed, 6),
+                    "plan": normalized_plan,
+                    "protectedStateUnchanged": True,
+                    "targetCommandsExecuted": False,
+                    "mutation": "CMake glob sentinel may update; target outputs and build receipt are unchanged",
+                }
+                print(json.dumps(receipt, sort_keys=True))
+                return 0
             setup_started = time.monotonic()
             switched = prepare_source_view(
                 source,
@@ -1027,9 +1248,6 @@ def main(argv: list[str] | None = None) -> int:
                     focused_linux_test_build(build, 32),
                     focused_linux_test_build(build, 64),
                 ),
-            )
-            profile_marker = expected_profile(
-                env["CCACHE_NAMESPACE"], profile_id, configure_options
             )
             configure_mode = configuration_mode(
                 args.action,
