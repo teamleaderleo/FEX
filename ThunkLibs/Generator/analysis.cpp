@@ -424,8 +424,9 @@ void AnalysisAction::ParseInterface(clang::ASTContext& context) {
 
               data.callbacks.emplace(param_idx, callback);
               if (!callback.is_stub && !data.custom_host_impl) {
-                thunked_funcptrs[emitted_function->getNameAsString() + "_cb" + std::to_string(param_idx)] =
-                  std::pair {context.getCanonicalType(funcptr), no_param_annotations};
+                const auto callback_key = emitted_function->getNameAsString() + "_cb" + std::to_string(param_idx);
+                thunked_funcptrs[callback_key] = std::pair {context.getCanonicalType(funcptr), no_param_annotations};
+                host_to_guest_callback_funcptrs.insert(callback_key);
               }
 
               if (data.callbacks.size() != 1) {

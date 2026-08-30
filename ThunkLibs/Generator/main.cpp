@@ -50,6 +50,15 @@ int main(int argc, char* const argv[]) {
     output_filenames.host = std::move(output_filename);
   } else if (target_abi == "-guest") {
     output_filenames.guest = std::move(output_filename);
+  } else if (target_abi == "-guest-resident") {
+    output_filenames.guest = output_filename;
+    if (!output_filename.ends_with(".inl")) {
+      std::cerr << "Resident guest output filename must end in .inl\n";
+      return EXIT_FAILURE;
+    }
+    auto output_base = output_filename.substr(0, output_filename.size() - 4);
+    output_filenames.guest_bridge = output_base + "_bridge.inl";
+    output_filenames.guest_bridge_accessors = output_base + "_bridge_accessors.inl";
   } else {
     std::cerr << "Unrecognized generator target ABI \"" << target_abi << "\"\n";
     return EXIT_FAILURE;

@@ -63,10 +63,11 @@ else()
   set(BITNESS 64)
 endif()
 
-# Syntax: generate(libxyz libxyz-interface.cpp)
+# Syntax: generate(libxyz libxyz-interface.cpp [RESIDENT_BRIDGE])
 # This defines a target and a custom command:
 # - custom command: Main build step that runs the thunk generator on the given interface definition
 # - libxyz-guest-deps: Interface target to read include directories from which are passed to libclang when parsing the interface definition
+# RESIDENT_BRIDGE adds definition/accessor outputs to the same generator invocation; it does not create or retain a companion DSO.
 function(generate NAME SOURCE_FILE)
   # Interface target for the user to add include directories
   add_library(${NAME}-guest-deps INTERFACE)
@@ -82,6 +83,14 @@ function(generate NAME SOURCE_FILE)
   # Run thunk generator for each of the given output files
   set(OUTFOLDER "${CMAKE_CURRENT_BINARY_DIR}/gen")
   set(OUTFILE "${OUTFOLDER}/thunkgen_guest_${NAME}.inl")
+  set(GENERATOR_TARGET "-guest")
+  set(GENERATOR_OUTPUTS "${OUTFILE}")
+  if ("RESIDENT_BRIDGE" IN_LIST ARGN)
+    set(GENERATOR_TARGET "-guest-resident")
+    string(REGEX REPLACE "[.]inl$" "_bridge.inl" BRIDGE_OUTFILE "${OUTFILE}")
+    string(REGEX REPLACE "[.]inl$" "_bridge_accessors.inl" BRIDGE_ACCESSORS_OUTFILE "${OUTFILE}")
+    list(APPEND GENERATOR_OUTPUTS "${BRIDGE_OUTFILE}" "${BRIDGE_ACCESSORS_OUTFILE}")
+  endif()
 
   file(MAKE_DIRECTORY "${OUTFOLDER}")
 
@@ -95,10 +104,10 @@ function(generate NAME SOURCE_FILE)
   list(APPEND BITNESS_FLAGS2 "--sysroot" "${X86_DEV_ROOTFS}")
 
   add_custom_command(
-    OUTPUT "${OUTFILE}"
+    OUTPUT ${GENERATOR_OUTPUTS}
     DEPENDS "${GENERATOR_EXE}"
     DEPENDS "${SOURCE_FILE}"
-    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "-guest" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
+    COMMAND "${GENERATOR_EXE}" "${SOURCE_FILE}" "${NAME}" "${GENERATOR_TARGET}" "${OUTFILE}" "${X86_DEV_ROOTFS}" ${BITNESS_FLAGS} -- -std=c++20 ${BITNESS_FLAGS2}
       # Expand compile definitions to space-separated list of -D parameters
       "$<$<BOOL:${compile_prop}>:;-D$<JOIN:${compile_prop},;-D>>"
       # Expand include directories to space-separated list of -isystem parameters
@@ -108,6 +117,10 @@ function(generate NAME SOURCE_FILE)
 
   list(APPEND OUTPUTS "${OUTFILE}")
   set(GEN_${NAME} ${OUTPUTS} PARENT_SCOPE)
+  if ("RESIDENT_BRIDGE" IN_LIST ARGN)
+    set(GEN_${NAME}_BRIDGE "${BRIDGE_OUTFILE}" PARENT_SCOPE)
+    set(GEN_${NAME}_BRIDGE_ACCESSORS "${BRIDGE_ACCESSORS_OUTFILE}" PARENT_SCOPE)
+  endif()
 endfunction()
 
 function(add_guest_lib NAME SONAME)
