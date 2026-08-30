@@ -1100,6 +1100,27 @@ def verify_editor_prerequisites(build: Path) -> None:
         raise RuntimeError("editor prerequisite targets omitted outputs: " + ", ".join(missing))
 
 
+def prepare_editor_database(
+    source_view: Path,
+    source: Path,
+    build: Path,
+    destination: Path,
+    env: dict[str, str],
+    runner=subprocess.run,
+) -> tuple[int, float]:
+    """Graph-check generated inputs before atomically replacing the editor database."""
+    started = time.monotonic()
+    runner(
+        editor_prerequisites_command(build),
+        check=True,
+        env=env,
+    )
+    verify_editor_prerequisites(build)
+    elapsed = time.monotonic() - started
+    count = write_editor_compile_commands(source_view, source, build, destination)
+    return count, elapsed
+
+
 def expected_profile(
     cache_namespace: str,
     profile: str = PROFILE,
@@ -1646,24 +1667,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"configured lane={lane} source={source} build={build}")
                 return 0
             if args.action == "editor":
-                if configure_mode == "reuse":
-                    subprocess.run(
-                        reconfigure_command(source_view, build, configure_options),
-                        check=True,
-                        env=env,
-                    )
-                    configure_mode = "incremental"
-                prerequisites_started = time.monotonic()
-                subprocess.run(
-                    editor_prerequisites_command(build),
-                    check=True,
-                    env=env,
-                )
-                verify_editor_prerequisites(build)
-                prerequisites_elapsed = time.monotonic() - prerequisites_started
                 destination = source / "compile_commands.json"
-                count = write_editor_compile_commands(
-                    source_view, source, build, destination
+                count, prerequisites_elapsed = prepare_editor_database(
+                    source_view, source, build, destination, env
                 )
                 print(
                     f"editor lane={lane} entries={count} "

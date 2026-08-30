@@ -356,10 +356,12 @@ Command-line users get the same setup with:
 ```
 
 Re-run `editor` after pulling or switching commits, changing CMake structure, switching the lane to
-another worktree or changing the build profile. On an existing lane it performs an incremental CMake
-regeneration and refreshes those two generated-header targets before exporting the database; it does
-not throw away the warm object tree or build a product target. Ordinary edits inside already-known
-source files do not require regenerating the database.
+another worktree or changing the build profile. On an existing compatible lane, its prerequisite
+target build lets the configured Ninja graph check CMake inputs and globs before exporting the
+database. Ninja regenerates when those inputs changed; a no-change invocation does not pay for an
+unconditional second CMake pass. A source switch or incompatible/missing profile still performs an
+explicit configure. The action does not throw away the warm object tree or build a product target.
+Ordinary edits inside already-known source files do not require regenerating the database.
 
 ## Measured big-red checkpoint
 
