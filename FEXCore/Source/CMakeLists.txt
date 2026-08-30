@@ -19,6 +19,7 @@ set(SRCS
   Interface/Context/Context.cpp
   Interface/Core/LookupCache.cpp
   Interface/Core/DiskCache.cpp
+  Interface/Core/DiskCacheFile.cpp
   Interface/Core/CodeCache.cpp
   Interface/Core/CodeCacheFile.cpp
   Interface/Core/Core.cpp
