@@ -195,6 +195,29 @@ generated Ninja graph and uses CTest's JSON show-only mode. It does not configur
 run a test, write a receipt, persist an index or infer target/test ownership. The same query is
 available as the VS Code task **FEX: discover configured targets and tests**.
 
+### Compile the source file you are editing
+
+For compiler feedback on one C or C++ translation unit, use its repository path instead of first
+finding a link target:
+
+```sh
+./Scripts/ResearchDevBuild.py --lane editor compile ThunkLibs/Generator/analysis.cpp
+```
+
+`compile` reads the configured lane's `compile_commands.json`, normalizes the selected worktree
+path through the stable source view, and requires exactly one matching object output inside that
+lane's build tree. It then asks CMake/Ninja for only that object target. The receipt binds the exact
+head/dirty state, profile, source file, object target, compilation-database digest, jobs, timing and
+exit status. It means that one configured object compiled; no archive, shared library, executable,
+CTest, guest or runtime result is implied.
+
+The command deliberately refuses headers, paths outside the selected source tree, symlinks,
+missing mappings and sources compiled in more than one configuration.
+For a header, choose one representative `.cpp` owner. For an ambiguous source, use `discover` and
+the ordinary exact target path rather than letting the helper guess which ABI/configuration matters.
+As with other focused commands, a dirty receipt is fast developer feedback, not reusable exact-head
+acceptance.
+
 The helper configures Clang, Ninja, lld, ccache, `RelWithDebInfo`, assertions, thunks and tests,
 without LTO or the GUI. It prints and stores a receipt containing the exact source head, dirty bit,
 target, worker count, configuration mode, setup and target durations, result, cache namespace and
@@ -336,7 +359,9 @@ worktree; this is why simply symlinking the external compilation database is not
 After preparation:
 
 - use `F12` for definition, `Shift+F12` for references and `Ctrl+P`, then `#`, for symbols;
-- press `Ctrl+Shift+B` for **FEX: build one target** and enter the exact CMake target;
+- press `Ctrl+Shift+B` for **FEX: compile current C++ file** with no target prompt;
+- run **FEX: build one target** only when the current question needs an archive, executable or
+  other linked owner;
 - run **FEX: explain one target rebuild** first when the pending owner chain is unclear;
 - run **FEX: build target and run one exact CTest** when a focused host-side test owns the oracle;
 - run **FEX: show editor lane receipt** before reporting what was built;
@@ -352,6 +377,7 @@ Command-line users get the same setup with:
 
 ```sh
 ./Scripts/ResearchDevBuild.py --lane editor editor
+./Scripts/ResearchDevBuild.py --lane editor compile ThunkLibs/Generator/analysis.cpp
 ./Scripts/ResearchDevBuild.py --lane editor build vulkan-host-64
 ```
 
