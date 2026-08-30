@@ -2,8 +2,8 @@
 
 This guide explains the owned fork's optional resident-output primitive for `thunkgen`. It assumes
 ordinary C++ familiarity, but not FEX internals. The primitive is now adopted by the measured GL
-companion; Vulkan and every other thunk library remain unadopted. Generator capability, each library
-integration and ARM64 runtime acceptance are still separate claims.
+and Vulkan companions; every other thunk library remains unadopted. Generator capability, each
+library integration and ARM64 runtime acceptance are still separate claims.
 
 ## The problem in one picture
 

@@ -16,6 +16,10 @@ For the escaped-code lifetime problem, the optional direction-aware generator ou
 boundary before any library can adopt a resident companion, see
 [Resident thunk bridges](ResidentThunkBridge.md).
 
+For Vulkan's generated proc-address invokers, three custom X11 publications, focused local checks,
+and the GPU-free retained-call runtime oracle, see
+[Vulkan resident companion](VulkanResidentCompanion.md).
+
 ## One target, not everything
 
 Before configuring anything on a new machine or chat container, inspect the local boundary:

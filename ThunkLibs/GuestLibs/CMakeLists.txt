@@ -197,6 +197,13 @@ function(add_guest_lib NAME SONAME)
   endif()
 endfunction()
 
+# GL and Vulkan companions call X11 entrypoints after their ordinary wrappers
+# unload. Link both against this guest placeholder so the real guest libX11
+# stays loaded beside the process-resident executable glue.
+add_library(PlaceholderX11 SHARED ../libX11/libX11_NativeGuest.cpp)
+target_link_options(PlaceholderX11 PRIVATE "LINKER:-soname,libX11.so.6")
+set_target_properties(PlaceholderX11 PROPERTIES NO_SONAME ON)
+
 # These thunks only support 64-bit
 if (BITNESS EQUAL 64)
   #add_guest_lib(fex_malloc_loader)
@@ -217,10 +224,26 @@ if (BITNESS EQUAL 64)
   # target_link_libraries(SDL2-guest PRIVATE GL)
   # target_link_libraries(SDL2-guest PRIVATE dl)
 
-  generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp)
+  generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp RESIDENT_BRIDGE)
   target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
   target_include_directories_from_pkgconfig(libvulkan-guest-deps "xcb;x11;xrandr;xrender")
+
+  # Native Vulkan retains guest-callable proc-address invokers and X11 callback
+  # unpackers beyond an ordinary wrapper load. Keep only that executable glue
+  # process-resident; libvulkan itself remains unloadable.
+  add_library(libvulkan_bridge-guest-deps INTERFACE)
+  target_include_directories(libvulkan_bridge-guest-deps INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+  target_link_libraries(libvulkan_bridge-guest-deps INTERFACE libvulkan-guest-deps)
+  set(GEN_libvulkan_bridge "${GEN_libvulkan_BRIDGE}")
+  add_guest_lib(vulkan_bridge "libfex-vulkan-bridge.so")
+  set_target_properties(vulkan_bridge-guest PROPERTIES OUTPUT_NAME "fex-vulkan-bridge")
+  target_link_options(vulkan_bridge-guest PRIVATE "LINKER:-z,nodelete" "LINKER:--no-as-needed")
+  set_target_properties(vulkan_bridge-guest PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
+  target_link_libraries(vulkan_bridge-guest PRIVATE PlaceholderX11)
+
   add_guest_lib(vulkan "libvulkan.so.1")
+  target_sources(vulkan-guest PRIVATE "${GEN_libvulkan_BRIDGE_ACCESSORS}")
+  target_link_libraries(vulkan-guest PRIVATE vulkan_bridge-guest)
 
   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
   target_include_directories_from_pkgconfig(libdrm-guest-deps libdrm /usr/include/drm /usr/include/libdrm)
@@ -290,10 +313,6 @@ target_include_directories_from_pkgconfig(libEGL-guest-deps egl)
 add_guest_lib(EGL "libEGL.so.1")
 target_link_libraries(EGL-guest PRIVATE GL-guest)
 
-# libGL must pull in libX11.so, so generate a placeholder libX11.so to link against
-add_library(PlaceholderX11 SHARED ../libX11/libX11_NativeGuest.cpp)
-target_link_options(PlaceholderX11 PRIVATE "LINKER:-soname,libX11.so.6")
-set_target_properties(PlaceholderX11 PROPERTIES NO_SONAME ON)
 target_link_libraries(GL-guest PRIVATE PlaceholderX11)
 target_link_libraries(GL_bridge-guest PRIVATE PlaceholderX11)
 
