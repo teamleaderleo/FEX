@@ -1,0 +1,11 @@
+{
+  "entrypoint": "run.sh",
+  "id": "arm64-disk-cache-shapes-v1",
+  "platform": "ubuntu-24.04-arm",
+  "schemaVersion": 1,
+  "timeoutSeconds": 1800,
+  "title": "Real ARM64 disk-cache shape and fresh-process warm-hit oracle",
+  "variants": [
+    "default"
+  ]
+}
