@@ -42,12 +42,22 @@ union FEXServerRequestPacket {
     struct Header Header;
     uint32_t Reserved {};
     uint64_t ConfigId;
+    uint64_t HostFeaturesHash;
+    uint32_t ConfigSize;
+    uint32_t Reserved2 {};
   } CodeCacheRequest;
 };
 
 static_assert(sizeof(FEXServerRequestPacket::Header) == 4);
 static_assert(sizeof(FEXServerRequestPacket::BasicRequest) == 4);
-static_assert(sizeof(FEXServerRequestPacket::CodeCacheRequest) == 16);
+using CodeCacheRequestPacket = decltype(FEXServerRequestPacket::CodeCacheRequest);
+static_assert(sizeof(CodeCacheRequestPacket) == 32);
+static_assert(offsetof(CodeCacheRequestPacket, Header) == 0);
+static_assert(offsetof(CodeCacheRequestPacket, Reserved) == 4);
+static_assert(offsetof(CodeCacheRequestPacket, ConfigId) == 8);
+static_assert(offsetof(CodeCacheRequestPacket, HostFeaturesHash) == 16);
+static_assert(offsetof(CodeCacheRequestPacket, ConfigSize) == 24);
+static_assert(offsetof(CodeCacheRequestPacket, Reserved2) == 28);
 
 union FEXServerResultPacket {
   struct Header {
@@ -142,8 +152,11 @@ int RequestPIDFD(int ServerSocket);
  * @param ProgramFD - FD for program binary
  * @param HasMultiblock - true if multiblock is enabled (used for selecting code maps)
  * @param ConfigId - exact effective code-generation configuration identity
+ * @param HostFeaturesHash - effective host code-generation feature state
+ * @param SerializedConfig - bounded canonical code-generation configuration
  */
-void PopulateCodeCache(int ServerSocket, int ProgramFD, bool HasMultiblock, uint64_t ConfigId);
+void PopulateCodeCache(int ServerSocket, int ProgramFD, bool HasMultiblock, uint64_t ConfigId, uint64_t HostFeaturesHash,
+                       std::string_view SerializedConfig);
 
 /**
  * @brief Request FEXServer to create a new code map for disk cache population

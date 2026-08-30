@@ -301,6 +301,10 @@ uint64_t CodeCache::GetConfigId() const {
   return CodeCacheConfig::ComputeId(CTX.HostFeatures, CTX.Config.Is64BitMode());
 }
 
+uint64_t CodeCache::GetHostFeaturesHash() const {
+  return CTX.HostFeatures.HashForCaching();
+}
+
 uint64_t CodeCache::ComputeCodeMapId(std::string_view Filename, int FD) {
   if (Filename.empty()) {
     return 0xffff'ffff'ffff'ffff;

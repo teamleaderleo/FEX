@@ -42,6 +42,11 @@ struct HostFeatures {
     return Result;
   }
 
+  void ApplyCacheHash(uint64_t Hash) {
+    static_assert(offsetof(HostFeatures, CPUMIDRs) == sizeof(Hash));
+    memcpy(static_cast<void*>(this), &Hash, sizeof(Hash));
+  }
+
   uint32_t DCacheLineLog2              : 4 {};
   uint32_t SupportsCacheMaintenanceOps : 1 {};
   uint32_t SupportsAES                 : 1 {};

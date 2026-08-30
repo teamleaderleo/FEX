@@ -10,6 +10,7 @@
 #include <Common/FEXServerClient.h>
 
 #include <FEXCore/Core/CodeCache.h>
+#include <FEXCore/Config/Config.h>
 #include <FEXCore/HLE/SourcecodeResolver.h>
 
 #include <fmt/ranges.h>
@@ -467,34 +468,78 @@ static std::map<FEXCore::ExecutableFileInfo, NeedsCacheRefresh> AggregateCodeMap
   return Result;
 }
 
-static int32_t EmbedSubprocess(const char* path, char* const* args) {
-  pid_t pid = fork();
-  if (pid == 0) {
-    execvp(path, args);
-    _exit(-1);
-  } else {
-    int32_t Status {};
-    while (waitpid(pid, &Status, 0) == -1 && errno == EINTR)
-      ;
-    if (WIFEXITED(Status)) {
-      return (int8_t)WEXITSTATUS(Status);
-    }
-  }
-
-  return -1;
-}
-
 /**
  * Spawn a FEXOfflineCompiler instance to generate a code cache from the given code map
  */
-static int RunOfflineCompiler(const char* CodeMap, uint64_t ConfigId) {
+static int RunOfflineCompiler(const char* CodeMap, uint64_t ConfigId, uint64_t HostFeaturesHash, std::string_view SerializedConfig) {
+  int ConfigPipe[2] {};
+  if (pipe2(ConfigPipe, O_CLOEXEC) != 0) {
+    return -1;
+  }
+
   const auto ConfigIdArgument = fmt::format("{:016x}", ConfigId);
-  const char* ExecveArgs[] = {OfflineCompilerPath.c_str(), "generate", "--config-id", ConfigIdArgument.c_str(), CodeMap, nullptr};
-  return EmbedSubprocess(OfflineCompilerPath.c_str(), const_cast<char* const*>(&ExecveArgs[0]));
+  const auto HostFeaturesArgument = fmt::format("{:016x}", HostFeaturesHash);
+  const auto ConfigFDArgument = fmt::format("{}", ConfigPipe[0]);
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(ConfigPipe[1]);
+    const auto Flags = fcntl(ConfigPipe[0], F_GETFD);
+    if (Flags == -1 || fcntl(ConfigPipe[0], F_SETFD, Flags & ~FD_CLOEXEC) == -1) {
+      _exit(127);
+    }
+
+    const char* ExecveArgs[] = {OfflineCompilerPath.c_str(),
+                                "generate",
+                                "--config-id",
+                                ConfigIdArgument.c_str(),
+                                "--config-fd",
+                                ConfigFDArgument.c_str(),
+                                "--host-features",
+                                HostFeaturesArgument.c_str(),
+                                CodeMap,
+                                nullptr};
+    execvp(OfflineCompilerPath.c_str(), const_cast<char* const*>(&ExecveArgs[0]));
+
+    // Keep a reader alive until the parent finishes if exec fails.
+    std::array<char, 4096> Drain {};
+    while (::read(ConfigPipe[0], Drain.data(), Drain.size()) > 0) { }
+    _exit(127);
+  }
+
+  close(ConfigPipe[0]);
+  if (pid == -1) {
+    close(ConfigPipe[1]);
+    return -1;
+  }
+
+  bool WriteSucceeded = true;
+  size_t Written {};
+  while (Written < SerializedConfig.size()) {
+    const auto Result = ::write(ConfigPipe[1], SerializedConfig.data() + Written, SerializedConfig.size() - Written);
+    if (Result > 0) {
+      Written += Result;
+    } else if (Result == -1 && errno == EINTR) {
+      continue;
+    } else {
+      WriteSucceeded = false;
+      break;
+    }
+  }
+  close(ConfigPipe[1]);
+
+  int32_t Status {};
+  pid_t WaitResult {};
+  do {
+    WaitResult = waitpid(pid, &Status, 0);
+  } while (WaitResult == -1 && errno == EINTR);
+  if (WriteSucceeded && WaitResult == pid && WIFEXITED(Status)) {
+    return static_cast<int8_t>(WEXITSTATUS(Status));
+  }
+  return -1;
 };
 
 static void HandleSocketData(fasio::tcp_socket& Socket) {
-  std::vector<uint8_t> Data(1500);
+  std::array<uint8_t, sizeof(FEXServerClient::FEXServerRequestPacket::Header)> Data {};
 
   // Get the current number of FDs of the process before we start handling sockets.
   GetMaxFDs();
@@ -507,8 +552,14 @@ static void HandleSocketData(fasio::tcp_socket& Socket) {
 
     auto Read = Socket.read_some(buffer, ec);
     if (ec == fasio::error::success) {
-      assert(Read >= sizeof(FEXServerClient::FEXServerRequestPacket::Header));
-      buffer = {buffer.Data.subspan(0, Read)};
+      if (Read < Data.size()) {
+        fasio::mutable_buffer Remaining {.Data = buffer.Data.subspan(Read)};
+        fasio::read(Socket, Remaining, ec);
+        if (ec != fasio::error::success) {
+          return;
+        }
+      }
+      buffer = {std::as_writable_bytes(std::span(Data))};
     } else if (ec == fasio::error::eof) {
       return;
     } else {
@@ -605,7 +656,16 @@ static void HandleSocketData(fasio::tcp_socket& Socket) {
 
     case FEXServerClient::PacketType::TYPE_POPULATE_CODE_CACHE:
     case FEXServerClient::PacketType::TYPE_POPULATE_CODE_CACHE_NO_MULTIBLOCK: {
-      if (buffer.size() < sizeof(FEXServerClient::FEXServerRequestPacket::CodeCacheRequest)) {
+      FEXServerClient::CodeCacheRequestPacket Request {
+        .Header = Req->Header,
+      };
+      fasio::mutable_buffer RequestRemainder {
+        .Data = std::as_writable_bytes(std::span {&Request, 1}).subspan(sizeof(Request.Header)),
+      };
+      fasio::error ReadError;
+      fasio::read(Socket, RequestRemainder, ReadError);
+      if (ReadError != fasio::error::success || Request.Reserved != 0 || Request.Reserved2 != 0 || Request.ConfigSize == 0 ||
+          Request.ConfigSize > FEXCore::Config::MAX_SERIALIZED_CACHE_CONFIG_SIZE || inFD == -1) {
         LogMan::Msg::EFmt("Malformed code-cache population request");
         SendEmptyErrorPacket(Socket);
         if (inFD != -1) {
@@ -615,21 +675,30 @@ static void HandleSocketData(fasio::tcp_socket& Socket) {
         return;
       }
 
-      char Tmp[PATH_MAX];
-      int TmpLen = FEX::get_fdpath(inFD, Tmp);
-      assert(TmpLen != -1);
-
-      std::filesystem::path Path {std::string_view(Tmp, TmpLen)};
-      auto filename_hash = XXH3_64bits(Tmp, TmpLen);
-      const bool HasMultiblock = (Req->Header.Type == FEXServerClient::PacketType::TYPE_POPULATE_CODE_CACHE);
-      if (Req->CodeCacheRequest.Reserved != 0) {
-        LogMan::Msg::EFmt("Unsupported code-cache population request version");
+      std::vector<char> SerializedConfig(Request.ConfigSize);
+      fasio::mutable_buffer ConfigBuffer {.Data = std::as_writable_bytes(std::span(SerializedConfig))};
+      fasio::read(Socket, ConfigBuffer, ReadError);
+      if (ReadError != fasio::error::success) {
+        LogMan::Msg::EFmt("Truncated code-cache configuration snapshot");
         SendEmptyErrorPacket(Socket);
         close(inFD);
         inFD = -1;
         return;
       }
-      const uint64_t CodeCacheConfigId = Req->CodeCacheRequest.ConfigId;
+
+      char Tmp[PATH_MAX];
+      int TmpLen = FEX::get_fdpath(inFD, Tmp);
+      if (TmpLen == -1) {
+        SendEmptyErrorPacket(Socket);
+        close(inFD);
+        inFD = -1;
+        return;
+      }
+
+      std::filesystem::path Path {std::string_view(Tmp, TmpLen)};
+      auto filename_hash = XXH3_64bits(Tmp, TmpLen);
+      const bool HasMultiblock = (Req->Header.Type == FEXServerClient::PacketType::TYPE_POPULATE_CODE_CACHE);
+      const uint64_t CodeCacheConfigId = Request.ConfigId;
 
       FEXCore::ExecutableFileInfo MainFileId = {nullptr, filename_hash, fextl::string(Tmp, TmpLen)};
       fmt::print("Requested {}cache generation for {}\n", HasMultiblock ? "" : "nomb-", MainFileId.Filename);
@@ -668,7 +737,8 @@ static void HandleSocketData(fasio::tcp_socket& Socket) {
 
         const auto BinaryName = (std::string)FEXCore::CodeMap::GetBaseFilename(File, !HasMultiblock);
         fmt::println("Generating cache for {}", BinaryName);
-        int Status = RunOfflineCompiler(fmt::format("{}/{}", ReadyCodeMapDirectory, BinaryName).c_str(), CodeCacheConfigId);
+        int Status = RunOfflineCompiler(fmt::format("{}/{}", ReadyCodeMapDirectory, BinaryName).c_str(), CodeCacheConfigId,
+                                        Request.HostFeaturesHash, std::string_view {SerializedConfig.data(), SerializedConfig.size()});
         if (Status != 0) {
           fmt::println("ERROR: Cache generation failed with status {}", Status);
         }

@@ -41,19 +41,28 @@ header and structurally usable contents.
 ## Fail-closed generation flow
 
 ```text
-FEX client computes requested ID C
-  -> FEXServer receives program fd + C
+FEX client freezes canonical snapshot S and effective host-feature bits H
+  -> client computes requested ID C from S + H + guest bitness
+  -> FEXServer receives program fd + C + H + bounded S
   -> server checks <binary>-<file-id>-C
-  -> server runs FEXOfflineCompiler --config-id C
-  -> compiler loads its own effective configuration and computes C'
+  -> server gives S to FEXOfflineCompiler through an inherited pipe
+  -> compiler schema-validates and atomically applies S, reconstructs H, and computes C'
        C' != C: refuse before InitCore/compilation; emit no cache
        C' == C: compile and write filename C + header C
   -> runtime opens filename C and independently requires header C
 ```
 
 The compiler never trusts a client-supplied ID as a label for code generated under different
-settings. Manual `generate` without `--config-id` remains possible and names output with the
-compiler's actual ID. A supplied ID must be exactly 16 hexadecimal digits.
+settings. The local request is a fixed 32-byte header followed by a length-delimited snapshot.
+The snapshot is capped at 64 KiB, is neither placed in argv nor persisted to a temporary file, and
+must contain the complete generated `AffectsCodeGen` scalar/string inventory in canonical order.
+Unknown, missing, duplicated, truncated, extra and non-canonical fields are rejected before any
+snapshot value is applied. The effective `HostFeatures` result remains a separate fixed 64-bit
+input because the source option is a string-enum rather than a canonical scalar.
+
+Manual `generate` without `--config-id` remains possible and names output with the compiler's
+actual ID. A transported snapshot requires the exact ID and host-feature inputs together; partial
+snapshot arguments are rejected. A supplied ID must be exactly 16 hexadecimal digits.
 
 `process-all` computes the same identity for each executable bitness. Windows cache loading uses
 the context identity too, although the current owned-fork evidence below is Linux/x86-host build
@@ -61,27 +70,30 @@ evidence rather than Windows or ARM64 runtime acceptance.
 
 ## Current evidence and limits
 
-At candidate parent `5d7bcec8f568b40af82401b06180ae5efe0ae4a0`:
+At the owned-fork candidate based on
+`2ae75f1f74c96f5ad6747763fdd2780d2e02012f`:
 
-- four focused identity cases passed 17 assertions: stable identical input; separation by bitness,
-  host features, `MaxInst`, `Multiblock`, TSO, x87 and extended volatile metadata; and no split for
-  a runtime-only lazy-load setting;
+- the three new exact cases pass: canonical snapshot round-trip; atomic rejection of truncated,
+  unknown, wrong-option, non-canonical, duplicated, missing, extra and oversized forms; and exact
+  reconstruction of effective host-feature bits;
 - exact focused targets `FEXCore_Tests_CodeCacheConfig`, `FEX`, `FEXServer` and
   `FEXOfflineCompiler` compiled locally;
-- a valid one-entry `/bin/true` codemap with requested ID zero was refused before compilation and
-  emitted no file;
-- the same fixture using the independently reported ID produced one 8,224-byte cache with that ID
-  in its filename and format-3 header.
+- the current default canonical snapshot is 416 bytes, versus the explicit 65,536-byte protocol
+  ceiling;
+- a valid one-entry `/bin/true` codemap plus a transported snapshot and zeroed effective-host bits
+  recomputed ID `b6392f4f1b85c4c4`; requested ID zero was refused and emitted no file;
+- the same inputs with that independently reported ID produced one 8,216-byte format-3 cache with
+  the ID in its filename and header;
+- an isolated FEXServer probe split the 32-byte header into 1/1/2/5/8/15-byte writes and the
+  416-byte snapshot into 37-byte writes, with the program descriptor attached only to byte one.
+  The server reconstructed the frame, invoked the compiler through its inherited pipe, and
+  produced the same 8,216-byte cache.
 
-The important remaining limitation is configuration transport. `FEXOfflineCompiler` currently
-reloads global/default configuration rather than receiving the client's final app-specific config
-snapshot. If those differ, the new handshake refuses generation. That is the correct failure mode,
-but it means configuration-specific caching is not yet universally available.
-
-A later transport must carry a bounded, schema-validated final codegen snapshot (or an equally
-exact reconstruction identity), bind it to the request and compiler receipt, and retain the
-independent recomputation check. Do not solve the limitation by accepting the client's hash,
-falling back to suffix zero, or silently compiling with global defaults.
+The 64 KiB ceiling is a protocol limit, not evidence that legitimate app configurations approach
+it. Raise it only from an observed valid snapshot distribution and retain a finite cap. The
+snapshot currently supports generated scalar/string codegen options; adding a codegen-affecting
+string-array or a second string-enum intentionally fails at compile time until it receives an
+explicit canonical representation.
 
 No broad suite, x86 guest, ARM64 product runtime, Windows runtime, cache eviction, compression,
 code-map redesign or upstream submission is implied by this evidence.
