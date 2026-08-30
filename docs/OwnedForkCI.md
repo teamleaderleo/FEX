@@ -14,8 +14,18 @@ The job may also be dispatched manually. It does not run a guest, a test family,
 matrix. The preview image changes weekly and carries no GA SLA, so its exact source SHA and printed
 toolchain identity are part of the result rather than an implicit stable environment claim.
 Helper-only changes to `Scripts/ResearchDevBuild.py` do not enqueue this compiler/product lane.
-They use the focused Python helper/policy tests locally; a later relevant product change still runs
-the lane through the helper at that exact head.
+They use `.github/workflows/research-tooling.yml`: one same-repository, path-filtered job that checks
+out the exact PR head and runs the closed Python research-tooling test inventory. It does not
+initialize submodules, configure CMake, compile FEX, invoke a research profile, or run product
+tests. The same bounded inventory is available locally through one command:
+
+```sh
+python3 Scripts/RunResearchToolingTests.py
+```
+
+Independent test files run with at most four workers by default. Their output is buffered per file
+and emitted in inventory order so concurrency does not make the log nondeterministic. A later
+relevant product change still runs the compiler lane through the helper at that exact head.
 
 Each research PR should instead report:
 
