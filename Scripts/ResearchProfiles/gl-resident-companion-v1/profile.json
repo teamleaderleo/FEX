@@ -1,0 +1,11 @@
+{
+  "entrypoint": "run.sh",
+  "id": "gl-resident-companion-v1",
+  "platform": "ubuntu-24.04-arm",
+  "schemaVersion": 1,
+  "timeoutSeconds": 2700,
+  "title": "GL resident companion physical unload and retained-call oracle",
+  "variants": [
+    "default"
+  ]
+}

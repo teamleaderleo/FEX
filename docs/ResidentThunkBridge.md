@@ -58,8 +58,10 @@ function-pointer signature. They contain `CallbackUnpack` exports only for the c
 subset recorded by `AnalysisAction`.
 
 The accessor include gives the unloadable wrapper typed functions for obtaining those resident
-addresses. Requesting an unpacker for a signature that analysis did not classify as a callback has
-no generated specialization and fails at compile time.
+addresses. All typed invoker accessors share one indexed C dispatcher, and the callback subset
+shares a second dispatcher. This keeps the wrapper's dynamic relocation surface constant instead
+of adding one imported symbol per signature. Requesting an unpacker for a signature that analysis
+did not classify as a callback has no generated specialization and fails at compile time.
 
 The normal output and bridge output share the same signature digest and numbering computed in
 `GenerateThunkLibsAction::OnAnalysisComplete`. Resident mode must not quietly create a second
@@ -122,3 +124,6 @@ enabled merely by adding the generator primitive.
 Do not run a broad FEX suite to answer a generator ownership question. Escalate to a bounded ARM64
 profile only when the unresolved claim is physical unload/reload or callback execution on the real
 cross-ISA path.
+
+The first GL-only integration and its bounded runtime oracle are explained in
+[`GLResidentCompanion.md`](GLResidentCompanion.md).
