@@ -554,12 +554,13 @@ namespace DiskCache {
     const size_t EntryPointHostOffsetsOffset = EntryPointRIPsOffset + EntryPointCount * sizeof(uint64_t);
     const size_t SmallRelocsOffset = EntryPointHostOffsetsOffset + EntryPointCount * sizeof(uint32_t);
     const size_t ThunkRelocsOffset = SmallRelocsOffset + SmallRelocCount * sizeof(BlobSmallRelocation);
-    const size_t GuestCodeOffset = ThunkRelocsOffset + ThunkRelocCount * sizeof(BlobThunkRelocation);
-    const size_t TotalSize = GuestCodeOffset + GuestCode.size();
+    const size_t RequiredSize = ThunkRelocsOffset + ThunkRelocCount * sizeof(BlobThunkRelocation);
 
     // we'll copy everything into here and pass it to the Writer, then return to caller quickly
     fextl::vector<uint8_t> Blob;
-    Blob.resize(TotalSize);
+    // GuestCode remains an identity input through GuestSize and GuestHash. It was historically
+    // appended after the required layout, but no reader consumes that duplicate byte tail.
+    Blob.resize(RequiredSize);
     uint8_t* BlobData = Blob.data();
 
     uint64_t ModuleOffset = GuestRIP - Region.FileStartVA;
@@ -642,8 +643,6 @@ namespace DiskCache {
       }
       }
     }
-
-    memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());
 
     // hand the rest off to the writer thread
     Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, std::move(Blob)));

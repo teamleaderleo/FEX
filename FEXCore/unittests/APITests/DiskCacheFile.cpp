@@ -29,9 +29,9 @@ struct Fixture {
 };
 
 Fixture MakeFixture(uint32_t GuestPages = 2, uint32_t EntryPoints = 2, uint32_t SmallRelocations = 1,
-                    uint32_t ThunkRelocations = 1, size_t GuestCodeTail = 0) {
+                    uint32_t ThunkRelocations = 1, uint32_t GuestSize = 0, size_t PersistedGuestCodeTail = 0) {
   FEXCore::DiskCache::BlobFixedHeader Header {
-    .GuestSize = static_cast<uint32_t>(GuestCodeTail),
+    .GuestSize = GuestSize,
     .HostSize = 32,
     .EntryPointCount = EntryPoints,
     .SmallRelocCount = SmallRelocations,
@@ -48,7 +48,7 @@ Fixture MakeFixture(uint32_t GuestPages = 2, uint32_t EntryPoints = 2, uint32_t 
   Result.SmallRelocationsOffset = Result.EntryPointHostOffsetsOffset + EntryPoints * sizeof(uint32_t);
   Result.ThunkRelocationsOffset = Result.SmallRelocationsOffset + SmallRelocations * sizeof(FEXCore::DiskCache::BlobSmallRelocation);
   Result.RequiredSize = Result.ThunkRelocationsOffset + ThunkRelocations * sizeof(FEXCore::DiskCache::BlobThunkRelocation);
-  Result.Data.resize(Result.RequiredSize + GuestCodeTail);
+  Result.Data.resize(Result.RequiredSize + PersistedGuestCodeTail);
   Write(Result.Data, 0, Header);
 
   if (EntryPoints != 0) {
@@ -76,7 +76,7 @@ void RequireError(const std::vector<std::byte>& Data, FEXCore::DiskCacheFile::Va
 } // namespace
 
 TEST_CASE("DiskCacheFile - format-3 block layout is mapped exactly") {
-  const auto Fixture = MakeFixture(2, 2, 1, 1, 19);
+  const auto Fixture = MakeFixture(2, 2, 1, 1, 19, 19);
   const auto Result = Validate(Fixture.Data);
   REQUIRE(Result.Parsed);
   REQUIRE(Result.Error == FEXCore::DiskCacheFile::ValidationError::None);
@@ -88,6 +88,22 @@ TEST_CASE("DiskCacheFile - format-3 block layout is mapped exactly") {
   REQUIRE(Result.Parsed->ThunkRelocationsOffset == Fixture.ThunkRelocationsOffset);
   REQUIRE(Result.Parsed->RequiredSize == Fixture.RequiredSize);
   REQUIRE(Result.Parsed->RequiredSize < Fixture.Data.size());
+}
+
+TEST_CASE("DiskCacheFile - original guest bytes are an optional legacy tail") {
+  constexpr uint32_t GuestSize = 37;
+  const auto Minimal = MakeFixture(2, 2, 1, 1, GuestSize, 0);
+  const auto Legacy = MakeFixture(2, 2, 1, 1, GuestSize, GuestSize);
+
+  const auto MinimalResult = Validate(Minimal.Data);
+  const auto LegacyResult = Validate(Legacy.Data);
+  REQUIRE(MinimalResult.Parsed);
+  REQUIRE(LegacyResult.Parsed);
+  REQUIRE(MinimalResult.Parsed->Header.GuestSize == GuestSize);
+  REQUIRE(LegacyResult.Parsed->Header.GuestSize == GuestSize);
+  REQUIRE(MinimalResult.Parsed->RequiredSize == Minimal.Data.size());
+  REQUIRE(LegacyResult.Parsed->RequiredSize == MinimalResult.Parsed->RequiredSize);
+  REQUIRE(Legacy.Data.size() - Minimal.Data.size() == GuestSize);
 }
 
 TEST_CASE("DiskCacheFile - every required-layout prefix is rejected") {

@@ -68,8 +68,12 @@ The required prefix is, in order:
 6. compact ordinary relocations; and
 7. named-thunk relocations.
 
-Store also appends the original guest bytes. Lookup does not consume that tail, so a read-only
-database may omit it without changing the required lookup layout.
+Older writers appended the original guest bytes after the required layout. Lookup does not consume
+that tail, so new writable blobs omit it: `GuestSize` and `GuestHash` retain the live-code
+validation identity, while the database payload ends after the final required relocation. Old
+tailed blobs remain readable. The exact bytes saved for each new blob equal that block's guest-code
+length; without a real cache corpus, this is not evidence for a population-wide percentage
+reduction.
 
 Upstream `b3f902166` changed lookup from a temporary `BlobEntryPoint` map plus copied guest-page
 vector to spans over one owning blob. Guest-page and entrypoint offsets are relocated in that blob
