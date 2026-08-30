@@ -219,6 +219,80 @@ class ResearchDevBuildTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ConfigValues.inl"):
                 dev_build.verify_editor_prerequisites(build)
 
+    def test_editor_database_survives_failed_graph_regeneration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source_view = root / "source-view"
+            build = root / "build"
+            destination = source / "compile_commands.json"
+            source.mkdir()
+            build.mkdir()
+            destination.write_text("prior database\n", encoding="utf-8")
+
+            def fail(command, **kwargs):
+                raise subprocess.CalledProcessError(1, command)
+
+            with mock.patch.object(dev_build, "required_tool", return_value="/tool/cmake"):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    dev_build.prepare_editor_database(
+                        source_view, source, build, destination, {}, runner=fail
+                    )
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "prior database\n")
+
+    @unittest.skipUnless(
+        shutil.which("cmake") and shutil.which("ninja"),
+        "CMake and Ninja are required for the regeneration fixture",
+    )
+    def test_editor_prerequisite_build_owns_cmake_regeneration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            build = root / "build"
+            source.mkdir()
+            template = source / "value.in"
+            ordinary_source = source / "known.cpp"
+            template.write_text("@VALUE@\n", encoding="utf-8")
+            ordinary_source.write_text("int known;\n", encoding="utf-8")
+
+            def project(value: str) -> str:
+                return (
+                    "cmake_minimum_required(VERSION 3.20)\n"
+                    "project(EditorGraphFixture NONE)\n"
+                    'file(APPEND "${CMAKE_BINARY_DIR}/configure-count.txt" "x")\n'
+                    f'set(VALUE "{value}")\n'
+                    'configure_file(value.in generated/value.txt @ONLY)\n'
+                    'add_custom_target(CONFIG_INC DEPENDS "${CMAKE_BINARY_DIR}/generated/value.txt")\n'
+                    'add_custom_target(IR_INC DEPENDS "${CMAKE_BINARY_DIR}/generated/value.txt")\n'
+                )
+
+            cmake_lists = source / "CMakeLists.txt"
+            cmake_lists.write_text(project("before"), encoding="utf-8")
+            subprocess.run(
+                ["cmake", "-S", str(source), "-B", str(build), "-G", "Ninja"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            counter = build / "configure-count.txt"
+            generated = build / "generated/value.txt"
+            self.assertEqual(counter.read_text(encoding="utf-8"), "x")
+
+            with mock.patch.object(dev_build, "required_tool", return_value="cmake"):
+                command = dev_build.editor_prerequisites_command(build)
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "x")
+
+            cmake_lists.write_text(project("after"), encoding="utf-8")
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "xx")
+            self.assertEqual(generated.read_text(encoding="utf-8"), "after\n")
+
+            ordinary_source.write_text("int known = 1;\n", encoding="utf-8")
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            self.assertEqual(counter.read_text(encoding="utf-8"), "xx")
+
     def test_build_requires_one_explicit_target(self):
         with mock.patch.object(dev_build, "required_tool", return_value="/tool/cmake"):
             command = dev_build.build_command(Path("/view/build"), "vulkan-host-64", 8)
