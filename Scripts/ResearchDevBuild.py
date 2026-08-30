@@ -27,6 +27,18 @@ LINUX_TEST_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 PROFILE = "x86-host-dev-v1"
 CCACHE_SLOPPINESS = "time_macros"
 DEFAULT_SUBMODULE_JOBS = min(os.cpu_count() or 1, 16)
+DOCTOR_TOOLS = (
+    "git",
+    "cmake",
+    "ctest",
+    "ninja",
+    "ccache",
+    "clang",
+    "clang++",
+    "ld.lld",
+    "nasm",
+    "pkg-config",
+)
 CONFIGURE_OPTIONS = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
     "-DENABLE_LTO=False",
@@ -90,6 +102,10 @@ def parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "lanes",
         help="inventory stable build lanes without mutating them",
+    )
+    subparsers.add_parser(
+        "doctor",
+        help="inspect local focused-development capability without configuring or building",
     )
     subparsers.add_parser("configure", help="freshly configure the lane")
     subparsers.add_parser(
@@ -389,6 +405,177 @@ def source_identity(source: Path) -> dict[str, object]:
     return {
         "head": git_output(source, "rev-parse", "HEAD"),
         "dirty": bool(git_output(source, "status", "--porcelain")),
+    }
+
+
+def doctor_git_output(
+    git: str,
+    source: Path,
+    *arguments: str,
+    runner=subprocess.run,
+) -> subprocess.CompletedProcess[str]:
+    return runner(
+        [git, "-C", str(source), *arguments],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+    )
+
+
+def doctor_submodules(
+    source: Path,
+    git: str,
+    runner=subprocess.run,
+) -> dict[str, object]:
+    completed = doctor_git_output(
+        git, source, "submodule", "status", "--recursive", runner=runner
+    )
+    if completed.returncode != 0:
+        return {
+            "state": "unavailable",
+            "reason": "git submodule status failed",
+        }
+
+    normalized = []
+    uninitialized = []
+    drifted = []
+    conflicted = []
+    for line in completed.stdout.splitlines():
+        if len(line) < 43:
+            return {"state": "invalid", "reason": "cannot parse recursive submodule status"}
+        prefix = line[0]
+        path = line[42:].split(" (", 1)[0]
+        if not path:
+            return {"state": "invalid", "reason": "recursive submodule path is empty"}
+        if prefix == "-":
+            uninitialized.append(path)
+            continue
+        if prefix == "+":
+            drifted.append(path)
+            continue
+        if prefix == "U":
+            conflicted.append(path)
+            continue
+        commit = line[1:41]
+        if prefix != " " or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            return {"state": "invalid", "reason": "cannot parse recursive submodule status"}
+        normalized.append(f"{commit} {path}")
+
+    if uninitialized or drifted or conflicted:
+        return {
+            "state": "not_ready",
+            "uninitialized": sorted(uninitialized),
+            "drifted": sorted(drifted),
+            "conflicted": sorted(conflicted),
+            "remediation": (
+                f"git -C {source} submodule update --init --recursive --depth 1 "
+                f"--jobs {DEFAULT_SUBMODULE_JOBS}"
+            ),
+        }
+    if not normalized:
+        return {"state": "invalid", "reason": "recursive submodule status is empty"}
+    payload = "\n".join(sorted(normalized)) + "\n"
+    return {
+        "state": "ready",
+        "repositories": len(normalized),
+        "pinnedDigest": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+    }
+
+
+def doctor_receipt(
+    source: Path,
+    *,
+    finder=shutil.which,
+    runner=subprocess.run,
+    machine: str | None = None,
+) -> dict[str, object]:
+    tools = {
+        name: {"state": "ready", "path": path}
+        if (path := finder(name)) is not None
+        else {"state": "missing"}
+        for name in DOCTOR_TOOLS
+    }
+    missing_tools = [name for name in DOCTOR_TOOLS if tools[name]["state"] == "missing"]
+    git = tools["git"].get("path")
+    source_receipt: dict[str, object]
+    submodules: dict[str, object]
+    if not isinstance(git, str):
+        source_receipt = {"state": "unavailable", "reason": "git is missing"}
+        submodules = {"state": "unavailable", "reason": "git is missing"}
+    else:
+        head = doctor_git_output(git, source, "rev-parse", "HEAD", runner=runner)
+        dirty = doctor_git_output(git, source, "status", "--porcelain", runner=runner)
+        if head.returncode != 0 or dirty.returncode != 0:
+            source_receipt = {
+                "state": "unavailable",
+                "reason": "source is not an inspectable Git worktree",
+            }
+            submodules = {"state": "unavailable", "reason": "source identity is unavailable"}
+        else:
+            source_receipt = {
+                "state": "ready",
+                "head": head.stdout.strip(),
+                "dirty": bool(dirty.stdout.strip()),
+            }
+            submodules = doctor_submodules(source, git, runner=runner)
+
+    host_machine = machine if machine is not None else platform.machine()
+    x86_host = host_machine in {"x86_64", "amd64"}
+    local_blockers = []
+    if missing_tools:
+        local_blockers.append("missing_tools")
+    if source_receipt["state"] != "ready":
+        local_blockers.append("source_identity")
+    if submodules["state"] != "ready":
+        local_blockers.append("submodules")
+    if not x86_host:
+        local_blockers.append("host_architecture")
+    local_preflight_ready = not local_blockers
+    dirty_source = source_receipt.get("dirty") is True
+    if source_receipt["state"] != "ready":
+        exact_head_state = "blocked"
+        exact_head_reason = "source identity is unavailable"
+    elif dirty_source:
+        exact_head_state = "feedback_only"
+        exact_head_reason = "source is dirty"
+    else:
+        exact_head_state = "candidate_requires_post_check"
+        exact_head_reason = "recheck clean source identity after the focused command"
+    arm_state = (
+        "candidate_requires_checked_in_profile"
+        if host_machine in {"aarch64", "arm64"}
+        else "escalate_to_checked_in_arm64_profile"
+    )
+    return {
+        "format": "teamleaderleo-fex-experiment-doctor-v1",
+        "status": "preflight_ready" if local_preflight_ready else "blocked",
+        "source": source_receipt,
+        "submodules": submodules,
+        "host": {
+            "machine": host_machine,
+            "logicalCpus": os.cpu_count(),
+        },
+        "tools": tools,
+        "capabilities": {
+            "focusedX86HostBuildAndCTest": {
+                "state": "preflight_ready" if local_preflight_ready else "blocked",
+                "ready": False,
+                "blockers": local_blockers,
+                "scope": "one named x86-host target or one exact host-side CTest",
+                "proof": "required command paths and pinned submodules only; configure/build/test did not run",
+            },
+            "reusableExactHeadEvidence": {
+                "state": exact_head_state,
+                "reason": exact_head_reason,
+            },
+            "arm64ProductRuntime": {
+                "state": arm_state,
+                "ready": False,
+                "scope": "requires an exact-SHA checked-in ARM64 profile and its own runtime oracle",
+            },
+        },
+        "mutation": "none; no configure, build, test, package, cache, or submodule update ran",
     }
 
 
@@ -769,6 +956,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(submodule_pack_cache.inventory(cache_root), indent=2, sort_keys=True))
             return 0
         source = args.source.resolve(strict=True)
+        if args.action == "doctor":
+            receipt = doctor_receipt(source)
+            print(json.dumps(receipt, indent=2, sort_keys=True))
+            return 0 if receipt["status"] == "preflight_ready" else 2
         lane_root = cache_root / "views" / lane
         source_view = lane_root / "src"
         build = lane_root / "build"

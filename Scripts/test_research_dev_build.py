@@ -20,6 +20,106 @@ SPEC.loader.exec_module(dev_build)
 
 
 class ResearchDevBuildTest(unittest.TestCase):
+    @staticmethod
+    def doctor_runner(
+        *, dirty: bool = False, submodules: str | None = None
+    ):
+        pinned = submodules or f" {'a' * 40} ThunkLibs/one (heads/main)\n"
+
+        def run(command, **kwargs):
+            git_environment = kwargs["env"]
+            if git_environment["GIT_OPTIONAL_LOCKS"] != "0":
+                raise AssertionError("doctor Git inspection may not refresh the index")
+            if command[-2:] == ["rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(command, 0, stdout=f"{'b' * 40}\n", stderr="")
+            if command[-2:] == ["status", "--porcelain"]:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=" M file.cpp\n" if dirty else "", stderr=""
+                )
+            if command[-3:] == ["submodule", "status", "--recursive"]:
+                return subprocess.CompletedProcess(command, 0, stdout=pinned, stderr="")
+            raise AssertionError(command)
+
+        return run
+
+    def test_doctor_parser_and_ready_receipt_are_read_only_and_bounded(self):
+        args = dev_build.parser().parse_args(["doctor"])
+        self.assertEqual(args.action, "doctor")
+        receipt = dev_build.doctor_receipt(
+            Path("/source"),
+            finder=lambda name: f"/tool/{name}",
+            runner=self.doctor_runner(),
+            machine="x86_64",
+        )
+
+        self.assertEqual(receipt["status"], "preflight_ready")
+        self.assertEqual(receipt["source"]["head"], "b" * 40)
+        self.assertEqual(receipt["submodules"]["repositories"], 1)
+        self.assertEqual(
+            receipt["capabilities"]["focusedX86HostBuildAndCTest"]["state"],
+            "preflight_ready",
+        )
+        self.assertFalse(
+            receipt["capabilities"]["focusedX86HostBuildAndCTest"]["ready"]
+        )
+        self.assertEqual(
+            receipt["capabilities"]["arm64ProductRuntime"]["state"],
+            "escalate_to_checked_in_arm64_profile",
+        )
+        self.assertIn("no configure", receipt["mutation"])
+
+    def test_doctor_reports_missing_tool_and_uninitialized_submodule(self):
+        receipt = dev_build.doctor_receipt(
+            Path("/source"),
+            finder=lambda name: None if name == "nasm" else f"/tool/{name}",
+            runner=self.doctor_runner(
+                submodules=(
+                    f"-{'c' * 40} ThunkLibs/missing\n"
+                    f"+{'d' * 40} ThunkLibs/drifted (heads/other)\n"
+                )
+            ),
+            machine="x86_64",
+        )
+
+        self.assertEqual(receipt["status"], "blocked")
+        self.assertEqual(receipt["tools"]["nasm"]["state"], "missing")
+        self.assertEqual(receipt["submodules"]["uninitialized"], ["ThunkLibs/missing"])
+        self.assertEqual(receipt["submodules"]["drifted"], ["ThunkLibs/drifted"])
+        self.assertIn("submodule update", receipt["submodules"]["remediation"])
+        self.assertEqual(
+            receipt["capabilities"]["focusedX86HostBuildAndCTest"]["blockers"],
+            ["missing_tools", "submodules"],
+        )
+
+    def test_doctor_marks_dirty_source_as_feedback_only_without_blocking(self):
+        receipt = dev_build.doctor_receipt(
+            Path("/source"),
+            finder=lambda name: f"/tool/{name}",
+            runner=self.doctor_runner(dirty=True),
+            machine="x86_64",
+        )
+
+        self.assertEqual(receipt["status"], "preflight_ready")
+        self.assertEqual(
+            receipt["capabilities"]["reusableExactHeadEvidence"]["state"],
+            "feedback_only",
+        )
+
+    def test_doctor_refuses_to_call_arm_host_runtime_ready(self):
+        receipt = dev_build.doctor_receipt(
+            Path("/source"),
+            finder=lambda name: f"/tool/{name}",
+            runner=self.doctor_runner(),
+            machine="aarch64",
+        )
+
+        self.assertEqual(receipt["status"], "blocked")
+        self.assertEqual(
+            receipt["capabilities"]["arm64ProductRuntime"]["state"],
+            "candidate_requires_checked_in_profile",
+        )
+        self.assertFalse(receipt["capabilities"]["arm64ProductRuntime"]["ready"])
+
     def test_configure_profile_is_host_debug_without_lto(self):
         with mock.patch.object(dev_build, "required_tool", return_value="/tool/cmake"):
             command = dev_build.configure_command(Path("/view/src"), Path("/view/build"))

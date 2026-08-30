@@ -15,6 +15,22 @@ boundary before any library can adopt a resident companion, see
 
 ## One target, not everything
 
+Before configuring anything on a new machine or chat container, inspect the local boundary:
+
+```sh
+./Scripts/ResearchDevBuild.py doctor
+```
+
+`doctor` is read-only. Its JSON receipt reports the exact source head/dirty state, recursive pinned
+submodule digest, required tool paths, host architecture, and three deliberately separate outcomes:
+focused x86-host build/CTest preflight, whether a dirty tree limits the result to developer
+feedback, and whether an ARM64 product-runtime question must move to a checked-in profile. A green
+preflight still says that configure/build/test did not run, and it is not an ARM runtime result.
+Missing or drifted submodules include the
+bounded recovery command, but `doctor` never runs it, configures CMake, writes a cache, builds a
+target, runs a test, or installs a package. VS Code exposes the same check as **FEX: diagnose
+experiment capability**.
+
 Explicitly initialize the pinned submodules once, then build only the target that owns the current
 question:
 

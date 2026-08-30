@@ -2,6 +2,13 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "FEX: diagnose experiment capability",
+      "type": "process",
+      "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
+      "args": ["doctor"],
+      "problemMatcher": []
+    },
+    {
       "label": "FEX: prepare editor lane",
       "type": "process",
       "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
