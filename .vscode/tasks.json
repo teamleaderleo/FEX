@@ -9,6 +9,13 @@
       "problemMatcher": []
     },
     {
+      "label": "FEX: initialize submodules from local caches",
+      "type": "process",
+      "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",
+      "args": ["submodules", "--origin-cache", "--pack-cache"],
+      "problemMatcher": []
+    },
+    {
       "label": "FEX: prepare editor lane",
       "type": "process",
       "command": "${workspaceFolder}/Scripts/ResearchDevBuild.py",

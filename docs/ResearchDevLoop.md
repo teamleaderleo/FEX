@@ -51,6 +51,61 @@ a content-addressed digest of the complete pinned commit/path inventory. Use `--
 smaller explicit bound. Git checkout progress goes to stderr; stdout is one parseable JSON receipt,
 so a carrier can redirect it without mixing progress lines into the evidence file.
 
+### Reusing verified shallow origins before clone
+
+When several local chats or branches need the same submodule generation, opt in to both setup
+caches:
+
+```sh
+./Scripts/ResearchDevBuild.py \
+  --cache-root /same/filesystem/fex-research \
+  --source /same/filesystem/fex-worktree \
+  submodules --jobs 16 --origin-cache --pack-cache
+```
+
+`--origin-cache` saves setup time; `--pack-cache` saves per-consumer storage. On the first compatible
+generation, the origin cache deliberately runs the ordinary network update, verifies every recursive
+pin and canonical HTTPS origin, then publishes one self-contained shallow repository per origin plus
+an immutable manifest keyed by the top-level path/pin/origin inventory. A later worktree with that
+exact top-level identity clones from those local repositories under a shared cache lock. The helper
+enables file transport and exact URL rewrites only for that one Git command. It writes no persistent
+Git configuration, records the original HTTPS origins in each consumer, creates no alternate, and
+again verifies the complete recursive path/pin/origin graph before reporting a hit.
+
+When both flags are requested on that first cold population, the helper deliberately defers pack
+compaction. The network clone's pack layout is a one-time input; retaining it would add variants that
+the local-origin consumers do not reuse. The receipt reports `deferred_until_warm_origin`. The first
+later worktree populated from the local origins creates the reusable pack-cache generation instead.
+Do not rerun the cold worktree merely to force compaction; initialize the next actual worktree.
+
+A missing generation is an ordinary cold population. A present but malformed manifest, unsafe
+directory, missing advertised pin, non-HTTPS origin, unexpected nested repository, active cache
+mutation or post-clone identity difference fails closed instead of falling back to an unrecorded
+network treatment. The cache is an optimization, not source authority: reusable evidence still
+binds the superproject SHA and recursive pin digest.
+
+The accepted exact-head Big Red A-L-L-A control used 18 shallow repositories and 17 origins. Local
+origin medians were 6.965 seconds versus 69.045 seconds ordinary, 62.08 seconds / 89.91% lower, with
+all 18 canonical origins, zero alternates and zero `git fsck` failures. Local module Git allocation
+was 152,248,320 versus 173,598,720 bytes. A private empty pack-cache composition then left only
+4,734,976 consumer-unique bytes, below the established 15,790,080-byte pack-cache median. These are
+same-host exact-generation results, not a claim about an empty cache, a changed submodule generation,
+or hosted runners.
+
+Inspect the origin cache without changing it:
+
+```sh
+./Scripts/ResearchDevBuild.py \
+  --cache-root /same/filesystem/fex-research \
+  submodule-origin-cache
+```
+
+The inventory validates immutable manifests, origin bindings, advertised pins and each shallow Git
+repository under a nonblocking shared lock. It reports generations, origins, advertised pins and
+inode-aware allocation. It has no delete, prune, garbage-collection or eviction action. The origin
+cache adds another retained copy of the shallow objects, so keep it opt-in for repeated local
+materialization; the one-consumer hosted ARM carrier remains on the ordinary path.
+
 ### Sharing immutable submodule packs between retained worktrees
 
 Ordinary `git submodule update --depth 1` deliberately copies objects when its source repository is

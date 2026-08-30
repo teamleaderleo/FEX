@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 import SubmodulePackCache as submodule_pack_cache
+import SubmoduleOriginCache as submodule_origin_cache
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -99,9 +100,18 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="deduplicate immutable shallow pack files in the exact-pin cache generation",
     )
+    submodules.add_argument(
+        "--origin-cache",
+        action="store_true",
+        help="populate or reuse self-contained origin-bound shallow repositories",
+    )
     subparsers.add_parser(
         "submodule-cache",
         help="inventory submodule pack-cache generations without changing them",
+    )
+    subparsers.add_parser(
+        "submodule-origin-cache",
+        help="inventory origin-bound submodule seed generations without changing them",
     )
     subparsers.add_parser(
         "lanes",
@@ -1098,6 +1108,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "submodule-cache":
             print(json.dumps(submodule_pack_cache.inventory(cache_root), indent=2, sort_keys=True))
             return 0
+        if args.action == "submodule-origin-cache":
+            print(json.dumps(submodule_origin_cache.inventory(cache_root), indent=2, sort_keys=True))
+            return 0
         source = args.source.resolve(strict=True)
         if args.action == "doctor":
             receipt = doctor_receipt(source)
@@ -1119,15 +1132,29 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.action == "submodules":
             started = time.monotonic()
-            subprocess.run(
-                submodule_update_command(source, args.jobs),
-                check=True,
-                stdout=sys.stderr,
-            )
+            origin_cache = None
+            if args.origin_cache:
+                origin_cache = submodule_origin_cache.update(
+                    source,
+                    cache_root,
+                    args.jobs,
+                    progress=sys.stderr,
+                )
+            else:
+                subprocess.run(
+                    submodule_update_command(source, args.jobs),
+                    check=True,
+                    stdout=sys.stderr,
+                )
             require_pinned_submodules(source)
             repositories, digest = pinned_submodule_identity(source)
             pack_cache = None
-            if args.pack_cache:
+            defer_pack_cache = bool(
+                args.pack_cache
+                and origin_cache is not None
+                and origin_cache["state"] == "cold_populated"
+            )
+            if args.pack_cache and not defer_pack_cache:
                 pack_cache = submodule_pack_cache.compact(
                     source,
                     cache_root,
@@ -1150,6 +1177,14 @@ def main(argv: list[str] | None = None) -> int:
             }
             if pack_cache is not None:
                 receipt["packCache"] = pack_cache
+            elif defer_pack_cache:
+                receipt["packCache"] = {
+                    "format": "teamleaderleo-fex-submodule-pack-cache-deferred-v1",
+                    "state": "deferred_until_warm_origin",
+                    "reason": "avoid retaining one-time network pack variants",
+                }
+            if origin_cache is not None:
+                receipt["originCache"] = origin_cache
             print(json.dumps(receipt, sort_keys=True))
             return 0
 
