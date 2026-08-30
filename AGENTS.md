@@ -17,6 +17,10 @@ For the current owned-fork fixes, source-reading order and merged-versus-hypothe
 `docs/OwnedForkResearchMap.md` before treating similar Vulkan, callback, cache or unload symptoms as
 one bug.
 
+When the question is which owned-fork PRs to learn or how the C++ pieces compose, read
+`docs/OwnedForkLearningPath.md`. It gives a short essential path plus an exhaustive current merged-PR
+atlas; do not read every PR chronologically by default.
+
 Agents may create disposable workflow branches, add or edit workflow files, trigger workflows by authorized pushes or dispatches, rerun failed jobs, iterate on harnesses, download and inspect artifacts/logs, and delete or abandon temporary CI machinery when it has served its purpose. This includes ARM64 runners and other owned-fork CI used to reproduce, instrument, or discriminate bugs.
 
 Read `docs/OwnedForkCI.md` before scheduling validation. Broad inherited matrices are opt-in in this fork; prefer the smallest exact-head target or runtime discriminator that answers the open question, and record its scope and receipt.

@@ -1,9 +1,12 @@
 # Owned-fork FEX research map
 
-Reviewed against accepted Vulkan companion source
-[`310c40c81`](https://github.com/teamleaderleo/FEX/commit/310c40c81b8ab73b4e309b36c8459823d8ad377d)
+Reviewed against owned-fork main
+[`66f88dd3a`](https://github.com/teamleaderleo/FEX/commit/66f88dd3ac323ceb7890cae92b27c09b7338a0fb)
 on 2026-08-30. This is a reading and experiment router for `teamleaderleo/FEX`, not an upstream
 submission plan and not a claim that every thunk or Vulkan lifetime problem is solved.
+
+If the starting question is “which fork PRs should I learn, and in what order?” use the
+[owned-fork learning path](OwnedForkLearningPath.md). This page remains the symptom-to-owner router.
 
 ## Start with the boundary, not the largest test
 
