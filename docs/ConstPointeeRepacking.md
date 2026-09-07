@@ -1,55 +1,62 @@
 # Why thunk repacking must remember `const`
 
-This note explains the narrow fix on the owned-fork research branch `codex/thunkgen-const-current`. It assumes familiarity with ordinary C++ pointers, but not with FEX's thunk generator.
+Current explanation checked against owned-fork [`72872bac83`](https://github.com/teamleaderleo/FEX/tree/72872bac83ed714ff9f79143beb4d85926186c32) on 2026-09-07. [PR #5](https://github.com/teamleaderleo/FEX/pull/5) preserves pointee constness during generation; [PR #14](https://github.com/teamleaderleo/FEX/pull/14) subsequently separates host-only cleanup from mutable exit/copyback. The historical PR #5 measurements are retained below.
+
+For a line-by-line introduction to the surrounding C++, begin with [Reading FEX through its small fixes](FEXCodeReadingCompanion.md). The complete current three-hook contract lives in [ThunkRepacking.md](ThunkRepacking.md).
 
 ## The bridge in one minute
 
-FEX thunks let an x86 guest call a native host library. A pointer passed by the guest cannot always be handed directly to the host: the pointed-to C/C++ structure may have a different layout under the guest and host ABIs.
+FEX thunks let an x86 guest call a native host library. When the guest and host representations differ, generated host code uses `make_repack_wrapper<T>` to prepare temporary host-layout storage. The native function receives access to that storage, and the wrapper's destructor handles the appropriate exit operation. Read the constructor, storage fields, and destructor together in [`common/Host.h`](../ThunkLibs/include/common/Host.h).
 
-For those cases, generated host code calls `make_repack_wrapper<T>`:
+There are two separate decisions: what storage the host-side temporary needs, and whether the original guest input permits copyback. A const input can require temporary allocation and therefore cleanup, while preserving the guest's original fields.
 
-1. `guest_layout` describes the guest-side value.
-2. `repack_wrapper` creates temporary host-layout storage and repacks into it.
-3. The native host function receives a pointer to that temporary object.
-4. The wrapper's destructor may repack changes back into guest memory.
+## The original generator bug
 
-Step 4 is where `const` matters. A native function accepting `const A*` promises not to modify the `A`. FEX should not perform ordinary exit writeback for that parameter.
+The generator erased the pointee's `const` qualifier before emitting the wrapper type. A source parameter such as `const A*` therefore selected mutable-pointer behavior in the wrapper's exit policy.
 
-## The bug
+The repair in [`gen.cpp`](../ThunkLibs/Generator/gen.cpp), inside `GenerateThunkLibsAction::OnAnalysisComplete`, preserves the original parameter type when emitting `make_repack_wrapper<...>`. For a `const A*` parameter, the factory now receives that same type as its explicit template argument.
 
-The wrapper already has the correct policy:
+The wrapper keeps mutable private storage through:
 
 ```cpp
-if constexpr (!std::is_const_v<std::remove_pointer_t<T>>) {
-  // ordinary host-to-guest exit repacking
+using PointeeT = std::remove_cv_t<std::remove_pointer_t<T>>;
+```
+
+For `T = const A*`, the inner transformation yields `const A` and the outer one yields `A`. The original `T` remains available for the exit-policy decision. This is why the host representation can be constructed and managed while the guest input retains its const access policy.
+
+`const A*` and `A* const` qualify different things: the former describes a const access path to the pointee; the latter fixes the pointer variable. The language rule is about that access path, rather than global immutability of every alias. See [C++ cv-qualification](https://eel.is/c++draft/dcl.type.cv).
+
+## Current cleanup behavior after PR #14
+
+At the source checkpoint, the relevant destructor branch is:
+
+```cpp
+if constexpr (std::is_const_v<std::remove_pointer_t<T>>) {
+  fex_apply_custom_repacking_cleanup(*data);
+} else {
+  // Mutable exit hook, then eligible automatic copyback.
 }
 ```
 
-But the generator removed `const` from a pointed-to type before choosing `T`. In effect, a source parameter like `const A*` instantiated `repack_wrapper<A*>`. By the time the destructor asked whether the pointee was const, that information had been erased, so the ordinary writeback path was eligible.
+This is a shortened excerpt: the real header also checks whether the wrapper is eligible and holds data, and contains the complete mutable branch. For the language mechanism, see [C++ constexpr if](https://eel.is/c++draft/stmt.if).
 
-## Why preserving `const` is safe
+The const branch releases entry-side host resources through the dedicated cleanup hook. The mutable branch calls the exit hook, then performs the existing automatic repacking when the hook result and compatibility conditions select it.
 
-The generator now instantiates the wrapper with the original parameter type: `repack_wrapper<const A*>`.
+An earlier version of this guide described the intermediate PR #5 behavior, where custom exit processing still ran for const inputs. PR #14 superseded that policy. Read [ThunkRepacking.md](ThunkRepacking.md) for entry allocation, mutable exit, host-only cleanup, nested array owners, and the focused ownership checks.
 
-The wrapper independently removes cv-qualification for its private temporary storage (`PointeeT`). It can still construct and hold the repacked host representation. The original template argument remains available only where API semantics matter—especially the exit-writeback decision.
-
-Custom exit repacking is still invoked. That is intentional because a custom hook may release entry-side allocations or perform other bookkeeping even when the native function received a const pointer. Only the wrapper's automatic guest-memory writeback is suppressed.
-
-## Bounded proof on big-red
+## Historical PR #5 evidence on big-red
 
 Original product head: `6a741ede248ef29d903b37efa028765983339b97`, based on fork `origin/main` at `8fe2f3d1e2fd29d78b1927616daf0e973df54816`.
 
-- Focused target `thunkgentest` built successfully with the cached Clang 21/Ninja lane.
+- The focused target `thunkgentest` built with the cached Clang 21/Ninja lane.
 - With the fix present, the single Catch2 case `StructRepacking` passed 28 assertions for both x86-32 and x86-64 guest ABIs in 0.98 seconds, with 99,256 KiB peak RSS.
-- Negative control: with only the generator behavior temporarily reverted and the new test retained, the same case failed twice. The emitted `make_repack_wrapper<...>` type lacked `const` for both guest ABIs.
+- The recorded negative control restored the old generator behavior while retaining the new test. The same case failed twice because the emitted wrapper type lacked `const` for both guest ABIs.
 - Restoring the fix rebuilt the target in 0.52 seconds and returned the same focused case to green.
 
-After the fork merged upstream `98964c552773b374676610776357a030a6825e53`, the refreshed product head `4086fa083dd4aacbb532f6fb6ddd4f95e1940ea5` rebuilt the same focused target in 2.19 seconds. `StructRepacking` again passed 28 assertions in 1.47 seconds with 99,396 KiB peak RSS. The upstream refresh changed the exact product head, so this rerun was warranted; it still does not imply a broad suite.
+After the fork incorporated upstream commit `98964c552773b374676610776357a030a6825e53`, the refreshed product head `4086fa083dd4aacbb532f6fb6ddd4f95e1940ea5` rebuilt the focused target in 2.19 seconds. `StructRepacking` again passed 28 assertions in 1.47 seconds with 99,396 KiB peak RSS.
 
-This proves code generation preserves the qualifier and proves the regression test detects the old behavior. It does not by itself prove every thunk or an ARM64 runtime workload; those are separate scopes.
+These are the retained generator-level records from the original investigation. They establish qualifier preservation and sensitivity to the old behavior. The current cleanup contract has its own checks documented in [ThunkRepacking.md](ThunkRepacking.md); guest execution through FEX on ARM remains a separate evidence class. This documentation revision performed source/reference review only.
 
 ## Reading trail
 
-- Generation decision: `ThunkLibs/Generator/gen.cpp`, in `GenerateThunkLibsAction::OnAnalysisComplete`.
-- Wrapper storage and exit policy: `ThunkLibs/include/common/Host.h`, `repack_wrapper`.
-- Focused regression: `unittests/ThunkLibs/generator.cpp`, `StructRepacking`.
+Follow [`gen.cpp`](../ThunkLibs/Generator/gen.cpp) for the emitted type, [`Host.h`](../ThunkLibs/include/common/Host.h) for storage and exit behavior, and [`generator.cpp`](../unittests/ThunkLibs/generator.cpp) for the `StructRepacking` regression. Then use [exercise 4](FEXReadingExercises.md#4-follow-the-const-objects-complete-lifetime) to explain the const and mutable paths yourself.
